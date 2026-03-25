@@ -1,5 +1,7 @@
 mod agent;
+mod bus;
 mod config;
+mod message;
 
 use clap::{Parser, Subcommand};
 
@@ -16,6 +18,12 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         action: AgentAction,
+    },
+    /// Start the message bus server
+    Serve {
+        /// Unix socket path
+        #[arg(long, default_value = "/tmp/deskd.sock")]
+        socket: String,
     },
 }
 
@@ -121,6 +129,9 @@ async fn main() -> anyhow::Result<()> {
                 println!("Agent {} removed", name);
             }
         },
+        Commands::Serve { socket } => {
+            bus::serve(&socket).await?;
+        }
     }
 
     Ok(())
