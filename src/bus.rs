@@ -63,7 +63,9 @@ impl BusState {
                     }
                 }
             }
-            if !delivered {
+            if delivered {
+                eprintln!("[bus] delivered to subscriber via pattern match for target: {}", target);
+            } else {
                 eprintln!("[bus] no subscriber for target: {}", target);
             }
         }
@@ -183,4 +185,137 @@ async fn handle_connection(stream: UnixStream, state: Arc<RwLock<BusState>>) -> 
     writer_handle.abort();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Metadata;
+    use std::collections::HashSet;
+
+    fn make_bus() -> BusState {
+        BusState::new()
+    }
+
+    fn register_client(bus: &mut BusState, name: &str, subs: Vec<&str>) -> mpsc::UnboundedReceiver<Message> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        bus.clients.insert(
+            name.to_string(),
+            Client {
+                name: name.to_string(),
+                tx,
+                subscriptions: subs.into_iter().map(String::from).collect::<HashSet<_>>(),
+            },
+        );
+        rx
+    }
+
+    fn make_msg(source: &str, target: &str) -> Message {
+        Message {
+            id: "test-id".to_string(),
+            source: source.to_string(),
+            target: target.to_string(),
+            payload: serde_json::json!({"result": "hello"}),
+            reply_to: None,
+            metadata: Metadata::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_routing() {
+        let mut bus = make_bus();
+        let mut rx_a = register_client(&mut bus, "alice", vec![]);
+        let mut rx_b = register_client(&mut bus, "bob", vec![]);
+
+        let msg = make_msg("alice", "broadcast");
+        bus.route(&msg);
+
+        // alice should NOT receive (sender excluded)
+        assert!(rx_a.try_recv().is_err());
+        // bob should receive
+        assert!(rx_b.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_agent_direct_routing() {
+        let mut bus = make_bus();
+        let mut rx_a = register_client(&mut bus, "alice", vec![]);
+        let mut rx_b = register_client(&mut bus, "bob", vec![]);
+
+        let msg = make_msg("bob", "agent:alice");
+        bus.route(&msg);
+
+        assert!(rx_a.try_recv().is_ok());
+        assert!(rx_b.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_queue_routing() {
+        let mut bus = make_bus();
+        let mut rx_a = register_client(&mut bus, "worker1", vec!["queue:tasks"]);
+        let mut rx_b = register_client(&mut bus, "worker2", vec!["queue:tasks"]);
+        let mut rx_c = register_client(&mut bus, "sender", vec![]);
+
+        let msg = make_msg("sender", "queue:tasks");
+        bus.route(&msg);
+
+        assert!(rx_a.try_recv().is_ok());
+        assert!(rx_b.try_recv().is_ok());
+        assert!(rx_c.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_subscription_glob_routing() {
+        // This is the core bug scenario: telegram adapter subscribes to "telegram:*",
+        // agent sends reply to "telegram:-123456", bus should deliver via glob match.
+        let mut bus = make_bus();
+        let mut rx_telegram = register_client(&mut bus, "telegram-adapter", vec!["telegram:*"]);
+        let mut rx_agent = register_client(&mut bus, "agent1", vec!["agent:agent1", "queue:tasks"]);
+
+        let msg = make_msg("agent1", "telegram:-123456");
+        bus.route(&msg);
+
+        // telegram adapter should receive via glob match
+        let received = rx_telegram.try_recv();
+        assert!(received.is_ok(), "telegram adapter should receive message targeted to telegram:-123456");
+        let received_msg = received.unwrap();
+        assert_eq!(received_msg.target, "telegram:-123456");
+
+        // agent should NOT receive
+        assert!(rx_agent.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_subscription_exact_match() {
+        let mut bus = make_bus();
+        let mut rx = register_client(&mut bus, "listener", vec!["custom:exact-target"]);
+
+        let msg = make_msg("sender", "custom:exact-target");
+        bus.route(&msg);
+
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_subscription_no_self_delivery() {
+        // A client subscribed to "telegram:*" should NOT receive its own messages
+        let mut bus = make_bus();
+        let mut rx = register_client(&mut bus, "telegram-adapter", vec!["telegram:*"]);
+
+        let msg = make_msg("telegram-adapter", "telegram:-123");
+        bus.route(&msg);
+
+        assert!(rx.try_recv().is_err(), "should not deliver to sender even if subscription matches");
+    }
+
+    #[tokio::test]
+    async fn test_no_subscriber_for_target() {
+        let mut bus = make_bus();
+        let mut rx = register_client(&mut bus, "alice", vec!["other:*"]);
+
+        let msg = make_msg("bob", "telegram:-123");
+        bus.route(&msg);
+
+        assert!(rx.try_recv().is_err());
+    }
 }
