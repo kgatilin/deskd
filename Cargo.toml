@@ -5,6 +5,10 @@ edition = "2024"
 description = "Agent orchestration runtime — spawn, route, and manage AI agents"
 license = "MIT"
 
+[features]
+default = []
+openssl-vendored = ["openssl"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -17,4 +21,5 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 teloxide = { version = "0.13", features = ["macros"] }
+openssl = { version = "0.10", features = ["vendored"], optional = true }
 cron = "0.12"
