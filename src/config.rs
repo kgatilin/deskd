@@ -315,14 +315,14 @@ mod tests {
 
     #[test]
     fn test_expand_env_vars_braces() {
-        std::env::set_var("TEST_TOKEN_DESKD", "abc123");
+        unsafe { std::env::set_var("TEST_TOKEN_DESKD", "abc123") };
         let result = expand_env_vars("token: ${TEST_TOKEN_DESKD}");
         assert_eq!(result, "token: abc123");
     }
 
     #[test]
     fn test_expand_env_vars_dollar() {
-        std::env::set_var("TEST_VAR_DESKD", "hello");
+        unsafe { std::env::set_var("TEST_VAR_DESKD", "hello") };
         let result = expand_env_vars("val: $TEST_VAR_DESKD end");
         assert_eq!(result, "val: hello end");
     }
@@ -483,9 +483,11 @@ schedules:
             telegram: Some(TelegramRoutesConfig {
                 routes: vec![TelegramRoute {
                     chat_id: -1003733725513,
+                    mention_only: false,
                 }],
             }),
             schedules: vec![],
+            mcp_config: None,
         };
         let desc = cfg.send_message_description("kira");
         assert!(desc.contains("agent:dev"));
