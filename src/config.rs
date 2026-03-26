@@ -182,6 +182,9 @@ pub struct TelegramRoutesConfig {
 pub struct TelegramRoute {
     /// Telegram chat_id (positive for users/groups, negative for channels/supergroups).
     pub chat_id: i64,
+    /// If true, only respond when the bot is @mentioned in this chat.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 /// A scheduled action that fires on a cron expression and posts a message to the bus.

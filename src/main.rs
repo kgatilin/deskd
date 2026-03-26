@@ -327,8 +327,19 @@ async fn serve(config_path: String) -> anyhow::Result<()> {
             let token = tg.token.clone();
             let bus = bus_socket.clone();
             let agent_name = name.clone();
+            let mention_only_chats = user_cfg
+                .as_ref()
+                .and_then(|c| c.telegram.as_ref())
+                .map(|t| {
+                    t.routes
+                        .iter()
+                        .filter(|r| r.mention_only)
+                        .map(|r| r.chat_id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             tokio::spawn(async move {
-                if let Err(e) = adapters::telegram::run(token, bus, agent_name.clone()).await {
+                if let Err(e) = adapters::telegram::run(token, bus, agent_name.clone(), mention_only_chats).await {
                     tracing::error!(agent = %agent_name, error = %e, "telegram adapter failed");
                 }
             });
