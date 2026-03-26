@@ -9,8 +9,10 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
+use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{ChatAction, ParseMode};
+use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -271,6 +273,32 @@ async fn outbound_sender(bot: Bot, mut rx: mpsc::UnboundedReceiver<OutboundCmd>)
     }
 }
 
+/// Download a Telegram photo to `/tmp/deskd-photos/<file_id>.jpg` and return the local path.
+/// Takes the largest available size (last element in the PhotoSize array).
+async fn download_photo(bot: &Bot, file_id: &str) -> Result<String> {
+    let dir = "/tmp/deskd-photos";
+    fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("failed to create photo dir {}", dir))?;
+
+    let dest_path = format!("{}/{}.jpg", dir, file_id);
+
+    let tg_file = bot
+        .get_file(file_id)
+        .await
+        .with_context(|| format!("failed to get file info for {}", file_id))?;
+
+    let mut dest = fs::File::create(&dest_path)
+        .await
+        .with_context(|| format!("failed to create {}", dest_path))?;
+
+    bot.download_file(&tg_file.path, &mut dest)
+        .await
+        .with_context(|| format!("failed to download file {}", file_id))?;
+
+    Ok(dest_path)
+}
+
 /// Poll Telegram for incoming messages and publish them to the bus as `telegram.in:<chat_id>`.
 async fn polling_loop(
     bot: Bot,
@@ -298,7 +326,33 @@ async fn polling_loop(
                 return Ok(());
             }
 
-            if let Some(text) = msg.text() {
+            // Determine the task text from the message.
+            // Photos are downloaded and prepended as `[photo: <path>]\n<caption>`.
+            // Pure text messages are passed through unchanged.
+            let task_text: Option<String> = if let Some(photos) = msg.photo() {
+                // Take the largest photo (Telegram sends sizes smallest → largest).
+                if let Some(largest) = photos.last() {
+                    let file_id = largest.file.id.clone();
+                    match download_photo(&bot, &file_id).await {
+                        Ok(path) => {
+                            let caption = msg.caption().unwrap_or("[photo attached]");
+                            Some(format!("[photo: {}]\n{}", path, caption))
+                        }
+                        Err(e) => {
+                            warn!(file_id = %file_id, error = %e, "failed to download Telegram photo");
+                            // Fall back to caption-only so the message isn't silently dropped.
+                            let caption = msg.caption().unwrap_or("[photo attached — download failed]");
+                            Some(caption.to_string())
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                msg.text().map(|t| t.to_string())
+            };
+
+            if let Some(text) = task_text {
                 let chat_id = msg.chat.id.0;
 
                 // Whitelist check — only process chats explicitly configured in routes.
@@ -323,7 +377,7 @@ async fn polling_loop(
                 debug!(agent = %agent, chat_id = chat_id, "received Telegram message");
 
                 if let Err(e) =
-                    publish_to_bus(&socket, &agent, text, &target, &reply_to, chat_id, chat_name)
+                    publish_to_bus(&socket, &agent, &text, &target, &reply_to, chat_id, chat_name)
                         .await
                 {
                     warn!(chat_id = chat_id, error = %e, "failed to publish message to bus");
