@@ -27,11 +27,13 @@ enum OutboundCmd {
 /// Run the Telegram adapter for a specific agent.
 /// `agent_name` is used to name the bus registration and for logging.
 /// `mention_only_chats` is a set of chat_ids where only @mentions trigger the agent.
+/// `chat_names` maps chat_id to a human-readable name shown to the agent as context.
 pub async fn run(
     token: String,
     socket_path: String,
     agent_name: String,
     mention_only_chats: Vec<i64>,
+    chat_names: std::collections::HashMap<i64, String>,
 ) -> Result<()> {
     info!(agent = %agent_name, "starting Telegram adapter");
 
@@ -75,7 +77,9 @@ pub async fn run(
         let name = agent_name.clone();
         let mention_only: std::collections::HashSet<i64> = mention_only_chats.into_iter().collect();
         tokio::spawn(async move {
-            if let Err(e) = polling_loop(bot, socket, name, bot_username, mention_only).await {
+            if let Err(e) =
+                polling_loop(bot, socket, name, bot_username, mention_only, chat_names).await
+            {
                 tracing::error!(error = %e, "telegram polling loop failed");
             }
         })
@@ -264,12 +268,14 @@ async fn polling_loop(
     agent_name: String,
     bot_username: String,
     mention_only_chats: std::collections::HashSet<i64>,
+    chat_names: std::collections::HashMap<i64, String>,
 ) -> Result<()> {
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
         let socket = socket_path.clone();
         let agent = agent_name.clone();
         let bot_user = bot_username.clone();
         let mention_only = mention_only_chats.clone();
+        let names = chat_names.clone();
         async move {
             // Skip messages from the bot itself to prevent reply loops.
             if msg.from.as_ref().map(|u| u.username.as_deref() == Some(&bot_user)).unwrap_or(false) {
@@ -294,10 +300,14 @@ async fn polling_loop(
 
                 let target = format!("telegram.in:{}", chat_id);
                 let reply_to = format!("telegram.out:{}", chat_id);
+                let chat_name = names.get(&chat_id).cloned();
 
                 debug!(agent = %agent, chat_id = chat_id, "received Telegram message");
 
-                if let Err(e) = publish_to_bus(&socket, &agent, text, &target, &reply_to).await {
+                if let Err(e) =
+                    publish_to_bus(&socket, &agent, text, &target, &reply_to, chat_id, chat_name)
+                        .await
+                {
                     warn!(chat_id = chat_id, error = %e, "failed to publish message to bus");
                     let _ = bot
                         .send_message(msg.chat.id, "Internal error, please try again.")
@@ -319,6 +329,8 @@ async fn publish_to_bus(
     text: &str,
     target: &str,
     reply_to: &str,
+    chat_id: i64,
+    chat_name: Option<String>,
 ) -> Result<()> {
     let mut stream = UnixStream::connect(socket_path)
         .await
@@ -340,6 +352,8 @@ async fn publish_to_bus(
         "target": target,
         "payload": {
             "task": text,
+            "telegram_chat_id": chat_id,
+            "telegram_chat_name": chat_name,
         },
         "reply_to": reply_to,
         "metadata": {"priority": 5u8},

@@ -104,16 +104,32 @@ pub async fn run(name: &str, socket_path: &str, bus_socket: Option<String>) -> R
             continue;
         }
 
-        let task = msg
+        let task_raw = msg
             .payload
             .get("task")
             .and_then(|t| t.as_str())
             .unwrap_or_default();
 
-        if task.is_empty() {
+        if task_raw.is_empty() {
             debug!(agent = %name, "message has no task payload, skipping");
             continue;
         }
+
+        // Prepend channel context so the agent knows where the message came from.
+        let task_owned;
+        let task =
+            if let Some(chat_id) = msg.payload.get("telegram_chat_id").and_then(|v| v.as_i64()) {
+                let label = msg
+                    .payload
+                    .get("telegram_chat_name")
+                    .and_then(|v| v.as_str())
+                    .map(|n| format!("{} ({})", n, chat_id))
+                    .unwrap_or_else(|| chat_id.to_string());
+                task_owned = format!("[Telegram: {}]\n{}", label, task_raw);
+                &task_owned as &str
+            } else {
+                task_raw
+            };
 
         info!(agent = %name, source = %msg.source, task = %truncate(task, 80), "processing task");
 

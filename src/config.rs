@@ -185,6 +185,8 @@ pub struct TelegramRoute {
     /// If true, only respond when the bot is @mentioned in this chat.
     #[serde(default)]
     pub mention_only: bool,
+    /// Human-readable name for this chat, shown to the agent as context.
+    pub name: Option<String>,
 }
 
 /// A scheduled action that fires on a cron expression and posts a message to the bus.
@@ -484,6 +486,7 @@ schedules:
                 routes: vec![TelegramRoute {
                     chat_id: -1003733725513,
                     mention_only: false,
+                    name: None,
                 }],
             }),
             schedules: vec![],
