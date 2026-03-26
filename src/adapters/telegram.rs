@@ -26,11 +26,13 @@ enum OutboundCmd {
 
 /// Run the Telegram adapter for a specific agent.
 /// `agent_name` is used to name the bus registration and for logging.
-/// `mention_only_chats` is a set of chat_ids where only @mentions trigger the agent.
+/// `allowed_chats` is the whitelist of chat_ids to accept messages from — all others are ignored.
+/// `mention_only_chats` is a subset where only @mentions trigger the agent.
 pub async fn run(
     token: String,
     socket_path: String,
     agent_name: String,
+    allowed_chats: std::collections::HashSet<i64>,
     mention_only_chats: Vec<i64>,
 ) -> Result<()> {
     info!(agent = %agent_name, "starting Telegram adapter");
@@ -75,7 +77,9 @@ pub async fn run(
         let name = agent_name.clone();
         let mention_only: std::collections::HashSet<i64> = mention_only_chats.into_iter().collect();
         tokio::spawn(async move {
-            if let Err(e) = polling_loop(bot, socket, name, bot_username, mention_only).await {
+            if let Err(e) =
+                polling_loop(bot, socket, name, bot_username, allowed_chats, mention_only).await
+            {
                 tracing::error!(error = %e, "telegram polling loop failed");
             }
         })
@@ -263,12 +267,14 @@ async fn polling_loop(
     socket_path: String,
     agent_name: String,
     bot_username: String,
+    allowed_chats: std::collections::HashSet<i64>,
     mention_only_chats: std::collections::HashSet<i64>,
 ) -> Result<()> {
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
         let socket = socket_path.clone();
         let agent = agent_name.clone();
         let bot_user = bot_username.clone();
+        let allowed = allowed_chats.clone();
         let mention_only = mention_only_chats.clone();
         async move {
             // Skip messages from the bot itself to prevent reply loops.
@@ -282,6 +288,12 @@ async fn polling_loop(
 
             if let Some(text) = msg.text() {
                 let chat_id = msg.chat.id.0;
+
+                // Whitelist check — only process chats explicitly configured in routes.
+                if !allowed.is_empty() && !allowed.contains(&chat_id) {
+                    debug!(agent = %agent, chat_id = chat_id, "ignoring message — chat not in whitelist");
+                    return Ok(());
+                }
 
                 // If this chat requires a mention, skip unless @bot_user appears in text.
                 if mention_only.contains(&chat_id) {
