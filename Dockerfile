@@ -1,5 +1,5 @@
 # Stage 1: build the Rust binary
-FROM rust:1.87-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /build
 
