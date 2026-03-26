@@ -435,6 +435,10 @@ async fn serve(config_path: String) -> anyhow::Result<()> {
                 .filter(|r| r.mention_only)
                 .map(|r| r.chat_id)
                 .collect();
+            let chat_names: std::collections::HashMap<i64, String> = routes
+                .iter()
+                .filter_map(|r| r.name.as_ref().map(|n| (r.chat_id, n.clone())))
+                .collect();
             tokio::spawn(async move {
                 if let Err(e) = adapters::telegram::run(
                     token,
@@ -442,6 +446,7 @@ async fn serve(config_path: String) -> anyhow::Result<()> {
                     agent_name.clone(),
                     allowed_chats,
                     mention_only_chats,
+                    chat_names,
                 )
                 .await
                 {
