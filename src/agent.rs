@@ -115,7 +115,9 @@ pub async fn create_or_recover(def: &config::AgentDef) -> Result<AgentState> {
 }
 
 /// Send a message to an agent — runs claude CLI and returns the full response text.
-pub async fn send(name: &str, message: &str, max_turns: Option<u32>) -> Result<String> {
+/// `sub_bus`: optional path to this agent's sub-bus socket, injected as DESKD_SUB_BUS
+/// into the claude process so it can call `deskd agent spawn`.
+pub async fn send(name: &str, message: &str, max_turns: Option<u32>, sub_bus: Option<&str>) -> Result<String> {
     let mut state = load_state(name)?;
 
     let turns = max_turns.unwrap_or(state.config.max_turns);
@@ -145,7 +147,13 @@ pub async fn send(name: &str, message: &str, max_turns: Option<u32>) -> Result<S
 
     debug!(agent = %name, turns, "spawning claude");
 
-    let mut cmd = build_command(&state.config, &args);
+    // Build env vars to inject: agent identity + sub-bus path for agent_spawn support.
+    let mut extra_env: Vec<(&str, &str)> = vec![("DESKD_AGENT_NAME", name)];
+    if let Some(bus) = sub_bus {
+        extra_env.push(("DESKD_SUB_BUS", bus));
+    }
+
+    let mut cmd = build_command(&state.config, &args, &extra_env);
     let output = cmd
         .output()
         .await
@@ -213,7 +221,8 @@ pub async fn send(name: &str, message: &str, max_turns: Option<u32>) -> Result<S
 /// Build the tokio Command for running the agent process.
 /// Uses cfg.command as the executable (defaults to ["claude"]).
 /// When unix_user is set, wraps with sudo and strips SSH env vars.
-pub fn build_command(cfg: &AgentConfig, args: &[String]) -> Command {
+/// extra_env: additional environment variables to pass to the process.
+pub fn build_command(cfg: &AgentConfig, args: &[String], extra_env: &[(&str, &str)]) -> Command {
     let (bin, prefix) = split_command(&cfg.command);
     let mut cmd = match &cfg.unix_user {
         Some(user) => {
@@ -233,6 +242,9 @@ pub fn build_command(cfg: &AgentConfig, args: &[String]) -> Command {
             c
         }
     };
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     cmd.current_dir(&cfg.work_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -266,6 +278,45 @@ pub async fn list() -> Result<Vec<AgentState>> {
     }
 
     Ok(agents)
+}
+
+/// Spawn an ephemeral sub-agent: create, run task, clean up.
+/// `bus_socket` — the sub-bus of the parent agent (not the root bus).
+/// Returns the agent's text response.
+pub async fn spawn_ephemeral(
+    name: &str,
+    task: &str,
+    model: &str,
+    work_dir: &str,
+    max_turns: u32,
+    bus_socket: &str,
+    parent_name: &str,
+) -> Result<String> {
+    // Use a unique name to avoid collisions when run in parallel.
+    let unique_name = format!("{}-{}", name, uuid::Uuid::new_v4().as_simple());
+
+    let cfg = AgentConfig {
+        name: unique_name.clone(),
+        model: model.to_string(),
+        system_prompt: String::new(),
+        work_dir: work_dir.to_string(),
+        max_turns,
+        unix_user: None,
+        budget_usd: 50.0,
+        command: default_agent_command(),
+    };
+
+    create(&cfg).await?;
+    info!(agent = %unique_name, parent = %parent_name, bus = %bus_socket, "spawning ephemeral sub-agent");
+
+    let result = send(&unique_name, task, Some(max_turns), None).await;
+
+    // Always clean up, even on error.
+    if let Err(e) = remove(&unique_name).await {
+        warn!(agent = %unique_name, error = %e, "failed to clean up ephemeral agent");
+    }
+
+    result
 }
 
 /// Remove an agent (state file + log).
@@ -342,6 +393,7 @@ created_at: "2026-01-01T00:00:00Z"
             max_turns: 100,
             unix_user: Some("agent1".to_string()),
             budget_usd: 10.0,
+            command: vec!["claude".to_string()],
         };
         let state = AgentState {
             config: cfg,

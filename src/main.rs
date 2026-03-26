@@ -100,6 +100,27 @@ enum AgentAction {
         /// Agent name.
         name: String,
     },
+    /// Spawn an ephemeral sub-agent, run a task, print result, clean up.
+    /// Intended to be called by a running agent via bash tool.
+    /// Sub-agent connects to the parent agent's sub-bus (DESKD_SUB_BUS env var by default).
+    Spawn {
+        /// Sub-agent name prefix (a UUID suffix is appended to ensure uniqueness).
+        name: String,
+        /// Task to run.
+        task: String,
+        /// Sub-bus socket the spawned agent should use (defaults to $DESKD_SUB_BUS).
+        #[arg(long)]
+        socket: Option<String>,
+        /// Working directory for the spawned agent (defaults to current dir).
+        #[arg(long)]
+        work_dir: Option<String>,
+        /// Claude model to use.
+        #[arg(long, default_value = "claude-sonnet-4-6")]
+        model: String,
+        /// Max turns for this task.
+        #[arg(long, default_value = "50")]
+        max_turns: u32,
+    },
 }
 
 #[tokio::main]
@@ -151,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
                     let target = format!("agent:{}", name);
                     worker::send_via_bus(&socket, "cli", &target, &message, max_turns).await?;
                 } else {
-                    let response = agent::send(&name, &message, max_turns).await?;
+                    let response = agent::send(&name, &message, max_turns, None).await?;
                     println!("{}", response);
                 }
             }
@@ -159,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
                 agent::load_state(&name)?;
                 info!(agent = %name, "starting worker");
                 tokio::select! {
-                    result = worker::run(&name, &socket) => { result?; }
+                    result = worker::run(&name, &socket, None) => { result?; }
                     _ = tokio::signal::ctrl_c() => {
                         info!(agent = %name, "shutting down");
                     }
@@ -210,6 +231,37 @@ async fn main() -> anyhow::Result<()> {
                 agent::remove(&name).await?;
                 println!("Agent {} removed", name);
             }
+            AgentAction::Spawn {
+                name,
+                task,
+                socket,
+                work_dir,
+                model,
+                max_turns,
+            } => {
+                // Resolve bus socket: flag > env var > error.
+                let bus_socket = socket
+                    .or_else(|| std::env::var("DESKD_SUB_BUS").ok())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "No sub-bus socket: pass --socket or set DESKD_SUB_BUS"
+                    ))?;
+
+                let parent = std::env::var("DESKD_AGENT_NAME").unwrap_or_else(|_| "unknown".into());
+
+                let resolved_work_dir = work_dir.unwrap_or_else(|| ".".into());
+
+                let response = agent::spawn_ephemeral(
+                    &name,
+                    &task,
+                    &model,
+                    &resolved_work_dir,
+                    max_turns,
+                    &bus_socket,
+                    &parent,
+                ).await?;
+
+                println!("{}", response);
+            }
         },
     }
 
@@ -256,9 +308,11 @@ async fn serve(socket: String, config_path: Option<String>) -> anyhow::Result<()
             info!(agent = %name, sub_bus = %sub_bus, "started sub-bus for agent");
 
             // Worker connects to the ROOT bus (receives tasks from external world).
+            // sub_bus is injected as DESKD_SUB_BUS into the claude subprocess.
             let sock = effective_socket.clone();
+            let sub_bus_for_worker = Some(sub_bus.clone());
             tokio::spawn(async move {
-                if let Err(e) = worker::run(&name, &sock).await {
+                if let Err(e) = worker::run(&name, &sock, sub_bus_for_worker).await {
                     tracing::error!(agent = %name, error = %e, "worker exited with error");
                 }
             });
