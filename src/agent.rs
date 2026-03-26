@@ -53,6 +53,11 @@ pub fn load_state(name: &str) -> Result<AgentState> {
     Ok(state)
 }
 
+/// Public alias for use by session.rs.
+pub fn save_state_pub(state: &AgentState) -> Result<()> {
+    save_state(state)
+}
+
 fn save_state(state: &AgentState) -> Result<()> {
     let path = state_path(&state.config.name);
     let content = serde_yaml::to_string(state)?;

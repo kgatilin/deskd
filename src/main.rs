@@ -2,6 +2,7 @@ mod agent;
 mod bus;
 mod config;
 mod message;
+mod session;
 mod worker;
 
 use clap::{Parser, Subcommand};
