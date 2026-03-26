@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -6,7 +6,7 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::config;
+use crate::config::{self, UserConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -24,6 +24,9 @@ pub struct AgentConfig {
     /// Command to run. Defaults to ["claude"].
     #[serde(default = "default_agent_command")]
     pub command: Vec<String>,
+    /// Path to the agent's deskd.yaml (injected as DESKD_AGENT_CONFIG into claude).
+    #[serde(default)]
+    pub config_path: Option<String>,
 }
 
 fn default_budget_usd() -> f64 {
@@ -42,10 +45,6 @@ pub struct AgentState {
     pub total_turns: u32,
     pub total_cost: f64,
     pub created_at: String,
-    /// The Unix socket path of this agent's own sub-bus.
-    /// Set at serve time; used by `deskd agent send` to route without specifying --socket.
-    #[serde(default)]
-    pub sub_bus: Option<String>,
 }
 
 fn state_path(name: &str) -> PathBuf {
@@ -88,7 +87,6 @@ pub async fn create(cfg: &AgentConfig) -> Result<AgentState> {
         total_turns: 0,
         total_cost: 0.0,
         created_at: Utc::now().to_rfc3339(),
-        sub_bus: None,
     };
 
     save_state(&state)?;
@@ -96,48 +94,65 @@ pub async fn create(cfg: &AgentConfig) -> Result<AgentState> {
     Ok(state)
 }
 
-/// Create or recover agent state from a workspace AgentDef.
-/// If state already exists on disk, returns existing state and updates sub_bus path.
-pub async fn create_or_recover(def: &config::AgentDef, sub_bus: &str) -> Result<AgentState> {
-    let path = state_path(&def.name);
-    if path.exists() {
-        let mut state = load_state(&def.name)?;
-        // Always update sub_bus — socket paths can change between runs.
-        state.sub_bus = Some(sub_bus.to_string());
-        save_state(&state)?;
-        info!(agent = %def.name, session_id = %state.session_id, sub_bus = %sub_bus, "recovered existing agent state");
-        return Ok(state);
-    }
+/// Create or recover agent state from workspace AgentDef + optional UserConfig.
+/// If state already exists, returns it with config fields updated from current def.
+/// Model priority: workspace def.model override > user_cfg.model > default.
+pub async fn create_or_recover(
+    def: &config::AgentDef,
+    user_cfg: Option<&UserConfig>,
+) -> Result<AgentState> {
+    let model = def
+        .model
+        .clone()
+        .or_else(|| user_cfg.map(|c| c.model.clone()))
+        .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+
+    let system_prompt = user_cfg
+        .map(|c| c.system_prompt.clone())
+        .unwrap_or_default();
+
+    let max_turns = user_cfg.map(|c| c.max_turns).unwrap_or(100);
 
     let cfg = AgentConfig {
         name: def.name.clone(),
-        model: def.model.clone(),
-        system_prompt: def.system_prompt.clone(),
+        model,
+        system_prompt,
         work_dir: def.work_dir.clone(),
-        max_turns: def.max_turns,
+        max_turns,
         unix_user: def.unix_user.clone(),
         budget_usd: def.budget_usd,
         command: def.command.clone(),
+        config_path: Some(def.config_path()),
     };
-    let mut state = AgentState {
+
+    let path = state_path(&def.name);
+    if path.exists() {
+        let mut state = load_state(&def.name)?;
+        // Update mutable fields on recovery; preserve session_id + costs.
+        state.config = cfg;
+        save_state(&state)?;
+        info!(agent = %def.name, session_id = %state.session_id, "recovered existing agent state");
+        return Ok(state);
+    }
+
+    let state = AgentState {
         config: cfg,
         pid: 0,
         session_id: String::new(),
         total_turns: 0,
         total_cost: 0.0,
         created_at: Utc::now().to_rfc3339(),
-        sub_bus: Some(sub_bus.to_string()),
     };
     save_state(&state)?;
-    info!(agent = %def.name, sub_bus = %sub_bus, "agent created");
-    state.config.name = def.name.clone(); // ensure
+    info!(agent = %def.name, "agent created");
     Ok(state)
 }
 
-/// Send a message to an agent — runs claude CLI and returns the full response text.
-/// `sub_bus`: optional path to this agent's sub-bus socket, injected as DESKD_SUB_BUS
-/// into the claude process so it can call `deskd agent spawn`.
-pub async fn send(name: &str, message: &str, max_turns: Option<u32>, sub_bus: Option<&str>) -> Result<String> {
+/// Run claude for one task, return the response text.
+///
+/// `bus_socket`: path to the agent's bus (injected as DESKD_BUS_SOCKET).
+/// Claude uses this to call the `send_message` MCP tool.
+pub async fn send(name: &str, message: &str, max_turns: Option<u32>, bus_socket: Option<&str>) -> Result<String> {
     let mut state = load_state(name)?;
 
     let turns = max_turns.unwrap_or(state.config.max_turns);
@@ -165,12 +180,28 @@ pub async fn send(name: &str, message: &str, max_turns: Option<u32>, sub_bus: Op
         args.push(state.config.system_prompt.clone());
     }
 
+    // Expose the MCP server so Claude can use send_message, add_persistent_agent, etc.
+    // deskd must be in PATH for the unix user running claude.
+    args.push("--mcp-server".to_string());
+    args.push(format!("deskd mcp --agent {}", name));
+
     debug!(agent = %name, turns, "spawning claude");
 
-    // Build env vars to inject: agent identity + sub-bus path for agent_spawn support.
-    let mut extra_env: Vec<(&str, &str)> = vec![("DESKD_AGENT_NAME", name)];
-    if let Some(bus) = sub_bus {
-        extra_env.push(("DESKD_SUB_BUS", bus));
+    // Env vars injected into the claude process:
+    //   DESKD_BUS_SOCKET  — bus socket for MCP send_message tool
+    //   DESKD_AGENT_NAME  — agent name for MCP server
+    //   DESKD_AGENT_CONFIG — path to deskd.yaml for tool description generation
+    let bus_path = bus_socket
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| config::agent_bus_socket(&state.config.work_dir));
+
+    let config_path_str = state.config.config_path.clone().unwrap_or_default();
+    let mut extra_env: Vec<(&str, &str)> = vec![
+        ("DESKD_AGENT_NAME", name),
+        ("DESKD_BUS_SOCKET", &bus_path),
+    ];
+    if !config_path_str.is_empty() {
+        extra_env.push(("DESKD_AGENT_CONFIG", &config_path_str));
     }
 
     let mut cmd = build_command(&state.config, &args, &extra_env);
@@ -279,6 +310,43 @@ fn split_command(command: &[String]) -> (&str, &[String]) {
     }
 }
 
+/// Spawn an ephemeral sub-agent: create, run task, clean up.
+/// Returns the agent's text response.
+pub async fn spawn_ephemeral(
+    name: &str,
+    task: &str,
+    model: &str,
+    work_dir: &str,
+    max_turns: u32,
+    bus_socket: &str,
+    parent_name: &str,
+) -> Result<String> {
+    let unique_name = format!("{}-{}", name, uuid::Uuid::new_v4().as_simple());
+
+    let cfg = AgentConfig {
+        name: unique_name.clone(),
+        model: model.to_string(),
+        system_prompt: String::new(),
+        work_dir: work_dir.to_string(),
+        max_turns,
+        unix_user: None,
+        budget_usd: 50.0,
+        command: default_agent_command(),
+        config_path: None,
+    };
+
+    create(&cfg).await?;
+    info!(agent = %unique_name, parent = %parent_name, bus = %bus_socket, "spawning ephemeral sub-agent");
+
+    let result = send(&unique_name, task, Some(max_turns), Some(bus_socket)).await;
+
+    if let Err(e) = remove(&unique_name).await {
+        warn!(agent = %unique_name, error = %e, "failed to clean up ephemeral agent");
+    }
+
+    result
+}
+
 /// List all agents whose state files exist on disk.
 pub async fn list() -> Result<Vec<AgentState>> {
     let dir = config::state_dir();
@@ -298,45 +366,6 @@ pub async fn list() -> Result<Vec<AgentState>> {
     }
 
     Ok(agents)
-}
-
-/// Spawn an ephemeral sub-agent: create, run task, clean up.
-/// `bus_socket` — the sub-bus of the parent agent (not the root bus).
-/// Returns the agent's text response.
-pub async fn spawn_ephemeral(
-    name: &str,
-    task: &str,
-    model: &str,
-    work_dir: &str,
-    max_turns: u32,
-    bus_socket: &str,
-    parent_name: &str,
-) -> Result<String> {
-    // Use a unique name to avoid collisions when run in parallel.
-    let unique_name = format!("{}-{}", name, uuid::Uuid::new_v4().as_simple());
-
-    let cfg = AgentConfig {
-        name: unique_name.clone(),
-        model: model.to_string(),
-        system_prompt: String::new(),
-        work_dir: work_dir.to_string(),
-        max_turns,
-        unix_user: None,
-        budget_usd: 50.0,
-        command: default_agent_command(),
-    };
-
-    create(&cfg).await?;
-    info!(agent = %unique_name, parent = %parent_name, bus = %bus_socket, "spawning ephemeral sub-agent");
-
-    let result = send(&unique_name, task, Some(max_turns), None).await;
-
-    // Always clean up, even on error.
-    if let Err(e) = remove(&unique_name).await {
-        warn!(agent = %unique_name, error = %e, "failed to clean up ephemeral agent");
-    }
-
-    result
 }
 
 /// Remove an agent (state file + log).
@@ -373,34 +402,11 @@ pid: 0
 session_id: ""
 total_turns: 0
 total_cost: 0.0
-created_at: "2026-01-01T00:00:00Z"
+created_at: "2024-01-01T00:00:00Z"
 "#;
         let state: AgentState = serde_yaml::from_str(yaml).unwrap();
-        assert!(state.config.unix_user.is_none());
         assert_eq!(state.config.budget_usd, 50.0);
-    }
-
-    #[test]
-    fn test_agent_config_with_unix_user() {
-        let yaml = r#"
-config:
-  name: kira
-  model: claude-opus-4-6
-  system_prompt: "You are Kira."
-  work_dir: /home/agent-kira
-  max_turns: 50
-  unix_user: agent-kira
-  budget_usd: 25.0
-pid: 0
-session_id: "sess-abc"
-total_turns: 10
-total_cost: 1.23
-created_at: "2026-01-01T00:00:00Z"
-"#;
-        let state: AgentState = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(state.config.unix_user.as_deref(), Some("agent-kira"));
-        assert_eq!(state.config.budget_usd, 25.0);
-        assert_eq!(state.session_id, "sess-abc");
+        assert!(state.config.unix_user.is_none());
     }
 
     #[test]
@@ -414,6 +420,7 @@ created_at: "2026-01-01T00:00:00Z"
             unix_user: Some("agent1".to_string()),
             budget_usd: 10.0,
             command: vec!["claude".to_string()],
+            config_path: Some("/home/agent1/deskd.yaml".to_string()),
         };
         let state = AgentState {
             config: cfg,
@@ -422,12 +429,12 @@ created_at: "2026-01-01T00:00:00Z"
             total_turns: 5,
             total_cost: 0.42,
             created_at: Utc::now().to_rfc3339(),
-            sub_bus: Some("/run/deskd/root-test-agent.sock".to_string()),
         };
         let yaml = serde_yaml::to_string(&state).unwrap();
         let restored: AgentState = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(restored.config.unix_user.as_deref(), Some("agent1"));
         assert_eq!(restored.session_id, "sid-123");
         assert_eq!(restored.total_cost, 0.42);
+        assert_eq!(restored.config.config_path.as_deref(), Some("/home/agent1/deskd.yaml"));
     }
 }

@@ -31,9 +31,9 @@ pub async fn bus_connect(
 }
 
 /// Run the agent worker loop: read messages from bus, execute tasks, post results.
-/// `sub_bus`: optional path to this agent's own sub-bus socket, injected into the
-/// claude subprocess so it can call `deskd agent spawn` for sub-agent delegation.
-pub async fn run(name: &str, socket_path: &str, sub_bus: Option<String>) -> Result<()> {
+/// `bus_socket`: the agent's bus socket path, injected as DESKD_BUS_SOCKET into
+/// the claude subprocess so the MCP server can connect to the bus.
+pub async fn run(name: &str, socket_path: &str, bus_socket: Option<String>) -> Result<()> {
     let initial_state = agent::load_state(name)?;
     let budget_usd = initial_state.config.budget_usd;
 
@@ -89,7 +89,7 @@ pub async fn run(name: &str, socket_path: &str, sub_bus: Option<String>) -> Resu
             .and_then(|t| t.as_u64())
             .map(|t| t as u32);
 
-        match agent::send(name, task, max_turns, sub_bus.as_deref()).await {
+        match agent::send(name, task, max_turns, bus_socket.as_deref()).await {
             Ok(response) => {
                 info!(agent = %name, "task completed, posting result");
 
