@@ -95,7 +95,8 @@ async fn bus_loop(
     stream.write_all(line.as_bytes()).await?;
     info!(adapter = %adapter_name, "telegram adapter registered on bus");
 
-    let (reader, _) = stream.into_split();
+    // Keep _writer alive — dropping it closes the connection.
+    let (reader, _writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
     while let Some(line) = lines.next_line().await? {

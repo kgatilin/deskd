@@ -124,7 +124,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<RwLock<BusState>>) -> 
 
     let (name, subscriptions) = match envelope {
         Envelope::Register(reg) => (reg.name, reg.subscriptions.into_iter().collect()),
-        Envelope::Message(_) => {
+        Envelope::Message(_) | Envelope::List => {
             anyhow::bail!("first message must be register");
         }
     };
