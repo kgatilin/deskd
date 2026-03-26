@@ -1,0 +1,150 @@
+# deskd — Agent Orchestration Runtime
+
+Lightweight runtime for managing AI agents. Spawn agents, route messages, track costs.
+
+Repo: github.com/kgatilin/deskd (public, MIT). Part of the Nassau ecosystem.
+
+## Architecture
+
+Each agent gets its own isolated message bus (Unix socket at `{work_dir}/.deskd/bus.sock`). No shared root bus. `deskd serve` starts all agents defined in a workspace config.
+
+```
+workspace.yaml
+    ↓
+deskd serve
+    ↓
+┌─────────────────┐     ┌─────────────────┐
+│ agent: uagent    │     │ agent: dev       │
+│ bus.sock         │     │ bus.sock         │
+│ worker (Claude)  │     │ worker (Claude)  │
+│ [telegram]       │     │                  │
+└─────────────────┘     └─────────────────┘
+```
+
+## Source Layout
+
+```
+src/
+  main.rs       — CLI (clap): serve, agent {create,send,run,list,stats,read,rm,spawn}, mcp
+  config.rs     — WorkspaceConfig (workspace.yaml) + UserConfig (deskd.yaml) parsing
+  agent.rs      — Agent state, create/recover, send() and send_streaming() to Claude
+  bus.rs        — Per-agent Unix socket message bus (pub/sub with glob routing)
+  worker.rs     — Worker loop: read from bus → execute via Claude → post result + write inbox
+  inbox.rs      — File-based inbox: write task results to ~/.deskd/inbox/<sender>/
+  mcp.rs        — MCP server (stdio, newline-delimited JSON): send_message, add_persistent_agent
+  message.rs    — Message/Envelope types for bus protocol
+  schedule.rs   — Cron-based scheduled actions on the bus
+  adapters/
+    telegram.rs — Telegram bot adapter (teloxide): polls messages, routes to/from bus
+```
+
+## Config Files
+
+### workspace.yaml — defines agents for `deskd serve`
+```yaml
+agents:
+  - name: dev
+    work_dir: /home/dev
+    command: [claude, --output-format, stream-json, ...]
+    telegram:                    # optional
+      token: ${BOT_TOKEN}
+    budget_usd: 50.0             # optional, default 50
+```
+
+### deskd.yaml — per-agent config (at `{work_dir}/deskd.yaml`)
+```yaml
+model: claude-sonnet-4-6
+system_prompt: "You are..."
+max_turns: 100
+mcp_config: '{"mcpServers":{...}}'
+telegram:
+  routes:
+    - chat_id: -1234567890
+agents: []         # sub-agents
+schedules: []      # cron jobs
+channels: []       # named bus targets
+```
+
+## Key Paths
+
+| Path | Purpose |
+|------|---------|
+| `{work_dir}/.deskd/bus.sock` | Agent's message bus socket |
+| `~/.deskd/agents/{name}.yaml` | Agent state (cost, turns, session_id) |
+| `~/.deskd/inbox/{sender}/` | Task results for async reading |
+| `~/.deskd/logs/{name}.log` | Agent logs |
+
+## CLI
+
+```bash
+# Start all agents
+deskd serve --config workspace.yaml
+
+# Send task to agent
+deskd agent send <name> "task" --socket <bus.sock>
+
+# Read replies
+deskd agent read <sender>          # e.g. "cli"
+deskd agent read <sender> --clear  # read and delete
+
+# Agent management
+deskd agent list --socket <bus.sock>
+deskd agent stats <name>
+deskd agent create <name> [--prompt ...] [--model ...]
+deskd agent rm <name>
+
+# MCP server (called by Claude via --mcp-config)
+deskd mcp --agent <name>
+```
+
+## Bus Protocol
+
+Unix socket, newline-delimited JSON.
+
+Register: `{"type":"register","name":"cli","subscriptions":["agent:cli"]}`
+Message: `{"type":"message","id":"uuid","source":"cli","target":"agent:dev","payload":{"task":"..."}}`
+List: `{"type":"list"}` → `{"type":"list_response","clients":[...]}`
+
+Routing targets:
+- `agent:<name>` — direct to agent
+- `queue:<name>` — subscription-based multicast
+- `telegram.out:<chat_id>` — to Telegram adapter
+- `broadcast` — to all clients
+- Glob patterns: `telegram.in:*`, `agent:*`
+
+## MCP Server
+
+Newline-delimited JSON-RPC on stdio (NOT Content-Length framed). Tools:
+- `send_message(target, text)` — publish to bus
+- `add_persistent_agent(name, model, system_prompt, subscribe)` — spawn sub-agent
+
+Env vars injected by deskd into Claude process:
+- `DESKD_BUS_SOCKET` — bus socket path
+- `DESKD_AGENT_NAME` — agent name
+- `DESKD_AGENT_CONFIG` — path to deskd.yaml
+
+## Build
+
+```bash
+# Development
+cargo build
+cargo test
+
+# Release (native)
+cargo build --release
+
+# Release (Linux static, for containers/VPS)
+cargo build --release --target x86_64-unknown-linux-musl
+
+# macOS: re-sign after build
+codesign --force --sign - target/release/deskd
+```
+
+Releases are built by GitHub Actions on tag push (`v*`). Download from GitHub Releases.
+
+## Conventions
+
+- Merge directly to main (squash merge, no PRs for owner repos)
+- Commit messages: `description (#issue)` or `description`
+- `cargo test` must pass before merge
+- RUST_LOG=debug for verbose logging to stderr
