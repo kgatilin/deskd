@@ -9,16 +9,26 @@ permissions:
   contents: write
 
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test
+
   build:
+    needs: quality
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             artifact: deskd-linux-amd64
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            artifact: deskd-linux-arm64
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact: deskd-darwin-amd64
@@ -36,21 +46,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install Linux build tools
+      - name: Install musl tools (Linux)
         if: contains(matrix.target, 'linux')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools perl
-
-      - name: Install cross-compilation tools (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          mkdir -p .cargo
-          printf '[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-gnu-gcc"\n' >> .cargo/config.toml
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --features openssl-vendored
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
         run: |
