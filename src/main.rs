@@ -40,6 +40,20 @@ enum Commands {
         #[command(subcommand)]
         action: AgentAction,
     },
+    /// Kill the running `deskd serve` process and restart it with the same config.
+    Restart {
+        /// Path to workspace.yaml. Required if the running process cannot be auto-detected.
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Download the latest deskd release binary, replace the current installation,
+    /// then restart deskd serve if it is running.
+    Upgrade {
+        /// Install directory. Defaults to the directory of the current binary,
+        /// falling back to ~/.local/bin.
+        #[arg(long)]
+        install_dir: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -320,6 +334,12 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", response);
             }
         },
+        Commands::Restart { config } => {
+            restart(config).await?;
+        }
+        Commands::Upgrade { install_dir } => {
+            upgrade(install_dir).await?;
+        }
     }
 
     Ok(())
@@ -335,6 +355,220 @@ fn truncate_main(s: &str, max: usize) -> String {
         }
         format!("{}…", &s[..end])
     }
+}
+
+/// Find a running `deskd serve` process by scanning /proc (Linux only).
+/// Returns (pid, config_path) of the first match found.
+#[cfg(target_os = "linux")]
+fn find_serve_process() -> Option<(u32, String)> {
+    use std::fs;
+    let proc = fs::read_dir("/proc").ok()?;
+    for entry in proc.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let pid: u32 = match name_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        let Ok(cmdline) = fs::read(&cmdline_path) else {
+            continue;
+        };
+        // cmdline entries are NUL-separated
+        let args: Vec<&str> = cmdline
+            .split(|&b| b == 0)
+            .filter_map(|s| {
+                let s = std::str::from_utf8(s).ok()?;
+                if s.is_empty() { None } else { Some(s) }
+            })
+            .collect();
+
+        let is_deskd = args.first().map(|a| a.ends_with("deskd")).unwrap_or(false);
+        let has_serve = args.contains(&"serve");
+        if is_deskd && has_serve {
+            let config = args.windows(2).find_map(|w| {
+                if w[0] == "--config" {
+                    Some(w[1].to_string())
+                } else {
+                    None
+                }
+            });
+            return Some((pid, config.unwrap_or_default()));
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn find_serve_process() -> Option<(u32, String)> {
+    None
+}
+
+/// Kill the running `deskd serve` and restart it with the same (or provided) config.
+async fn restart(config_override: Option<String>) -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    let (pid, detected_config) = match find_serve_process() {
+        Some(p) => p,
+        None => {
+            if let Some(cfg) = config_override {
+                info!("No running deskd serve found — starting fresh with {}", cfg);
+                serve(cfg).await?;
+                return Ok(());
+            }
+            anyhow::bail!(
+                "No running `deskd serve` process found. \
+                 Pass --config to start one, or start it manually first."
+            );
+        }
+    };
+
+    let config_path = config_override
+        .or_else(|| {
+            if detected_config.is_empty() {
+                None
+            } else {
+                Some(detected_config.clone())
+            }
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Found deskd serve (pid {}) but could not determine its --config path. \
+                 Pass --config explicitly.",
+                pid
+            )
+        })?;
+
+    info!(pid = pid, config = %config_path, "sending SIGTERM to deskd serve");
+    let kill_status = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run kill: {}", e))?;
+    if !kill_status.success() {
+        anyhow::bail!("kill -TERM {} failed: {}", pid, kill_status);
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "deskd serve (pid {}) did not exit within 10 s after SIGTERM",
+                pid
+            );
+        }
+    }
+    info!(pid = pid, "old deskd serve exited — restarting");
+
+    serve(config_path).await
+}
+
+/// Download the latest deskd binary from GitHub Releases and replace the current binary.
+/// Restarts deskd serve if it is running.
+async fn upgrade(install_dir_override: Option<String>) -> anyhow::Result<()> {
+    let install_dir = if let Some(dir) = install_dir_override {
+        std::path::PathBuf::from(dir)
+    } else {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+                std::path::PathBuf::from(home).join(".local").join("bin")
+            })
+    };
+
+    let os_name = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        other => anyhow::bail!("Unsupported OS for upgrade: {}", other),
+    };
+    let arch_name = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => anyhow::bail!("Unsupported architecture for upgrade: {}", other),
+    };
+
+    let artifact = format!("deskd-{}-{}", os_name, arch_name);
+    let url = format!(
+        "https://github.com/kgatilin/deskd/releases/latest/download/{}",
+        artifact
+    );
+
+    println!("Downloading {} ...", url);
+    std::fs::create_dir_all(&install_dir)?;
+
+    let tmp_path = install_dir.join(".deskd-upgrade.tmp");
+    let dest_path = install_dir.join("deskd");
+
+    let status = std::process::Command::new("curl")
+        .args([
+            "-fsSL",
+            &url,
+            "-o",
+            tmp_path.to_str().unwrap_or("/tmp/.deskd-upgrade.tmp"),
+        ])
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run curl: {}", e))?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "curl download failed (exit {}). Check https://github.com/kgatilin/deskd/releases",
+            status
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    std::fs::rename(&tmp_path, &dest_path)?;
+    println!("Installed: {}", dest_path.display());
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("codesign")
+            .args([
+                "--force",
+                "--sign",
+                "-",
+                dest_path.to_str().unwrap_or("deskd"),
+            ])
+            .status();
+    }
+
+    match find_serve_process() {
+        Some((pid, ref config_path)) if !config_path.is_empty() => {
+            println!(
+                "Restarting deskd serve (pid {}) with config {}",
+                pid, config_path
+            );
+            restart(Some(config_path.clone())).await?;
+        }
+        Some((pid, _)) => {
+            println!(
+                "deskd serve (pid {}) is running but config path is unknown — \
+                 please restart it manually.",
+                pid
+            );
+        }
+        None => {
+            println!("No running deskd serve detected — upgrade complete.");
+        }
+    }
+
+    Ok(())
 }
 
 /// Start per-agent buses and workers for all agents in workspace config.
