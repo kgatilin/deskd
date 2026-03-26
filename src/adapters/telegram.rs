@@ -79,8 +79,16 @@ pub async fn run(
         let name = agent_name.clone();
         let mention_only: std::collections::HashSet<i64> = mention_only_chats.into_iter().collect();
         tokio::spawn(async move {
-            if let Err(e) =
-                polling_loop(bot, socket, name, bot_username, allowed_chats, mention_only, chat_names).await
+            if let Err(e) = polling_loop(
+                bot,
+                socket,
+                name,
+                bot_username,
+                allowed_chats,
+                mention_only,
+                chat_names,
+            )
+            .await
             {
                 tracing::error!(error = %e, "telegram polling loop failed");
             }
