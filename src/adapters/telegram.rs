@@ -7,12 +7,12 @@
 /// The adapter ignores messages from the bot itself to prevent reply loops.
 /// Outbound text is converted from Markdown to Telegram HTML before sending.
 use anyhow::{Context, Result};
+use base64::Engine;
 use serde_json::Value;
 use std::collections::HashMap;
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{ChatAction, ParseMode};
-use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -273,30 +273,20 @@ async fn outbound_sender(bot: Bot, mut rx: mpsc::UnboundedReceiver<OutboundCmd>)
     }
 }
 
-/// Download a Telegram photo to `/tmp/deskd-photos/<file_id>.jpg` and return the local path.
+/// Download a Telegram photo into memory and return its base64-encoded bytes.
 /// Takes the largest available size (last element in the PhotoSize array).
-async fn download_photo(bot: &Bot, file_id: &str) -> Result<String> {
-    let dir = "/tmp/deskd-photos";
-    fs::create_dir_all(dir)
-        .await
-        .with_context(|| format!("failed to create photo dir {}", dir))?;
-
-    let dest_path = format!("{}/{}.jpg", dir, file_id);
-
+async fn download_photo_base64(bot: &Bot, file_id: &str) -> Result<String> {
     let tg_file = bot
         .get_file(file_id)
         .await
         .with_context(|| format!("failed to get file info for {}", file_id))?;
 
-    let mut dest = fs::File::create(&dest_path)
-        .await
-        .with_context(|| format!("failed to create {}", dest_path))?;
-
-    bot.download_file(&tg_file.path, &mut dest)
+    let mut buf: Vec<u8> = Vec::new();
+    bot.download_file(&tg_file.path, &mut buf)
         .await
         .with_context(|| format!("failed to download file {}", file_id))?;
 
-    Ok(dest_path)
+    Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
 }
 
 /// Poll Telegram for incoming messages and publish them to the bus as `telegram.in:<chat_id>`.
@@ -326,17 +316,19 @@ async fn polling_loop(
                 return Ok(());
             }
 
-            // Determine the task text from the message.
-            // Photos are downloaded and prepended as `[photo: <path>]\n<caption>`.
+            // Determine the task text and optional image data from the message.
+            // Photos are base64-encoded in memory and passed alongside the caption.
             // Pure text messages are passed through unchanged.
+            let mut image_base64: Option<String> = None;
             let task_text: Option<String> = if let Some(photos) = msg.photo() {
                 // Take the largest photo (Telegram sends sizes smallest → largest).
                 if let Some(largest) = photos.last() {
                     let file_id = largest.file.id.clone();
-                    match download_photo(&bot, &file_id).await {
-                        Ok(path) => {
+                    match download_photo_base64(&bot, &file_id).await {
+                        Ok(b64) => {
+                            image_base64 = Some(b64);
                             let caption = msg.caption().unwrap_or("[photo attached]");
-                            Some(format!("[photo: {}]\n{}", path, caption))
+                            Some(caption.to_string())
                         }
                         Err(e) => {
                             warn!(file_id = %file_id, error = %e, "failed to download Telegram photo");
@@ -377,7 +369,7 @@ async fn polling_loop(
                 debug!(agent = %agent, chat_id = chat_id, "received Telegram message");
 
                 if let Err(e) =
-                    publish_to_bus(&socket, &agent, &text, &target, &reply_to, chat_id, chat_name)
+                    publish_to_bus(&socket, &agent, &text, &target, &reply_to, chat_id, chat_name, image_base64.as_deref())
                         .await
                 {
                     warn!(chat_id = chat_id, error = %e, "failed to publish message to bus");
@@ -395,6 +387,9 @@ async fn polling_loop(
 }
 
 /// Publish an incoming Telegram message to the bus as `telegram.in:<chat_id>`.
+/// When `image_base64` is provided, the payload includes `image_base64` and `image_media_type`
+/// so the worker can send a multimodal message to Claude via stream-json.
+#[allow(clippy::too_many_arguments)]
 async fn publish_to_bus(
     socket_path: &str,
     agent_name: &str,
@@ -403,6 +398,7 @@ async fn publish_to_bus(
     reply_to: &str,
     chat_id: i64,
     chat_name: Option<String>,
+    image_base64: Option<&str>,
 ) -> Result<()> {
     let mut stream = UnixStream::connect(socket_path)
         .await
@@ -417,16 +413,23 @@ async fn publish_to_bus(
     reg_line.push('\n');
     stream.write_all(reg_line.as_bytes()).await?;
 
+    let mut payload = serde_json::json!({
+        "task": text,
+        "telegram_chat_id": chat_id,
+        "telegram_chat_name": chat_name,
+    });
+
+    if let Some(b64) = image_base64 {
+        payload["image_base64"] = serde_json::Value::String(b64.to_string());
+        payload["image_media_type"] = serde_json::Value::String("image/jpeg".to_string());
+    }
+
     let msg = serde_json::json!({
         "type": "message",
         "id": Uuid::new_v4().to_string(),
         "source": format!("telegram-{}", agent_name),
         "target": target,
-        "payload": {
-            "task": text,
-            "telegram_chat_id": chat_id,
-            "telegram_chat_name": chat_name,
-        },
+        "payload": payload,
         "reply_to": reply_to,
         "metadata": {"priority": 5u8},
     });

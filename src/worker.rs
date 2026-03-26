@@ -115,6 +115,18 @@ pub async fn run(name: &str, socket_path: &str, bus_socket: Option<String>) -> R
             continue;
         }
 
+        // Extract optional image data from payload (sent by Telegram adapter for photos).
+        let image_base64 = msg
+            .payload
+            .get("image_base64")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let image_media_type = msg
+            .payload
+            .get("image_media_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         // Prepend channel context so the agent knows where the message came from.
         let task_owned;
         let task =
@@ -183,9 +195,16 @@ pub async fn run(name: &str, socket_path: &str, bus_socket: Option<String>) -> R
                 }
             });
 
-            let result =
-                agent::send_streaming(name, task, max_turns, bus_socket.as_deref(), progress_tx)
-                    .await;
+            let image = image_base64.as_deref().zip(image_media_type.as_deref());
+            let result = agent::send_streaming(
+                name,
+                task,
+                max_turns,
+                bus_socket.as_deref(),
+                progress_tx,
+                image,
+            )
+            .await;
             fwd_task.await.ok();
 
             // Signal typing stop
