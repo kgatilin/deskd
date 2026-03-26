@@ -1,3 +1,4 @@
+mod adapters;
 mod agent;
 mod bus;
 mod config;
@@ -227,6 +228,18 @@ async fn serve(socket: String, config_path: Option<String>) -> anyhow::Result<()
             tokio::spawn(async move {
                 if let Err(e) = worker::run(&name, &sock).await {
                     tracing::error!(agent = %name, error = %e, "worker exited with error");
+                }
+            });
+        }
+
+        // Start Telegram adapter if configured.
+        if let Some(ref tg) = ws.adapters.telegram {
+            let token = tg.token.clone();
+            let sock = effective_socket.clone();
+            info!("starting Telegram adapter");
+            tokio::spawn(async move {
+                if let Err(e) = adapters::telegram::run(token, sock).await {
+                    tracing::error!(error = %e, "Telegram adapter exited with error");
                 }
             });
         }
