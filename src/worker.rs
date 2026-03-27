@@ -360,7 +360,8 @@ pub async fn run(
             }
         };
 
-        // Drop progress_tx so fwd_task finishes.
+        // Drop the future to release borrows on process and progress_tx.
+        drop(task_fut);
         drop(progress_tx);
         let full_response = fwd_task.await.unwrap_or_default();
 

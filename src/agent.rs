@@ -207,33 +207,6 @@ pub async fn send(
     send_inner(name, message, max_turns, bus_socket, None, None, None).await
 }
 
-/// Like `send`, but streams each assistant text block to `progress_tx` as it arrives.
-/// Still returns the full concatenated response when done.
-/// When `image` is Some((base64_data, media_type)), the message is sent as multimodal
-/// content via stream-json input format, allowing Claude to see the image.
-/// When `inject_rx` is Some, messages received on that channel are forwarded to Claude's
-/// stdin as new user turns while the task is running, enabling mid-task redirection.
-pub async fn send_streaming(
-    name: &str,
-    message: &str,
-    max_turns: Option<u32>,
-    bus_socket: Option<&str>,
-    progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
-    image: Option<(&str, &str)>,
-    inject_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
-) -> Result<String> {
-    send_inner(
-        name,
-        message,
-        max_turns,
-        bus_socket,
-        Some(progress_tx),
-        image,
-        inject_rx,
-    )
-    .await
-}
-
 /// Format a plain text message as a stream-json user turn line (with trailing newline).
 fn format_user_message(text: &str) -> String {
     let msg = serde_json::json!({
@@ -759,10 +732,6 @@ pub struct AgentProcess {
     child: tokio::sync::Mutex<Option<tokio::process::Child>>,
     /// Agent name.
     name: String,
-    /// Bus socket path.
-    bus_socket: String,
-    /// Number of consecutive start failures (for backoff).
-    restart_failures: std::sync::atomic::AtomicU32,
     /// Last cumulative cost reported by Claude (for computing deltas).
     /// Claude's `total_cost_usd` is session-cumulative, not per-task.
     last_reported_cost: tokio::sync::Mutex<f64>,
@@ -780,8 +749,6 @@ impl AgentProcess {
             event_rx: tokio::sync::Mutex::new(event_rx),
             child: tokio::sync::Mutex::new(Some(child)),
             name: name.to_string(),
-            bus_socket: bus_socket.to_string(),
-            restart_failures: std::sync::atomic::AtomicU32::new(0),
             last_reported_cost: tokio::sync::Mutex::new(0.0),
             last_reported_turns: tokio::sync::Mutex::new(0),
         })
@@ -986,21 +953,21 @@ impl AgentProcess {
                     assistant_turns += 1;
 
                     // Check turn limit.
-                    if let Some(max) = limits.max_turns {
-                        if assistant_turns > max {
-                            warn!(
-                                agent = %self.name,
-                                turns = assistant_turns,
-                                max = max,
-                                "turn limit exceeded mid-task, killing process"
-                            );
-                            self.kill().await;
-                            bail!(
-                                "task killed: exceeded {} turn limit ({} turns)",
-                                max,
-                                assistant_turns
-                            );
-                        }
+                    if let Some(max) = limits.max_turns
+                        && assistant_turns > max
+                    {
+                        warn!(
+                            agent = %self.name,
+                            turns = assistant_turns,
+                            max = max,
+                            "turn limit exceeded mid-task, killing process"
+                        );
+                        self.kill().await;
+                        bail!(
+                            "task killed: exceeded {} turn limit ({} turns)",
+                            max,
+                            assistant_turns
+                        );
                     }
 
                     if let Some(tx) = &progress_tx {
@@ -1010,9 +977,6 @@ impl AgentProcess {
                 }
                 Some(StdoutEvent::Result(mut result)) => {
                     result.response_text = response_text;
-                    // Reset failure count on success.
-                    self.restart_failures
-                        .store(0, std::sync::atomic::Ordering::Relaxed);
 
                     // Compute deltas: Claude's total_cost_usd and num_turns are
                     // session-cumulative, not per-task. We track the last reported
@@ -1036,16 +1000,16 @@ impl AgentProcess {
                         let _ = save_state(&state);
 
                         // Check budget limit after updating cost.
-                        if let Some(budget) = limits.budget_usd {
-                            if state.total_cost >= budget {
-                                warn!(
-                                    agent = %self.name,
-                                    cost = state.total_cost,
-                                    budget = budget,
-                                    "budget exceeded, killing process"
-                                );
-                                self.kill().await;
-                            }
+                        if let Some(budget) = limits.budget_usd
+                            && state.total_cost >= budget
+                        {
+                            warn!(
+                                agent = %self.name,
+                                cost = state.total_cost,
+                                budget = budget,
+                                "budget exceeded, killing process"
+                            );
+                            self.kill().await;
                         }
                     }
 
@@ -1074,55 +1038,6 @@ impl AgentProcess {
             let _ = child.wait().await;
         }
         warn!(agent = %self.name, "persistent process killed");
-    }
-
-    /// Check if the underlying process is still alive.
-    pub fn is_alive(&self) -> bool {
-        !self.stdin_tx.is_closed()
-    }
-
-    /// Restart the persistent process (e.g. after a crash).
-    pub async fn restart(&self) -> Result<()> {
-        let failures = self
-            .restart_failures
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if failures >= 3 {
-            bail!(
-                "persistent process crashed {} times, giving up",
-                failures + 1
-            );
-        }
-
-        // Backoff: 1s, 2s, 4s.
-        let delay = std::time::Duration::from_secs(1 << failures);
-        warn!(
-            agent = %self.name,
-            attempt = failures + 1,
-            delay_secs = delay.as_secs(),
-            "restarting persistent process"
-        );
-        tokio::time::sleep(delay).await;
-
-        // Kill old process if still running.
-        if let Some(mut child) = self.child.lock().await.take() {
-            let _ = child.kill().await;
-        }
-
-        let (stdin_tx, event_rx, child) = Self::spawn_process(&self.name, &self.bus_socket).await?;
-
-        // Swap internal handles. We can't replace self.stdin_tx directly since it's not
-        // behind a Mutex, but the old one is already closed (process exited).
-        // This is a limitation — restart() creates new channels but callers hold the old
-        // self reference. We'll handle this by returning a new AgentProcess instead.
-        // For simplicity, we swap what we can:
-        *self.event_rx.lock().await = event_rx;
-        *self.child.lock().await = Some(child);
-
-        // We can't replace stdin_tx (not behind Mutex). The caller should create a new
-        // AgentProcess after restart. Return Ok to signal that spawn succeeded.
-        // The worker will need to handle this by creating a fresh AgentProcess.
-        let _ = stdin_tx; // new stdin_tx is usable but not stored
-        Ok(())
     }
 
     /// Gracefully stop the persistent process.
