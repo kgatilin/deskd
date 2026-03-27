@@ -23,3 +23,16 @@ jobs:
         run: cargo clippy -- -D warnings
       - name: Tests
         run: cargo test
+
+  archlint:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Architecture review
+        uses: mikeshogin/archlint@latest
+        with:
+          directory: './src'
+          format: 'brief'
+          threshold: '10'
+          comment: 'true'
