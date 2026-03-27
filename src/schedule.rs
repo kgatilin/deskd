@@ -69,6 +69,7 @@ async fn fire(def: &ScheduleDef, bus_socket: &str, agent_name: &str) -> Result<(
     match def.action {
         ScheduleAction::Raw => fire_raw(def, bus_socket, agent_name).await,
         ScheduleAction::GithubPoll => fire_github_poll(def, bus_socket, agent_name).await,
+        ScheduleAction::Shell => fire_shell(def, bus_socket, agent_name).await,
     }
 }
 
@@ -165,6 +166,54 @@ async fn fetch_github_issues(repo: &str, label: &str) -> Result<Vec<serde_json::
     let issues: Vec<serde_json::Value> =
         serde_json::from_slice(&output.stdout).context("failed to parse gh output")?;
     Ok(issues)
+}
+
+/// Run an arbitrary shell command via `sh -c`.
+/// If the command exits successfully and produces stdout, it is posted to the bus target.
+/// If the command fails, the error is logged (no bus message).
+async fn fire_shell(def: &ScheduleDef, bus_socket: &str, agent_name: &str) -> Result<()> {
+    let command = def
+        .config
+        .as_ref()
+        .and_then(|c| c.get("command"))
+        .and_then(|v| v.as_str())
+        .or_else(|| def.config.as_ref().and_then(|c| c.as_str()))
+        .unwrap_or_else(|| {
+            warn!(agent = %agent_name, "shell schedule has no command, skipping");
+            ""
+        });
+
+    if command.is_empty() {
+        return Ok(());
+    }
+
+    info!(agent = %agent_name, command = %command, "shell schedule firing");
+
+    let output = tokio::process::Command::new("sh")
+        .args(["-c", command])
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn shell command: {}", command))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(
+            agent = %agent_name,
+            command = %command,
+            exit_code = ?output.status.code(),
+            stderr = %stderr.trim(),
+            "shell schedule command failed"
+        );
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = stdout.trim();
+    if !text.is_empty() && !def.target.is_empty() {
+        post_to_bus(bus_socket, agent_name, &def.target, text).await?;
+    }
+
+    Ok(())
 }
 
 /// Post a task message to the bus.

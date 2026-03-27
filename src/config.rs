@@ -209,6 +209,10 @@ pub enum ScheduleAction {
     GithubPoll,
     /// Post a static payload string to the target.
     Raw,
+    /// Run an arbitrary shell command via `sh -c`.
+    /// `config.command` — the shell command to execute.
+    /// If the command produces stdout and `target` is non-empty, stdout is posted to the bus.
+    Shell,
 }
 
 impl UserConfig {
