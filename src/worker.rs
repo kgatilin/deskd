@@ -128,10 +128,7 @@ pub async fn run(
     let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
 
     // Start persistent Claude process (reused across tasks).
-    let effective_bus = bus_socket
-        .as_deref()
-        .unwrap_or(socket_path)
-        .to_string();
+    let effective_bus = bus_socket.as_deref().unwrap_or(socket_path).to_string();
     let mut process = agent::AgentProcess::start(name, &effective_bus).await?;
 
     // Build task limits from agent config — enforced in real-time during tasks.
