@@ -408,6 +408,20 @@ pub async fn run(
                     serde_json::json!({"final": true, "in_reply_to": msg.id}),
                 )
                 .await;
+
+                // Post-task budget check: if exceeded, kill process to prevent
+                // further spending. Next task will hit the pre-task budget check.
+                if let Ok(st) = agent::load_state(name) {
+                    if st.total_cost >= budget_usd {
+                        warn!(
+                            agent = %name,
+                            cost = st.total_cost,
+                            budget = budget_usd,
+                            "budget exceeded after task, killing process"
+                        );
+                        process.kill().await;
+                    }
+                }
             }
             Err(e) => {
                 let err_str = format!("{}", e);

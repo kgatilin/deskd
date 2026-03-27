@@ -1001,6 +1001,16 @@ impl AgentProcess {
             .map_err(|_| anyhow::anyhow!("persistent process stdin closed"))
     }
 
+    /// Kill the running process immediately (e.g. budget exceeded mid-task).
+    /// The process can be restarted later with a fresh AgentProcess::start().
+    pub async fn kill(&self) {
+        if let Some(mut child) = self.child.lock().await.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        warn!(agent = %self.name, "persistent process killed");
+    }
+
     /// Check if the underlying process is still alive.
     pub fn is_alive(&self) -> bool {
         !self.stdin_tx.is_closed()
