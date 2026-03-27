@@ -142,6 +142,9 @@ pub struct UserConfig {
     /// Example: '{"mcpServers":{"deskd":{"command":"deskd","args":["mcp","--agent","kira"]}}}'
     #[serde(default)]
     pub mcp_config: Option<String>,
+    /// State machine model definitions.
+    #[serde(default)]
+    pub models: Vec<ModelDef>,
 }
 
 fn default_model() -> String {
@@ -213,6 +216,42 @@ pub enum ScheduleAction {
     /// `config.command` — the shell command to execute.
     /// If the command produces stdout and `target` is non-empty, stdout is posted to the bus.
     Shell,
+}
+
+/// A state machine model definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub states: Vec<String>,
+    pub initial: String,
+    #[serde(default)]
+    pub terminal: Vec<String>,
+    pub transitions: Vec<TransitionDef>,
+}
+
+/// A transition between states in a model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransitionDef {
+    pub from: String,
+    pub to: String,
+    #[serde(default)]
+    pub trigger: Option<String>,
+    #[serde(default)]
+    pub on: Option<String>,
+    #[serde(default)]
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(rename = "type", default)]
+    pub step_type: Option<String>,
+    #[serde(default)]
+    pub notify: Option<String>,
+    #[serde(default)]
+    pub timeout: Option<String>,
+    #[serde(default)]
+    pub timeout_goto: Option<String>,
 }
 
 impl UserConfig {
@@ -495,6 +534,7 @@ schedules:
             }),
             schedules: vec![],
             mcp_config: None,
+            models: vec![],
         };
         let desc = cfg.send_message_description("kira");
         assert!(desc.contains("agent:dev"));

@@ -6,6 +6,7 @@ mod inbox;
 mod mcp;
 mod message;
 mod schedule;
+mod statemachine;
 mod worker;
 
 use clap::{Parser, Subcommand};
@@ -45,6 +46,14 @@ enum Commands {
         /// Path to workspace.yaml.
         #[arg(long)]
         config: String,
+    },
+    /// State machine: manage models and instances.
+    Sm {
+        /// Path to deskd.yaml with model definitions.
+        #[arg(long, env = "DESKD_AGENT_CONFIG")]
+        config: String,
+        #[command(subcommand)]
+        action: SmAction,
     },
 }
 
@@ -125,6 +134,41 @@ enum AgentAction {
         #[arg(long, default_value = "50")]
         max_turns: u32,
     },
+}
+
+#[derive(Subcommand)]
+enum SmAction {
+    /// List defined models.
+    Models,
+    /// Show a model's states and transitions.
+    Show { model: String },
+    /// Create a new instance of a model.
+    Create {
+        model: String,
+        title: String,
+        #[arg(long)]
+        body: Option<String>,
+    },
+    /// Move an instance to a new state.
+    Move {
+        id: String,
+        state: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Show instance details and history.
+    Status { id: String },
+    /// List instances, optionally filtered.
+    List {
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Cancel an instance (move to terminal state if available).
+    Cancel { id: String },
 }
 
 #[tokio::main]
@@ -409,6 +453,13 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", response);
             }
         },
+        Commands::Sm {
+            config: config_path,
+            action,
+        } => {
+            let user_cfg = config::UserConfig::load(&config_path)?;
+            handle_sm(action, &user_cfg)?;
+        }
         Commands::Status {
             config: config_path,
         } => {
@@ -444,6 +495,177 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn handle_sm(action: SmAction, user_cfg: &config::UserConfig) -> anyhow::Result<()> {
+    match action {
+        SmAction::Models => {
+            if user_cfg.models.is_empty() {
+                println!("No models defined");
+            } else {
+                println!("{:<20} {:<8} {:<8} DESCRIPTION", "NAME", "STATES", "TRANS");
+                for m in &user_cfg.models {
+                    println!(
+                        "{:<20} {:<8} {:<8} {}",
+                        m.name,
+                        m.states.len(),
+                        m.transitions.len(),
+                        m.description,
+                    );
+                }
+            }
+        }
+        SmAction::Show { model } => {
+            let m = user_cfg
+                .models
+                .iter()
+                .find(|m| m.name == model)
+                .ok_or_else(|| anyhow::anyhow!("Model '{}' not found", model))?;
+            println!("Model:    {}", m.name);
+            if !m.description.is_empty() {
+                println!("Desc:     {}", m.description);
+            }
+            println!("States:   {}", m.states.join(", "));
+            println!("Initial:  {}", m.initial);
+            println!(
+                "Terminal: {}",
+                if m.terminal.is_empty() {
+                    "-".to_string()
+                } else {
+                    m.terminal.join(", ")
+                }
+            );
+            println!();
+            println!(
+                "{:<15} {:<15} {:<12} {:<12} ASSIGNEE",
+                "FROM", "TO", "TRIGGER", "ON"
+            );
+            for t in &m.transitions {
+                println!(
+                    "{:<15} {:<15} {:<12} {:<12} {}",
+                    t.from,
+                    t.to,
+                    t.trigger.as_deref().unwrap_or("-"),
+                    t.on.as_deref().unwrap_or("-"),
+                    t.assignee.as_deref().unwrap_or("-"),
+                );
+            }
+        }
+        SmAction::Create { model, title, body } => {
+            let m = user_cfg
+                .models
+                .iter()
+                .find(|m| m.name == model)
+                .ok_or_else(|| anyhow::anyhow!("Model '{}' not found", model))?;
+            let creator = std::env::var("DESKD_AGENT_NAME").unwrap_or_else(|_| "cli".to_string());
+            let inst = statemachine::create(m, &title, body.as_deref().unwrap_or(""), &creator)?;
+            println!(
+                "Created {} (model={}, state={})",
+                inst.id, inst.model, inst.state
+            );
+        }
+        SmAction::Move { id, state, note } => {
+            let mut inst = statemachine::load(&id)?;
+            let m = user_cfg
+                .models
+                .iter()
+                .find(|m| m.name == inst.model)
+                .ok_or_else(|| anyhow::anyhow!("Model '{}' not found in config", inst.model))?;
+            let trigger =
+                std::env::var("DESKD_AGENT_NAME").unwrap_or_else(|_| "manual".to_string());
+            statemachine::move_to(&mut inst, m, &state, &trigger, note.as_deref())?;
+            println!("{} -> {} ({})", id, inst.state, inst.model);
+        }
+        SmAction::Status { id } => {
+            let inst = statemachine::load(&id)?;
+            println!("ID:        {}", inst.id);
+            println!("Model:     {}", inst.model);
+            println!("Title:     {}", inst.title);
+            if !inst.body.is_empty() {
+                println!("Body:      {}", inst.body);
+            }
+            println!("State:     {}", inst.state);
+            println!("Assignee:  {}", inst.assignee);
+            if let Some(ref r) = inst.result {
+                println!("Result:    {}", r);
+            }
+            if let Some(ref e) = inst.error {
+                println!("Error:     {}", e);
+            }
+            println!("Created:   {} by {}", inst.created_at, inst.created_by);
+            println!("Updated:   {}", inst.updated_at);
+            if !inst.history.is_empty() {
+                println!();
+                println!("{:<15} {:<15} {:<20} TIMESTAMP", "FROM", "TO", "TRIGGER");
+                for h in &inst.history {
+                    println!(
+                        "{:<15} {:<15} {:<20} {}",
+                        h.from, h.to, h.trigger, h.timestamp,
+                    );
+                }
+            }
+        }
+        SmAction::List {
+            model,
+            state,
+            limit,
+        } => {
+            let mut instances = statemachine::list_all()?;
+            if let Some(ref m) = model {
+                instances.retain(|i| i.model == *m);
+            }
+            if let Some(ref s) = state {
+                instances.retain(|i| i.state == *s);
+            }
+            instances.truncate(limit);
+            if instances.is_empty() {
+                println!("No instances found");
+            } else {
+                println!(
+                    "{:<12} {:<15} {:<12} {:<12} TITLE",
+                    "ID", "MODEL", "STATE", "ASSIGNEE"
+                );
+                for inst in &instances {
+                    println!(
+                        "{:<12} {:<15} {:<12} {:<12} {}",
+                        inst.id,
+                        inst.model,
+                        inst.state,
+                        inst.assignee,
+                        truncate_main(&inst.title, 40),
+                    );
+                }
+            }
+        }
+        SmAction::Cancel { id } => {
+            let mut inst = statemachine::load(&id)?;
+            let m = user_cfg
+                .models
+                .iter()
+                .find(|m| m.name == inst.model)
+                .ok_or_else(|| anyhow::anyhow!("Model '{}' not found in config", inst.model))?;
+            if statemachine::is_terminal(m, &inst) {
+                println!("{} is already in terminal state '{}'", id, inst.state);
+                return Ok(());
+            }
+            // Find a transition to a terminal state from current state.
+            let valid = statemachine::valid_transitions(m, &inst.state);
+            let cancel_target = valid
+                .iter()
+                .find(|t| m.terminal.contains(&t.to))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No transition to a terminal state from '{}' in model '{}'",
+                        inst.state,
+                        m.name
+                    )
+                })?;
+            let target = cancel_target.to.clone();
+            statemachine::move_to(&mut inst, m, &target, "cancel", Some("Cancelled via CLI"))?;
+            println!("{} cancelled -> {}", id, inst.state);
+        }
+    }
     Ok(())
 }
 
