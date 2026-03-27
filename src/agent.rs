@@ -763,6 +763,11 @@ pub struct AgentProcess {
     bus_socket: String,
     /// Number of consecutive start failures (for backoff).
     restart_failures: std::sync::atomic::AtomicU32,
+    /// Last cumulative cost reported by Claude (for computing deltas).
+    /// Claude's `total_cost_usd` is session-cumulative, not per-task.
+    last_reported_cost: tokio::sync::Mutex<f64>,
+    /// Last cumulative turns reported by Claude.
+    last_reported_turns: tokio::sync::Mutex<u32>,
 }
 
 impl AgentProcess {
@@ -777,6 +782,8 @@ impl AgentProcess {
             name: name.to_string(),
             bus_socket: bus_socket.to_string(),
             restart_failures: std::sync::atomic::AtomicU32::new(0),
+            last_reported_cost: tokio::sync::Mutex::new(0.0),
+            last_reported_turns: tokio::sync::Mutex::new(0),
         })
     }
 
@@ -1008,13 +1015,25 @@ impl AgentProcess {
                     self.restart_failures
                         .store(0, std::sync::atomic::Ordering::Relaxed);
 
-                    // Update state file.
+                    // Compute deltas: Claude's total_cost_usd and num_turns are
+                    // session-cumulative, not per-task. We track the last reported
+                    // values to compute the actual delta for this task.
+                    let mut last_cost = self.last_reported_cost.lock().await;
+                    let mut last_turns = self.last_reported_turns.lock().await;
+                    let cost_delta = (result.cost_usd - *last_cost).max(0.0);
+                    let turns_delta = result.num_turns.saturating_sub(*last_turns);
+                    *last_cost = result.cost_usd;
+                    *last_turns = result.num_turns;
+                    drop(last_cost);
+                    drop(last_turns);
+
+                    // Update state file with deltas.
                     if let Ok(mut state) = load_state(&self.name) {
                         if !result.session_id.is_empty() {
                             state.session_id = result.session_id.clone();
                         }
-                        state.total_cost += result.cost_usd;
-                        state.total_turns += result.num_turns;
+                        state.total_cost += cost_delta;
+                        state.total_turns += turns_delta;
                         let _ = save_state(&state);
 
                         // Check budget limit after updating cost.
@@ -1027,8 +1046,6 @@ impl AgentProcess {
                                     "budget exceeded, killing process"
                                 );
                                 self.kill().await;
-                                // Still return the result — the task completed,
-                                // we just won't accept more tasks.
                             }
                         }
                     }
