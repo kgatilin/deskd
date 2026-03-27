@@ -277,7 +277,20 @@ async fn send_inner(
     // Always use stream-json input — needed for both multimodal content and mid-task injection.
     args.push("--input-format=stream-json".to_string());
 
-    debug!(agent = %name, turns, multimodal = image.is_some(), "spawning claude");
+    // Inject --model from agent config (sourced from deskd.yaml) unless the command
+    // array already contains --model (e.g. hardcoded in workspace.yaml).
+    if !state.config.model.is_empty()
+        && !state
+            .config
+            .command
+            .iter()
+            .any(|a| a == "--model" || a.starts_with("--model="))
+    {
+        args.push("--model".to_string());
+        args.push(state.config.model.clone());
+    }
+
+    debug!(agent = %name, turns, model = %state.config.model, multimodal = image.is_some(), "spawning claude");
 
     // Env vars injected into the claude process:
     //   DESKD_BUS_SOCKET  — bus socket for MCP send_message tool
