@@ -9,14 +9,56 @@ use crate::inbox;
 use crate::message::Message;
 
 /// Connect to the bus, register, and return the stream.
+///
+/// Retries up to 10 times with exponential backoff (100ms initial delay,
+/// doubling each attempt) to handle the race where the worker starts
+/// before the bus is listening on the socket.
 pub async fn bus_connect(
     socket_path: &str,
     name: &str,
     subscriptions: Vec<String>,
 ) -> Result<UnixStream> {
-    let mut stream = UnixStream::connect(socket_path)
-        .await
-        .with_context(|| format!("Failed to connect to bus at {}", socket_path))?;
+    let max_retries = 10u32;
+    let initial_delay = std::time::Duration::from_millis(100);
+
+    let mut stream = None;
+    let mut last_err = None;
+    for attempt in 0..max_retries {
+        match UnixStream::connect(socket_path).await {
+            Ok(s) => {
+                if attempt > 0 {
+                    info!(agent = %name, attempt = attempt + 1, "connected to bus after retry");
+                }
+                stream = Some(s);
+                break;
+            }
+            Err(e) => {
+                if attempt + 1 < max_retries {
+                    let delay = initial_delay * 2u32.saturating_pow(attempt);
+                    warn!(
+                        agent = %name,
+                        attempt = attempt + 1,
+                        delay_ms = delay.as_millis() as u64,
+                        "bus not ready, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+
+    let mut stream = match stream {
+        Some(s) => s,
+        None => {
+            return Err(last_err.unwrap()).with_context(|| {
+                format!(
+                    "Failed to connect to bus at {} after {} attempts",
+                    socket_path, max_retries
+                )
+            });
+        }
+    };
 
     let envelope = serde_json::json!({
         "type": "register",
