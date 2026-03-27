@@ -245,6 +245,10 @@ pub struct TelegramRoute {
     pub mention_only: bool,
     /// Human-readable name for this chat, shown to the agent as context.
     pub name: Option<String>,
+    /// Bus target override. When set, incoming messages from this chat are published
+    /// to this target (e.g. "agent:collab") instead of the default "telegram.in:<chat_id>".
+    #[serde(default)]
+    pub route_to: Option<String>,
 }
 
 /// A scheduled action that fires on a cron expression and posts a message to the bus.
@@ -589,6 +593,7 @@ schedules:
                     chat_id: -1003733725513,
                     mention_only: false,
                     name: None,
+                    route_to: None,
                 }],
             }),
             discord: None,
@@ -640,5 +645,25 @@ agents:
 "#;
         let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.agents[0].container.is_none());
+    }
+
+    #[test]
+    fn test_telegram_route_with_route_to() {
+        let yaml = r#"
+telegram:
+  routes:
+    - chat_id: -1003733725513
+      name: "personal"
+    - chat_id: -1003754811357
+      name: "collab"
+      mention_only: true
+      route_to: "agent:collab"
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        let routes = cfg.telegram.unwrap().routes;
+        assert_eq!(routes.len(), 2);
+        assert!(routes[0].route_to.is_none());
+        assert_eq!(routes[1].route_to.as_deref(), Some("agent:collab"));
+        assert!(routes[1].mention_only);
     }
 }

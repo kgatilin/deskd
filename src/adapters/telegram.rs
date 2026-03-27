@@ -51,6 +51,11 @@ impl super::Adapter for TelegramAdapter {
             .iter()
             .filter_map(|r| r.name.as_ref().map(|n| (r.chat_id, n.clone())))
             .collect();
+        let chat_route_to: std::collections::HashMap<i64, String> = self
+            .routes
+            .iter()
+            .filter_map(|r| r.route_to.as_ref().map(|t| (r.chat_id, t.clone())))
+            .collect();
         Box::pin(run(
             self.token,
             bus_socket,
@@ -58,6 +63,7 @@ impl super::Adapter for TelegramAdapter {
             allowed_chats,
             mention_only,
             chat_names,
+            chat_route_to,
         ))
     }
 }
@@ -76,6 +82,7 @@ enum OutboundCmd {
 /// `allowed_chats` is the whitelist of chat_ids to accept messages from — all others are ignored.
 /// `mention_only_chats` is a subset where only @mentions trigger the agent.
 /// `chat_names` maps chat_id to a human-readable name shown to the agent as context.
+/// `chat_route_to` maps chat_id to a bus target override (e.g. "agent:collab").
 pub async fn run(
     token: String,
     socket_path: String,
@@ -83,6 +90,7 @@ pub async fn run(
     allowed_chats: std::collections::HashSet<i64>,
     mention_only_chats: Vec<i64>,
     chat_names: std::collections::HashMap<i64, String>,
+    chat_route_to: std::collections::HashMap<i64, String>,
 ) -> Result<()> {
     info!(agent = %agent_name, "starting Telegram adapter");
 
@@ -134,6 +142,7 @@ pub async fn run(
                 allowed_chats,
                 mention_only,
                 chat_names,
+                chat_route_to,
             )
             .await
             {
@@ -374,6 +383,7 @@ async fn download_photo_base64(bot: &Bot, file_id: &str) -> Result<String> {
 }
 
 /// Poll Telegram for incoming messages and publish them to the bus as `telegram.in:<chat_id>`.
+#[allow(clippy::too_many_arguments)]
 async fn polling_loop(
     bot: Bot,
     socket_path: String,
@@ -382,6 +392,7 @@ async fn polling_loop(
     allowed_chats: std::collections::HashSet<i64>,
     mention_only_chats: std::collections::HashSet<i64>,
     chat_names: std::collections::HashMap<i64, String>,
+    chat_route_to: std::collections::HashMap<i64, String>,
 ) -> Result<()> {
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
         let socket = socket_path.clone();
@@ -390,6 +401,7 @@ async fn polling_loop(
         let allowed = allowed_chats.clone();
         let mention_only = mention_only_chats.clone();
         let names = chat_names.clone();
+        let route_to_map = chat_route_to.clone();
         async move {
             // Skip messages from the bot itself to prevent reply loops.
             if msg.from.as_ref().map(|u| u.username.as_deref() == Some(&bot_user)).unwrap_or(false) {
@@ -446,7 +458,13 @@ async fn polling_loop(
                     }
                 }
 
-                let target = format!("telegram.in:{}", chat_id);
+                // Use route_to override if configured, otherwise default to telegram.in:<chat_id>.
+                let target = if let Some(rt) = route_to_map.get(&chat_id) {
+                    rt.clone()
+                } else {
+                    format!("telegram.in:{}", chat_id)
+                };
+                // reply_to always goes back to Telegram so agent responses reach the chat.
                 let reply_to = format!("telegram.out:{}", chat_id);
                 let chat_name = names.get(&chat_id).cloned();
 
