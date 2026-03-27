@@ -550,8 +550,8 @@ async fn publish_to_bus(
 ///   # / ## / ###   → bold with ▶ / ▸ / • prefix
 ///   --- / *** / ___ → ───────────────────── separator
 ///   > blockquote   → <blockquote>
-///   | table |      → ASCII table inside <pre>
-///   ```code```     → <pre>
+///   \| table \|    → ASCII table inside `<pre>`
+///   \`\`\`code\`\`\` → `<pre>`
 ///
 /// Inline (within each line):
 ///   **bold**, *italic*, ~~strikethrough~~, `code`
