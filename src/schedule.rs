@@ -188,12 +188,14 @@ async fn fire_github_poll(def: &ScheduleDef, bus_socket: &str, agent_name: &str)
         });
 
         let mut count = 0;
+        let mut had_error = false;
 
         if events.contains(&"issues".to_string()) {
             match poll_issues(repo, label, &since, bus_socket, agent_name, &def.target).await {
                 Ok(n) => count += n,
                 Err(e) => {
                     warn!(agent = %agent_name, repo = %repo, error = %e, "github_poll issues failed");
+                    had_error = true;
                 }
             }
         }
@@ -203,15 +205,18 @@ async fn fire_github_poll(def: &ScheduleDef, bus_socket: &str, agent_name: &str)
                 Ok(n) => count += n,
                 Err(e) => {
                     warn!(agent = %agent_name, repo = %repo, error = %e, "github_poll issue_comments failed");
+                    had_error = true;
                 }
             }
         }
 
-        // Update since timestamp after successful poll
-        since_state.insert(
-            repo.clone(),
-            Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        );
+        // Only update since timestamp if all polls succeeded — otherwise retry next cycle.
+        if !had_error {
+            since_state.insert(
+                repo.clone(),
+                Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            );
+        }
 
         if count > 0 {
             info!(agent = %agent_name, repo = %repo, events = count, "github_poll posted events");
