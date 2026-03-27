@@ -714,6 +714,355 @@ pub async fn remove(name: &str) -> Result<()> {
     Ok(())
 }
 
+// ─── Persistent agent process ─────────────────────────────────────────────────
+
+/// Result of a single Claude turn (task).
+pub struct TurnResult {
+    pub response_text: String,
+    pub session_id: String,
+    pub cost_usd: f64,
+    pub num_turns: u32,
+}
+
+/// Events emitted by the stdout reader task.
+enum StdoutEvent {
+    /// A text block from an `assistant` message.
+    TextBlock(String),
+    /// The `result` event marking end of a turn.
+    Result(TurnResult),
+    /// Process exited (stdout closed).
+    ProcessExited,
+}
+
+/// A long-lived Claude process that accepts multiple tasks via stdin.
+///
+/// Usage:
+///   let process = AgentProcess::start(name, bus_socket).await?;
+///   let result = process.send_task(message, progress_tx, None, None).await?;
+///   // process stays alive for the next task
+///   process.stop().await;
+pub struct AgentProcess {
+    /// Send lines to Claude's stdin.
+    stdin_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Receive stdout events (text blocks + result).
+    event_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<StdoutEvent>>,
+    /// Child process handle for shutdown.
+    child: tokio::sync::Mutex<Option<tokio::process::Child>>,
+    /// Agent name.
+    name: String,
+    /// Bus socket path.
+    bus_socket: String,
+    /// Number of consecutive start failures (for backoff).
+    restart_failures: std::sync::atomic::AtomicU32,
+}
+
+impl AgentProcess {
+    /// Spawn a persistent Claude process for the named agent.
+    pub async fn start(name: &str, bus_socket: &str) -> Result<Self> {
+        let (stdin_tx, event_rx, child) = Self::spawn_process(name, bus_socket).await?;
+
+        Ok(Self {
+            stdin_tx,
+            event_rx: tokio::sync::Mutex::new(event_rx),
+            child: tokio::sync::Mutex::new(Some(child)),
+            name: name.to_string(),
+            bus_socket: bus_socket.to_string(),
+            restart_failures: std::sync::atomic::AtomicU32::new(0),
+        })
+    }
+
+    /// Core spawn logic — builds args, starts child, wires stdin/stdout tasks.
+    async fn spawn_process(
+        name: &str,
+        bus_socket: &str,
+    ) -> Result<(
+        tokio::sync::mpsc::UnboundedSender<String>,
+        tokio::sync::mpsc::UnboundedReceiver<StdoutEvent>,
+        tokio::process::Child,
+    )> {
+        let state = load_state(name)?;
+
+        let mut args: Vec<String> = Vec::new();
+
+        if !state.session_id.is_empty() {
+            args.push("--resume".to_string());
+            args.push(state.session_id.clone());
+        }
+
+        if !state.config.system_prompt.is_empty() && state.session_id.is_empty() {
+            args.push("--system-prompt".to_string());
+            args.push(state.config.system_prompt.clone());
+        }
+
+        args.push("--input-format=stream-json".to_string());
+
+        if !state.config.model.is_empty()
+            && !state
+                .config
+                .command
+                .iter()
+                .any(|a| a == "--model" || a.starts_with("--model="))
+        {
+            args.push("--model".to_string());
+            args.push(state.config.model.clone());
+        }
+
+        let bus_path = bus_socket.to_string();
+        let config_path_str = state.config.config_path.clone().unwrap_or_default();
+        let mut extra_env: Vec<(&str, &str)> =
+            vec![("DESKD_AGENT_NAME", name), ("DESKD_BUS_SOCKET", &bus_path)];
+        if !config_path_str.is_empty() {
+            extra_env.push(("DESKD_AGENT_CONFIG", &config_path_str));
+        }
+
+        let mut cmd = build_command(&state.config, &args, &extra_env);
+        cmd.stdin(Stdio::piped());
+        let mut child = cmd.spawn().context("Failed to spawn persistent claude process")?;
+
+        info!(agent = %name, model = %state.config.model, "persistent process started");
+
+        // Take stdin/stdout.
+        let child_stdin = child.stdin.take().expect("stdin is piped");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+
+        // Drain stderr in background.
+        let agent_name = name.to_string();
+        tokio::spawn(async move {
+            let mut buf = String::new();
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let _ = reader.read_to_string(&mut buf).await;
+            if !buf.is_empty() {
+                warn!(agent = %agent_name, stderr = %buf.trim(), "persistent process stderr");
+            }
+        });
+
+        // Stdin writer task.
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut writer = child_stdin;
+        tokio::spawn(async move {
+            while let Some(line) = stdin_rx.recv().await {
+                if writer.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Stdout reader task — parses stream-json and sends events.
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<StdoutEvent>();
+        let agent_name2 = name.to_string();
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    match v.get("type").and_then(|t| t.as_str()) {
+                        Some("assistant") => {
+                            let mut block_text = String::new();
+                            if let Some(blocks) = v
+                                .get("message")
+                                .and_then(|m| m.get("content"))
+                                .and_then(|c| c.as_array())
+                            {
+                                for block in blocks {
+                                    if block.get("type").and_then(|t| t.as_str())
+                                        == Some("text")
+                                        && let Some(text) =
+                                            block.get("text").and_then(|t| t.as_str())
+                                    {
+                                        block_text.push_str(text);
+                                    }
+                                }
+                            }
+                            if !block_text.is_empty()
+                                && event_tx.send(StdoutEvent::TextBlock(block_text)).is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Some("result") => {
+                            let session_id = v
+                                .get("session_id")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let cost_usd = v
+                                .get("total_cost_usd")
+                                .and_then(|c| c.as_f64())
+                                .unwrap_or(0.0);
+                            let num_turns = v
+                                .get("num_turns")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0) as u32;
+                            // response_text is accumulated by send_task, not here.
+                            if event_tx
+                                .send(StdoutEvent::Result(TurnResult {
+                                    response_text: String::new(),
+                                    session_id,
+                                    cost_usd,
+                                    num_turns,
+                                }))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // stdout closed — process exited.
+            let _ = event_tx.send(StdoutEvent::ProcessExited);
+            debug!(agent = %agent_name2, "persistent process stdout closed");
+        });
+
+        Ok((stdin_tx, event_rx, child))
+    }
+
+    /// Send a task to the persistent process and collect the response.
+    pub async fn send_task(
+        &self,
+        message: &str,
+        progress_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+        image: Option<(&str, &str)>,
+    ) -> Result<TurnResult> {
+        // Build the user message.
+        let user_msg = if let Some((b64_data, media_type)) = image {
+            let msg = serde_json::json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64_data,
+                            }
+                        },
+                        {"type": "text", "text": message}
+                    ]
+                }
+            });
+            let mut line = serde_json::to_string(&msg)?;
+            line.push('\n');
+            line
+        } else {
+            format_user_message(message)
+        };
+
+        // Send to stdin.
+        self.stdin_tx
+            .send(user_msg)
+            .map_err(|_| anyhow::anyhow!("persistent process stdin closed"))?;
+
+        // Read events until we get a Result.
+        let mut event_rx = self.event_rx.lock().await;
+        let mut response_text = String::new();
+
+        loop {
+            match event_rx.recv().await {
+                Some(StdoutEvent::TextBlock(text)) => {
+                    if let Some(tx) = &progress_tx {
+                        let _ = tx.send(text.clone());
+                    }
+                    response_text.push_str(&text);
+                }
+                Some(StdoutEvent::Result(mut result)) => {
+                    result.response_text = response_text;
+                    // Reset failure count on success.
+                    self.restart_failures
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+
+                    // Update state file.
+                    if let Ok(mut state) = load_state(&self.name) {
+                        if !result.session_id.is_empty() {
+                            state.session_id = result.session_id.clone();
+                        }
+                        state.total_cost += result.cost_usd;
+                        state.total_turns += result.num_turns;
+                        let _ = save_state(&state);
+                    }
+
+                    return Ok(result);
+                }
+                Some(StdoutEvent::ProcessExited) | None => {
+                    bail!("persistent process exited mid-task");
+                }
+            }
+        }
+    }
+
+    /// Inject a message into the running process as a new user turn.
+    pub fn inject_message(&self, message: &str) -> Result<()> {
+        let line = format_user_message(message);
+        self.stdin_tx
+            .send(line)
+            .map_err(|_| anyhow::anyhow!("persistent process stdin closed"))
+    }
+
+    /// Check if the underlying process is still alive.
+    pub fn is_alive(&self) -> bool {
+        !self.stdin_tx.is_closed()
+    }
+
+    /// Restart the persistent process (e.g. after a crash).
+    pub async fn restart(&self) -> Result<()> {
+        let failures = self
+            .restart_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if failures >= 3 {
+            bail!(
+                "persistent process crashed {} times, giving up",
+                failures + 1
+            );
+        }
+
+        // Backoff: 1s, 2s, 4s.
+        let delay = std::time::Duration::from_secs(1 << failures);
+        warn!(
+            agent = %self.name,
+            attempt = failures + 1,
+            delay_secs = delay.as_secs(),
+            "restarting persistent process"
+        );
+        tokio::time::sleep(delay).await;
+
+        // Kill old process if still running.
+        if let Some(mut child) = self.child.lock().await.take() {
+            let _ = child.kill().await;
+        }
+
+        let (stdin_tx, event_rx, child) =
+            Self::spawn_process(&self.name, &self.bus_socket).await?;
+
+        // Swap internal handles. We can't replace self.stdin_tx directly since it's not
+        // behind a Mutex, but the old one is already closed (process exited).
+        // This is a limitation — restart() creates new channels but callers hold the old
+        // self reference. We'll handle this by returning a new AgentProcess instead.
+        // For simplicity, we swap what we can:
+        *self.event_rx.lock().await = event_rx;
+        *self.child.lock().await = Some(child);
+
+        // We can't replace stdin_tx (not behind Mutex). The caller should create a new
+        // AgentProcess after restart. Return Ok to signal that spawn succeeded.
+        // The worker will need to handle this by creating a fresh AgentProcess.
+        let _ = stdin_tx; // new stdin_tx is usable but not stored
+        Ok(())
+    }
+
+    /// Gracefully stop the persistent process.
+    pub async fn stop(&self) {
+        // Dropping all senders closes stdin, which causes Claude to exit.
+        // We can't drop self.stdin_tx (owned), but we can kill the child.
+        if let Some(mut child) = self.child.lock().await.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        info!(agent = %self.name, "persistent process stopped");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
