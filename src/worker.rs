@@ -134,6 +134,16 @@ pub async fn run(
         .to_string();
     let mut process = agent::AgentProcess::start(name, &effective_bus).await?;
 
+    // Build task limits from agent config — enforced in real-time during tasks.
+    let limits = agent::TaskLimits {
+        max_turns: if initial_state.config.max_turns > 0 {
+            Some(initial_state.config.max_turns)
+        } else {
+            None
+        },
+        budget_usd: Some(budget_usd),
+    };
+
     info!(agent = %name, "persistent process ready, waiting for tasks");
 
     while let Some(line) = lines.next_line().await? {
@@ -320,7 +330,7 @@ pub async fn run(
         // Use the persistent process. send_task writes to its stdin and reads
         // stdout events until the result event marks the turn complete.
         let mut task_fut =
-            Box::pin(process.send_task(task, Some(&progress_tx), image));
+            Box::pin(process.send_task(task, Some(&progress_tx), image, &limits));
 
         // Concurrently await task completion OR new bus messages for injection.
         let result = loop {
@@ -409,19 +419,6 @@ pub async fn run(
                 )
                 .await;
 
-                // Post-task budget check: if exceeded, kill process to prevent
-                // further spending. Next task will hit the pre-task budget check.
-                if let Ok(st) = agent::load_state(name) {
-                    if st.total_cost >= budget_usd {
-                        warn!(
-                            agent = %name,
-                            cost = st.total_cost,
-                            budget = budget_usd,
-                            "budget exceeded after task, killing process"
-                        );
-                        process.kill().await;
-                    }
-                }
             }
             Err(e) => {
                 let err_str = format!("{}", e);

@@ -716,6 +716,15 @@ pub async fn remove(name: &str) -> Result<()> {
 
 // ─── Persistent agent process ─────────────────────────────────────────────────
 
+/// External limits enforced during a task. All control lives outside Claude.
+#[derive(Debug, Clone, Default)]
+pub struct TaskLimits {
+    /// Max assistant turns (tool-use loops) before killing the process.
+    pub max_turns: Option<u32>,
+    /// Max cumulative cost (USD) for this agent before killing.
+    pub budget_usd: Option<f64>,
+}
+
 /// Result of a single Claude turn (task).
 pub struct TurnResult {
     pub response_text: String,
@@ -919,11 +928,15 @@ impl AgentProcess {
     }
 
     /// Send a task to the persistent process and collect the response.
+    ///
+    /// Enforces `limits` in real-time: if max_turns or budget is exceeded
+    /// mid-task, the process is killed immediately.
     pub async fn send_task(
         &self,
         message: &str,
         progress_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
         image: Option<(&str, &str)>,
+        limits: &TaskLimits,
     ) -> Result<TurnResult> {
         // Build the user message.
         let user_msg = if let Some((b64_data, media_type)) = image {
@@ -956,13 +969,34 @@ impl AgentProcess {
             .send(user_msg)
             .map_err(|_| anyhow::anyhow!("persistent process stdin closed"))?;
 
-        // Read events until we get a Result.
+        // Read events until we get a Result, enforcing limits on each event.
         let mut event_rx = self.event_rx.lock().await;
         let mut response_text = String::new();
+        let mut assistant_turns = 0u32;
 
         loop {
             match event_rx.recv().await {
                 Some(StdoutEvent::TextBlock(text)) => {
+                    assistant_turns += 1;
+
+                    // Check turn limit.
+                    if let Some(max) = limits.max_turns {
+                        if assistant_turns > max {
+                            warn!(
+                                agent = %self.name,
+                                turns = assistant_turns,
+                                max = max,
+                                "turn limit exceeded mid-task, killing process"
+                            );
+                            self.kill().await;
+                            bail!(
+                                "task killed: exceeded {} turn limit ({} turns)",
+                                max,
+                                assistant_turns
+                            );
+                        }
+                    }
+
                     if let Some(tx) = &progress_tx {
                         let _ = tx.send(text.clone());
                     }
@@ -982,6 +1016,21 @@ impl AgentProcess {
                         state.total_cost += result.cost_usd;
                         state.total_turns += result.num_turns;
                         let _ = save_state(&state);
+
+                        // Check budget limit after updating cost.
+                        if let Some(budget) = limits.budget_usd {
+                            if state.total_cost >= budget {
+                                warn!(
+                                    agent = %self.name,
+                                    cost = state.total_cost,
+                                    budget = budget,
+                                    "budget exceeded, killing process"
+                                );
+                                self.kill().await;
+                                // Still return the result — the task completed,
+                                // we just won't accept more tasks.
+                            }
+                        }
                     }
 
                     return Ok(result);
