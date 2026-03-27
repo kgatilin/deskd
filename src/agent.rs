@@ -520,7 +520,7 @@ fn build_container_command(
 
     // User-defined mounts from container config.
     for mount in &container.mounts {
-        let expanded = expand_tilde(mount);
+        let expanded = normalize_mount(&expand_tilde(mount));
         cmd.args(["-v", &expanded]);
     }
 
@@ -588,20 +588,33 @@ fn expand_tilde(path: &str) -> String {
 
     match parts.len() {
         1 => expand(parts[0]),
+        2 => format!("{}:{}", expand(parts[0]), expand(parts[1])),
+        3 => format!("{}:{}:{}", expand(parts[0]), expand(parts[1]), parts[2]),
+        _ => path.to_string(),
+    }
+}
+
+/// Normalize a mount spec to always have src:dst[:opts].
+/// "path" → "path:path"
+/// "path:ro" → "path:path:ro"
+/// "src:dst" → "src:dst" (unchanged)
+/// "src:dst:ro" → "src:dst:ro" (unchanged)
+fn normalize_mount(mount: &str) -> String {
+    let parts: Vec<&str> = mount.splitn(3, ':').collect();
+    match parts.len() {
+        1 => {
+            // "path" → "path:path"
+            format!("{}:{}", parts[0], parts[0])
+        }
         2 => {
-            // Could be "src:ro" or "src:dst"
-            let a = expand(parts[0]);
-            let b_raw = parts[1];
-            if b_raw == "ro" || b_raw == "rw" {
-                format!("{}:{}", a, b_raw)
+            // Could be "src:dst" or "path:ro"/"path:rw"
+            if parts[1] == "ro" || parts[1] == "rw" {
+                format!("{}:{}:{}", parts[0], parts[0], parts[1])
             } else {
-                format!("{}:{}", a, expand(b_raw))
+                mount.to_string()
             }
         }
-        3 => {
-            format!("{}:{}:{}", expand(parts[0]), expand(parts[1]), parts[2])
-        }
-        _ => path.to_string(),
+        _ => mount.to_string(),
     }
 }
 
@@ -775,8 +788,29 @@ created_at: "2024-01-01T00:00:00Z"
     #[test]
     fn test_expand_tilde_with_ro() {
         let home = std::env::var("HOME").unwrap();
+        // expand_tilde treats "ro" as a path segment; normalize_mount fixes it later.
         let result = expand_tilde("~/.ssh:ro");
         assert_eq!(result, format!("{}/.ssh:ro", home));
+    }
+
+    #[test]
+    fn test_normalize_mount_path_only() {
+        assert_eq!(normalize_mount("/foo"), "/foo:/foo");
+    }
+
+    #[test]
+    fn test_normalize_mount_path_ro() {
+        assert_eq!(normalize_mount("/foo:ro"), "/foo:/foo:ro");
+    }
+
+    #[test]
+    fn test_normalize_mount_src_dst() {
+        assert_eq!(normalize_mount("/foo:/bar"), "/foo:/bar");
+    }
+
+    #[test]
+    fn test_normalize_mount_src_dst_ro() {
+        assert_eq!(normalize_mount("/foo:/bar:ro"), "/foo:/bar:ro");
     }
 
     #[test]
