@@ -547,11 +547,11 @@ async fn publish_to_bus(
 /// Convert Markdown to Telegram HTML.
 ///
 /// Block-level (processed line by line):
-///   # / ## / ###   → bold with ▶ / ▸ / • prefix
-///   --- / *** / ___ → ───────────────────── separator
-///   > blockquote   → <blockquote>
-///   \| table \|    → ASCII table inside `<pre>`
-///   \`\`\`code\`\`\` → `<pre>`
+///   `# / ## / ###`    → bold with ▶ / ▸ / • prefix
+///   `--- / *** / ___` → ───────────────────── separator
+///   `> blockquote`    → `<blockquote>`
+///   `| table |`       → ASCII table inside `<pre>`
+///   ` ``` code ``` `  → `<pre>`
 ///
 /// Inline (within each line):
 ///   **bold**, *italic*, ~~strikethrough~~, `code`
