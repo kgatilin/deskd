@@ -833,7 +833,9 @@ impl AgentProcess {
 
         let mut cmd = build_command(&state.config, &args, &extra_env);
         cmd.stdin(Stdio::piped());
-        let mut child = cmd.spawn().context("Failed to spawn persistent claude process")?;
+        let mut child = cmd
+            .spawn()
+            .context("Failed to spawn persistent claude process")?;
 
         info!(agent = %name, model = %state.config.model, "persistent process started");
 
@@ -880,8 +882,7 @@ impl AgentProcess {
                                 .and_then(|c| c.as_array())
                             {
                                 for block in blocks {
-                                    if block.get("type").and_then(|t| t.as_str())
-                                        == Some("text")
+                                    if block.get("type").and_then(|t| t.as_str()) == Some("text")
                                         && let Some(text) =
                                             block.get("text").and_then(|t| t.as_str())
                                     {
@@ -905,10 +906,8 @@ impl AgentProcess {
                                 .get("total_cost_usd")
                                 .and_then(|c| c.as_f64())
                                 .unwrap_or(0.0);
-                            let num_turns = v
-                                .get("num_turns")
-                                .and_then(|t| t.as_u64())
-                                .unwrap_or(0) as u32;
+                            let num_turns =
+                                v.get("num_turns").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
                             // response_text is accumulated by send_task, not here.
                             if event_tx
                                 .send(StdoutEvent::Result(TurnResult {
@@ -1109,8 +1108,7 @@ impl AgentProcess {
             let _ = child.kill().await;
         }
 
-        let (stdin_tx, event_rx, child) =
-            Self::spawn_process(&self.name, &self.bus_socket).await?;
+        let (stdin_tx, event_rx, child) = Self::spawn_process(&self.name, &self.bus_socket).await?;
 
         // Swap internal handles. We can't replace self.stdin_tx directly since it's not
         // behind a Mutex, but the old one is already closed (process exited).
