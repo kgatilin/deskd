@@ -329,8 +329,7 @@ pub async fn run(
 
         // Use the persistent process. send_task writes to its stdin and reads
         // stdout events until the result event marks the turn complete.
-        let mut task_fut =
-            Box::pin(process.send_task(task, Some(&progress_tx), image, &limits));
+        let mut task_fut = Box::pin(process.send_task(task, Some(&progress_tx), image, &limits));
 
         // Concurrently await task completion OR new bus messages for injection.
         let result = loop {
@@ -418,15 +417,13 @@ pub async fn run(
                     serde_json::json!({"final": true, "in_reply_to": msg.id}),
                 )
                 .await;
-
             }
             Err(e) => {
                 let err_str = format!("{}", e);
                 warn!(agent = %name, error = %err_str, "task failed");
 
                 // If the persistent process died, try to restart it.
-                if err_str.contains("persistent process exited")
-                    || err_str.contains("stdin closed")
+                if err_str.contains("persistent process exited") || err_str.contains("stdin closed")
                 {
                     warn!(agent = %name, "persistent process crashed, restarting");
                     match agent::AgentProcess::start(name, &effective_bus).await {
