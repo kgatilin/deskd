@@ -327,9 +327,12 @@ async fn outbound_sender(bot: Bot, mut rx: mpsc::UnboundedReceiver<OutboundCmd>)
             OutboundCmd::Text { chat_id, text } => {
                 // Abort current typing loop while sending so Telegram doesn't show
                 // typing and a new message at the same time.
-                if let Some(handle) = typing_tasks.remove(&chat_id) {
+                let was_typing = if let Some(handle) = typing_tasks.remove(&chat_id) {
                     handle.abort();
-                }
+                    true
+                } else {
+                    false
+                };
 
                 let chat = ChatId(chat_id);
                 let html = markdown_to_html(&text);
@@ -346,9 +349,13 @@ async fn outbound_sender(bot: Bot, mut rx: mpsc::UnboundedReceiver<OutboundCmd>)
                     warn!(chat_id = chat_id, error = %e, "failed to send Telegram message");
                 }
 
-                // Restart typing loop — more streaming chunks may still be coming.
-                // Will be cancelled by TypingStop when the task finishes.
-                typing_tasks.insert(chat_id, spawn_typing(bot.clone(), chat_id));
+                // Restart typing loop only if we were already typing in this chat
+                // (i.e. this is a streaming chunk, not a one-off send_message to
+                // a different chat). Otherwise typing would start on chats that
+                // never receive a TypingStop.
+                if was_typing {
+                    typing_tasks.insert(chat_id, spawn_typing(bot.clone(), chat_id));
+                }
             }
             OutboundCmd::TypingStart(chat_id) => {
                 // Cancel any existing typing task for this chat.
