@@ -1,0 +1,6 @@
+[Unit]
+Description=Check for deskd updates and auto-deploy
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/deskd/autoupdate.sh /usr/local/bin
