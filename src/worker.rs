@@ -334,13 +334,17 @@ pub async fn run(
                     typing_stopped = true;
                 }
                 full_response.push_str(&text);
-                write_bus_envelope(
-                    &writer_fwd,
-                    &name_owned,
-                    &reply_owned,
-                    serde_json::json!({"result": text}),
-                )
-                .await;
+                // Skip forwarding empty/whitespace-only chunks to avoid
+                // "(no content)" messages reaching Telegram.
+                if !text.trim().is_empty() {
+                    write_bus_envelope(
+                        &writer_fwd,
+                        &name_owned,
+                        &reply_owned,
+                        serde_json::json!({"result": text}),
+                    )
+                    .await;
+                }
             }
             full_response
         });
