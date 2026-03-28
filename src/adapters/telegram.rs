@@ -228,7 +228,14 @@ async fn bus_loop(
                         .or_else(|| p.get("error"))
                 })
                 .and_then(|t| t.as_str())
-                .unwrap_or("(no content)");
+                .unwrap_or("");
+
+            // Skip empty/whitespace-only messages (e.g. tool-only agent responses,
+            // final markers) — no point sending "(no content)" to Telegram.
+            if text.trim().is_empty() {
+                debug!(chat_id = chat_id, "skipping empty message to Telegram");
+                continue;
+            }
 
             debug!(chat_id = chat_id, "forwarding bus message to Telegram");
             if outbound_tx
