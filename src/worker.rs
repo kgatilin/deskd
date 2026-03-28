@@ -307,9 +307,32 @@ pub async fn run(
         let writer_fwd = writer.clone();
         let name_owned = name.to_string();
         let reply_owned = reply_target.clone();
+        let fwd_chat_id = telegram_chat_id;
         let fwd_task = tokio::spawn(async move {
             let mut full_response = String::new();
+            let mut typing_stopped = false;
             while let Some(text) = progress_rx.recv().await {
+                // On first output chunk, stop typing indicator and progress message.
+                if !typing_stopped {
+                    if let Some(chat_id) = fwd_chat_id {
+                        let ctrl_target = format!("telegram.ctrl:{}", chat_id);
+                        write_bus_envelope(
+                            &writer_fwd,
+                            &name_owned,
+                            &ctrl_target,
+                            serde_json::json!({"progress_done": true}),
+                        )
+                        .await;
+                        write_bus_envelope(
+                            &writer_fwd,
+                            &name_owned,
+                            &ctrl_target,
+                            serde_json::json!({"typing": false}),
+                        )
+                        .await;
+                    }
+                    typing_stopped = true;
+                }
                 full_response.push_str(&text);
                 write_bus_envelope(
                     &writer_fwd,
@@ -352,6 +375,24 @@ pub async fn run(
                                 "injecting mid-task message"
                             );
                             let _ = process.inject_message(inject_task);
+                            // Restart typing indicator for the new message
+                            if let Some(chat_id) = telegram_chat_id {
+                                let ctrl_target = format!("telegram.ctrl:{}", chat_id);
+                                write_bus_envelope(
+                                    &writer,
+                                    name,
+                                    &ctrl_target,
+                                    serde_json::json!({"typing": true}),
+                                )
+                                .await;
+                                write_bus_envelope(
+                                    &writer,
+                                    name,
+                                    &ctrl_target,
+                                    serde_json::json!({"progress_start": true}),
+                                )
+                                .await;
+                            }
                         }
                     } else {
                         warn!(agent = %name, "invalid message from bus during task, skipping");
