@@ -1,6 +1,6 @@
 [package]
 name = "deskd"
-version = "0.1.0"
+version = "0.6.2"
 edition = "2024"
 description = "Agent orchestration runtime — spawn, route, and manage AI agents"
 license = "MIT"
