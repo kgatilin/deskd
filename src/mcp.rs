@@ -337,6 +337,26 @@ fn handle_tools_list(
         }
     }));
 
+    // Graph execution tool
+    tools.push(json!({
+        "name": "run_graph",
+        "description": "Execute an executable skill graph from a YAML file. The graph is a DAG of tool call groups and LLM decision nodes. Returns step results and extracted variables.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file": {
+                    "type": "string",
+                    "description": "Path to the graph YAML file (absolute, or relative to agent work dir)"
+                },
+                "work_dir": {
+                    "type": "string",
+                    "description": "Working directory for tool execution (defaults to graph file's parent directory)"
+                }
+            },
+            "required": ["file"]
+        }
+    }));
+
     // Add state machine tools if models are defined.
     if user_config.map(|c| !c.models.is_empty()).unwrap_or(false) {
         tools.push(json!({
@@ -402,6 +422,7 @@ async fn handle_tools_call(
         "list_inboxes" => call_list_inboxes().await,
         "read_inbox" => call_read_inbox(args).await,
         "search_inbox" => call_search_inbox(args).await,
+        "run_graph" => call_run_graph(args).await,
         "sm_create" => call_sm_create(args, agent_name, bus_socket, user_config).await,
         "sm_move" => call_sm_move(args, agent_name, bus_socket, user_config).await,
         "sm_query" => call_sm_query(args).await,
@@ -701,6 +722,107 @@ async fn call_search_inbox(args: &Value) -> Result<Value> {
 
     Ok(json!({
         "content": [{"type": "text", "text": serde_json::to_string_pretty(&output)?}],
+        "isError": false
+    }))
+}
+
+// ─── Graph execution tool implementation ─────────────────────────────────────
+
+async fn call_run_graph(args: &Value) -> Result<Value> {
+    let file = args
+        .get("file")
+        .and_then(|f| f.as_str())
+        .context("missing file")?;
+
+    let file_path = std::path::Path::new(file);
+    let abs_path = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        let cwd = std::env::var("PWD").unwrap_or_else(|_| ".".to_string());
+        std::path::Path::new(&cwd).join(file_path)
+    };
+
+    let work_dir = if let Some(wd) = args.get("work_dir").and_then(|w| w.as_str()) {
+        std::path::PathBuf::from(wd)
+    } else {
+        abs_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf()
+    };
+
+    let yaml = std::fs::read_to_string(&abs_path)
+        .with_context(|| format!("failed to read graph file: {}", abs_path.display()))?;
+    let graph_def: crate::graph::GraphDef = serde_yaml::from_str(&yaml)
+        .with_context(|| format!("failed to parse graph YAML: {}", abs_path.display()))?;
+
+    info!(graph = %graph_def.graph, steps = graph_def.steps.len(), "run_graph via MCP");
+
+    let ctx = crate::graph::execute(&graph_def, &work_dir, None)
+        .await
+        .with_context(|| format!("graph execution failed: {}", graph_def.graph))?;
+
+    // Build a summary of results.
+    let mut summary = format!(
+        "Graph '{}' completed: {} steps executed\n",
+        graph_def.graph,
+        ctx.results.len()
+    );
+
+    for step in &graph_def.steps {
+        if let Some(result) = ctx.results.get(&step.id) {
+            let status = if result.skipped { "SKIP" } else { "DONE" };
+            summary.push_str(&format!(
+                "  [{status}] {} ({}ms)\n",
+                result.id, result.duration_ms
+            ));
+
+            // Include non-empty tool outputs (truncated).
+            for tr in &result.tool_results {
+                if !tr.stdout.is_empty() && !tr.skipped {
+                    let output = if tr.stdout.len() > 500 {
+                        format!("{}...", &tr.stdout[..500])
+                    } else {
+                        tr.stdout.clone()
+                    };
+                    summary.push_str(&format!("    {}: {}\n", tr.tool, output.trim()));
+                }
+                if !tr.stderr.is_empty() && tr.exit_code != 0 {
+                    let err_output = if tr.stderr.len() > 200 {
+                        format!("{}...", &tr.stderr[..200])
+                    } else {
+                        tr.stderr.clone()
+                    };
+                    summary.push_str(&format!("    {} stderr: {}\n", tr.tool, err_output.trim()));
+                }
+            }
+
+            // Include LLM decision output (truncated).
+            if let Some(ref llm_out) = result.llm_output {
+                let display = if llm_out.len() > 500 {
+                    format!("{}...", &llm_out[..500])
+                } else {
+                    llm_out.clone()
+                };
+                summary.push_str(&format!("    LLM: {}\n", display.trim()));
+            }
+        }
+    }
+
+    if !ctx.variables.is_empty() {
+        summary.push_str("\nVariables:\n");
+        for (k, v) in &ctx.variables {
+            let display = if v.len() > 200 {
+                format!("{}...", &v[..200])
+            } else {
+                v.clone()
+            };
+            summary.push_str(&format!("  {}: {}\n", k, display));
+        }
+    }
+
+    Ok(json!({
+        "content": [{"type": "text", "text": summary}],
         "isError": false
     }))
 }
