@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
-use crate::agent::{self, AgentConfig, TaskLimits, TurnResult, build_command};
+use crate::agent::{self, AgentConfig, TaskLimits, TokenUsage, TurnResult, build_command};
 use crate::config::SessionMode;
 
 // ─── JSON-RPC 2.0 types ─────────────────────────────────────────────────────
@@ -635,6 +635,7 @@ impl AcpProcess {
             session_id: self.session_id.lock().await.clone().unwrap_or_default(),
             cost_usd: 0.0, // ACP doesn't report cost.
             num_turns: assistant_turns,
+            token_usage: TokenUsage::default(),
         })
     }
 

@@ -1084,7 +1084,7 @@ impl AgentProcess {
                     // the next call to send_task() would see stale blocks from
                     // the previous turn, causing an off-by-one where turn N's
                     // output appears as part of turn N+1's response. (#102)
-                    while let Ok(StdoutEvent::TextBlock(trailing)) = event_rx.try_recv() {
+                    while let Ok(StdoutEvent::TextBlock(trailing, _)) = event_rx.try_recv() {
                         debug!(
                             agent = %self.name,
                             len = trailing.len(),
