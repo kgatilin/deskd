@@ -115,10 +115,11 @@ struct Link {
 
 fn truncate(s: &str, max: usize) -> String {
     let s = s.replace('\n', " ");
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s
     } else {
-        format!("{}...", &s[..max])
+        let truncated: String = s.chars().take(max).collect();
+        format!("{}...", truncated)
     }
 }
 
