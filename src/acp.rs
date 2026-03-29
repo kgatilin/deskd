@@ -75,7 +75,27 @@ pub fn parse_response(line: &str) -> Result<JsonRpcResponse> {
     serde_json::from_str(line).context("failed to parse JSON-RPC response")
 }
 
+/// Classify incoming JSON-RPC messages into three categories.
+#[derive(Debug, PartialEq)]
+pub enum MessageKind {
+    /// Server request: has both `id` and `method` (e.g. `session/request_permission`).
+    ServerRequest,
+    /// Notification: has `method` but no `id` (e.g. `session/update`).
+    Notification,
+    /// Response to a client request: has `id` but no `method`.
+    Response,
+}
+
+pub fn classify_message(resp: &JsonRpcResponse) -> MessageKind {
+    match (resp.id.is_some(), resp.method.is_some()) {
+        (true, true) => MessageKind::ServerRequest,
+        (false, true) => MessageKind::Notification,
+        _ => MessageKind::Response,
+    }
+}
+
 /// Check if a parsed response is a notification (no id, has method).
+#[cfg(test)]
 pub fn is_notification(resp: &JsonRpcResponse) -> bool {
     resp.id.is_none() && resp.method.is_some()
 }
@@ -317,41 +337,53 @@ impl AcpProcess {
                     }
                 };
 
-                if is_notification(&resp) {
-                    let method = resp.method.as_deref().unwrap_or_default();
-                    let params = resp.params.as_ref().cloned().unwrap_or_default();
-
-                    match method {
-                        "session/update" => {
-                            if let Some(text) = extract_update_text(&params)
-                                && event_tx.send(AcpEvent::TextBlock(text)).is_err()
-                            {
-                                break;
+                match classify_message(&resp) {
+                    MessageKind::ServerRequest => {
+                        // Server request: has both id and method.
+                        // e.g. session/request_permission — the server asks us
+                        // to approve something; we must reply with the same id.
+                        let method = resp.method.as_deref().unwrap_or_default();
+                        match method {
+                            "session/request_permission" => {
+                                if let Some(req_id) = resp.id
+                                    && event_tx.send(AcpEvent::PermissionRequest(req_id)).is_err()
+                                {
+                                    break;
+                                }
                             }
-                            if is_session_complete(&params)
-                                && event_tx.send(AcpEvent::SessionComplete).is_err()
-                            {
-                                break;
+                            _ => {
+                                debug!(agent = %agent_name2, method = %method, "unknown ACP server request");
                             }
-                        }
-                        "session/request_permission" => {
-                            // Extract the request ID to send back approval.
-                            // Notifications normally don't have id, but permission
-                            // requests need a response — they use the id field.
-                            if let Some(req_id) = resp.id
-                                && event_tx.send(AcpEvent::PermissionRequest(req_id)).is_err()
-                            {
-                                break;
-                            }
-                        }
-                        _ => {
-                            debug!(agent = %agent_name2, method = %method, "unknown ACP notification");
                         }
                     }
-                } else {
-                    // Regular response to our request.
-                    if event_tx.send(AcpEvent::Response(resp)).is_err() {
-                        break;
+                    MessageKind::Notification => {
+                        // Notification: has method but no id.
+                        let method = resp.method.as_deref().unwrap_or_default();
+                        let params = resp.params.as_ref().cloned().unwrap_or_default();
+
+                        match method {
+                            "session/update" => {
+                                if let Some(text) = extract_update_text(&params)
+                                    && event_tx.send(AcpEvent::TextBlock(text)).is_err()
+                                {
+                                    break;
+                                }
+                                if is_session_complete(&params)
+                                    && event_tx.send(AcpEvent::SessionComplete).is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            _ => {
+                                debug!(agent = %agent_name2, method = %method, "unknown ACP notification");
+                            }
+                        }
+                    }
+                    MessageKind::Response => {
+                        // Response to a request we sent: has id but no method.
+                        if event_tx.send(AcpEvent::Response(resp)).is_err() {
+                            break;
+                        }
                     }
                 }
             }
@@ -712,6 +744,48 @@ mod tests {
             params: None,
         };
         assert!(!is_notification(&response));
+    }
+
+    #[test]
+    fn test_classify_message_server_request() {
+        // id + method = server request (e.g. session/request_permission)
+        let server_req = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(42),
+            result: None,
+            error: None,
+            method: Some("session/request_permission".to_string()),
+            params: Some(serde_json::json!({"tool": "bash"})),
+        };
+        assert_eq!(classify_message(&server_req), MessageKind::ServerRequest);
+    }
+
+    #[test]
+    fn test_classify_message_notification() {
+        // method only (no id) = notification
+        let notification = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            result: None,
+            error: None,
+            method: Some("session/update".to_string()),
+            params: Some(serde_json::json!({})),
+        };
+        assert_eq!(classify_message(&notification), MessageKind::Notification);
+    }
+
+    #[test]
+    fn test_classify_message_response() {
+        // id only (no method) = response to our request
+        let response = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(1),
+            result: Some(serde_json::json!({})),
+            error: None,
+            method: None,
+            params: None,
+        };
+        assert_eq!(classify_message(&response), MessageKind::Response);
     }
 
     #[test]
