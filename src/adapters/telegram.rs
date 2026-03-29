@@ -525,31 +525,6 @@ async fn polling_loop(
                 return Ok(());
             }
 
-            // ── Slash command interception ──────────────────────────────────
-            // Handle /status and /restart locally without forwarding to the agent.
-            if let Some(text) = msg.text() {
-                let cmd = text.trim();
-                // Strip @botname suffix for group chats (e.g. "/status@my_bot")
-                let cmd_base = cmd.split('@').next().unwrap_or(cmd);
-                if cmd_base == "/status" {
-                    let reply = format_status_reply(&agent);
-                    let _ = bot.send_message(msg.chat.id, reply).await;
-                    return Ok(());
-                }
-                if cmd_base == "/restart" {
-                    let sender_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
-                    if !admins.contains(&sender_id) {
-                        let _ = bot
-                            .send_message(msg.chat.id, "Permission denied. Admin access required.")
-                            .await;
-                        return Ok(());
-                    }
-                    let reply = handle_restart_command(&agent, &socket).await;
-                    let _ = bot.send_message(msg.chat.id, reply).await;
-                    return Ok(());
-                }
-            }
-
             // Determine the task text and optional image data from the message.
             // Photos are base64-encoded in memory and passed alongside the caption.
             // Pure text messages are passed through unchanged.
@@ -584,6 +559,31 @@ async fn polling_loop(
                 // Whitelist check — only process chats explicitly configured in routes.
                 if !allowed.is_empty() && !allowed.contains(&chat_id) {
                     debug!(agent = %agent, chat_id = chat_id, "ignoring message — chat not in whitelist");
+                    return Ok(());
+                }
+
+                // ── Slash command interception ──────────────────────────────
+                // Handle /status and /restart locally without forwarding to
+                // the agent.  This runs AFTER the whitelist check so that
+                // only authorised chats can invoke these commands.
+                let cmd = text.trim();
+                // Strip @botname suffix for group chats (e.g. "/status@my_bot")
+                let cmd_base = cmd.split('@').next().unwrap_or(cmd);
+                if cmd_base == "/status" {
+                    let reply = format_status_reply(&agent);
+                    let _ = bot.send_message(msg.chat.id, reply).await;
+                    return Ok(());
+                }
+                if cmd_base == "/restart" {
+                    let sender_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+                    if !admins.contains(&sender_id) {
+                        let _ = bot
+                            .send_message(msg.chat.id, "Permission denied. Admin access required.")
+                            .await;
+                        return Ok(());
+                    }
+                    let reply = handle_restart_command(&agent, &socket).await;
+                    let _ = bot.send_message(msg.chat.id, reply).await;
                     return Ok(());
                 }
 
