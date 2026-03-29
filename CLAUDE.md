@@ -25,13 +25,14 @@ deskd serve
 
 ```
 src/
-  main.rs       — CLI (clap): serve, agent {create,send,run,list,stats,read,rm,spawn}, mcp
+  main.rs       — CLI (clap): serve, agent {create,send,run,list,stats,read,rm,spawn}, mcp, graph {run,validate}
   config.rs     — WorkspaceConfig (workspace.yaml) + UserConfig (deskd.yaml) parsing
   agent.rs      — Agent state, create/recover, send() and send_streaming() to Claude
   bus.rs        — Per-agent Unix socket message bus (pub/sub with glob routing)
   worker.rs     — Worker loop: read from bus → execute via Claude → post result + write inbox
   inbox.rs      — File-based inbox: write task results to ~/.deskd/inbox/<sender>/
-  mcp.rs        — MCP server (stdio, newline-delimited JSON): send_message, add_persistent_agent
+  mcp.rs        — MCP server (stdio, newline-delimited JSON): send_message, add_persistent_agent, run_graph
+  graph.rs      — Executable skill graph engine: DAG of tool groups + LLM decision nodes
   message.rs    — Message/Envelope types for bus protocol
   schedule.rs   — Cron-based scheduled actions on the bus
   adapters/
@@ -93,6 +94,11 @@ deskd agent stats <name>
 deskd agent create <name> [--prompt ...] [--model ...]
 deskd agent rm <name>
 
+# Skill graphs
+deskd graph run <file.yaml>              # execute a graph
+deskd graph run <file.yaml> --work-dir . # custom work dir
+deskd graph validate <file.yaml>         # validate without running
+
 # MCP server (called by Claude via --mcp-config)
 deskd mcp --agent <name>
 ```
@@ -117,6 +123,7 @@ Routing targets:
 Newline-delimited JSON-RPC on stdio (NOT Content-Length framed). Tools:
 - `send_message(target, text)` — publish to bus
 - `add_persistent_agent(name, model, system_prompt, subscribe)` — spawn sub-agent
+- `run_graph(file, work_dir)` — execute a skill graph YAML file
 
 Env vars injected by deskd into Claude process:
 - `DESKD_BUS_SOCKET` — bus socket path
