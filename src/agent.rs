@@ -916,6 +916,38 @@ impl AgentProcess {
         image: Option<(&str, &str)>,
         limits: &TaskLimits,
     ) -> Result<TurnResult> {
+        // Drain any stale events from the previous turn before starting a new one.
+        // Between turns, the stdout reader may have queued TextBlock events (e.g.,
+        // from output that arrived after the previous send_task saw the Result event
+        // but before it returned). If we don't drain these, the next turn picks up
+        // stale output and sends it as the response to the wrong message (#102).
+        {
+            let mut event_rx = self.event_rx.lock().await;
+            let mut drained = 0u32;
+            loop {
+                match event_rx.try_recv() {
+                    Ok(StdoutEvent::ProcessExited) => {
+                        bail!("persistent process exited between turns");
+                    }
+                    Ok(_) => {
+                        drained += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if drained > 0 {
+                info!(
+                    agent = %self.name,
+                    drained_events = drained,
+                    "flushed stale stdout events between turns"
+                );
+            }
+            // Yield to let the stdout reader task process any in-flight data
+            // before we check the channel again.
+            drop(event_rx);
+            tokio::task::yield_now().await;
+        }
+
         // Build the user message.
         let user_msg = if let Some((b64_data, media_type)) = image {
             let msg = serde_json::json!({
