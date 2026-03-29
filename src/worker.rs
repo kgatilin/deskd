@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, bail};
+use std::io::Write;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::acp;
-use crate::agent;
+use crate::agent::{self, TokenUsage};
 use crate::config::{AgentRuntime, SessionMode};
 use crate::inbox;
 use crate::message::Message;
@@ -336,6 +337,7 @@ pub async fn run(
             };
 
         info!(agent = %name, source = %msg.source, task = %truncate(task, 80), "processing task");
+        let task_start = std::time::Instant::now();
 
         // Mark agent as working so `deskd status` can report live state.
         if let Ok(mut st) = agent::load_state(name) {
@@ -549,13 +551,25 @@ pub async fn run(
         }
 
         set_idle(name);
+        let task_duration = task_start.elapsed().as_secs();
         match result {
-            Ok(turn) => {
+            Ok(ref turn) => {
                 info!(
                     agent = %name,
                     cost = turn.cost_usd,
                     turns = turn.num_turns,
                     "task completed (persistent)"
+                );
+
+                // Log token usage to JSONL file.
+                log_token_usage(
+                    &initial_state.config.work_dir,
+                    name,
+                    &msg.source,
+                    task,
+                    &turn.token_usage,
+                    task_duration,
+                    &initial_state.config.model,
                 );
 
                 // Write to file-based inbox for all senders.
@@ -610,6 +624,72 @@ pub async fn run(
     process.stop().await;
     info!(agent = %name, "disconnected from bus");
     Ok(())
+}
+
+/// Log token usage for a completed task to a JSONL file.
+fn log_token_usage(
+    work_dir: &str,
+    agent_name: &str,
+    source: &str,
+    task: &str,
+    usage: &TokenUsage,
+    duration_secs: u64,
+    model: &str,
+) {
+    let deskd_dir = std::path::Path::new(work_dir).join(".deskd");
+    if let Err(e) = std::fs::create_dir_all(&deskd_dir) {
+        warn!(agent = %agent_name, error = %e, "failed to create .deskd dir for usage log");
+        return;
+    }
+
+    let usage_path = deskd_dir.join("usage.jsonl");
+    let truncated_task = if task.len() > 80 {
+        let mut end = 80;
+        while end > 0 && !task.is_char_boundary(end) {
+            end -= 1;
+        }
+        &task[..end]
+    } else {
+        task
+    };
+
+    let entry = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "agent": agent_name,
+        "source": source,
+        "task": truncated_task,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_read": usage.cache_read_input_tokens,
+        "cache_creation": usage.cache_creation_input_tokens,
+        "duration_secs": duration_secs,
+        "model": model,
+    });
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&usage_path)
+    {
+        Ok(mut file) => {
+            if let Err(e) = writeln!(file, "{}", entry) {
+                warn!(agent = %agent_name, error = %e, "failed to write usage log");
+            }
+        }
+        Err(e) => {
+            warn!(agent = %agent_name, error = %e, "failed to open usage log");
+        }
+    }
+
+    info!(
+        agent = %agent_name,
+        input_tokens = usage.input_tokens,
+        output_tokens = usage.output_tokens,
+        cache_read = usage.cache_read_input_tokens,
+        cache_creation = usage.cache_creation_input_tokens,
+        duration_secs = duration_secs,
+        "token usage"
+    );
 }
 
 /// Mark agent as idle in its state file.

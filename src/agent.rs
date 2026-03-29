@@ -718,18 +718,53 @@ pub struct TaskLimits {
     pub budget_usd: Option<f64>,
 }
 
+/// Accumulated token usage across all messages in a task.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Accumulate usage from a parsed JSON value.
+    /// Expects the `usage` object from a Claude assistant message.
+    pub fn accumulate(&mut self, usage: &serde_json::Value) {
+        if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+            self.input_tokens += v;
+        }
+        if let Some(v) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+            self.output_tokens += v;
+        }
+        if let Some(v) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+        {
+            self.cache_creation_input_tokens += v;
+        }
+        if let Some(v) = usage
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_u64())
+        {
+            self.cache_read_input_tokens += v;
+        }
+    }
+}
+
 /// Result of a single Claude turn (task).
 pub struct TurnResult {
     pub response_text: String,
     pub session_id: String,
     pub cost_usd: f64,
     pub num_turns: u32,
+    pub token_usage: TokenUsage,
 }
 
 /// Events emitted by the stdout reader task.
 enum StdoutEvent {
-    /// A text block from an `assistant` message.
-    TextBlock(String),
+    /// A text block from an `assistant` message, with optional usage data.
+    TextBlock(String, Option<TokenUsage>),
     /// The `result` event marking end of a turn.
     Result(TurnResult),
     /// Process exited (stdout closed).
@@ -898,8 +933,16 @@ impl AgentProcess {
                                     }
                                 }
                             }
-                            if !block_text.is_empty()
-                                && event_tx.send(StdoutEvent::TextBlock(block_text)).is_err()
+                            // Extract token usage from assistant message.
+                            let usage = v.get("message").and_then(|m| m.get("usage")).map(|u| {
+                                let mut tu = TokenUsage::default();
+                                tu.accumulate(u);
+                                tu
+                            });
+                            if (!block_text.is_empty() || usage.is_some())
+                                && event_tx
+                                    .send(StdoutEvent::TextBlock(block_text, usage))
+                                    .is_err()
                             {
                                 break;
                             }
@@ -916,13 +959,14 @@ impl AgentProcess {
                                 .unwrap_or(0.0);
                             let num_turns =
                                 v.get("num_turns").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
-                            // response_text is accumulated by send_task, not here.
+                            // response_text and token_usage are accumulated by send_task, not here.
                             if event_tx
                                 .send(StdoutEvent::Result(TurnResult {
                                     response_text: String::new(),
                                     session_id,
                                     cost_usd,
                                     num_turns,
+                                    token_usage: TokenUsage::default(),
                                 }))
                                 .is_err()
                             {
@@ -987,11 +1031,21 @@ impl AgentProcess {
         let mut event_rx = self.event_rx.lock().await;
         let mut response_text = String::new();
         let mut assistant_turns = 0u32;
+        let mut accumulated_usage = TokenUsage::default();
 
         loop {
             match event_rx.recv().await {
-                Some(StdoutEvent::TextBlock(text)) => {
+                Some(StdoutEvent::TextBlock(text, usage)) => {
                     assistant_turns += 1;
+
+                    // Accumulate token usage from this assistant message.
+                    if let Some(u) = usage {
+                        accumulated_usage.input_tokens += u.input_tokens;
+                        accumulated_usage.output_tokens += u.output_tokens;
+                        accumulated_usage.cache_creation_input_tokens +=
+                            u.cache_creation_input_tokens;
+                        accumulated_usage.cache_read_input_tokens += u.cache_read_input_tokens;
+                    }
 
                     // Check turn limit.
                     if let Some(max) = limits.max_turns
@@ -1011,10 +1065,12 @@ impl AgentProcess {
                         );
                     }
 
-                    if let Some(tx) = &progress_tx {
-                        let _ = tx.send(text.clone());
+                    if !text.is_empty() {
+                        if let Some(tx) = &progress_tx {
+                            let _ = tx.send(text.clone());
+                        }
+                        response_text.push_str(&text);
                     }
-                    response_text.push_str(&text);
                 }
                 Some(StdoutEvent::Result(mut result)) => {
                     // Drain any trailing TextBlock events that arrived after the
@@ -1035,6 +1091,7 @@ impl AgentProcess {
                     }
 
                     result.response_text = response_text;
+                    result.token_usage = accumulated_usage;
 
                     // Compute deltas: Claude's total_cost_usd and num_turns are
                     // session-cumulative, not per-task. We track the last reported
@@ -1322,5 +1379,60 @@ created_at: "2024-01-01T00:00:00Z"
         let cmd = build_command(&cfg, &[], &[]);
         let program = cmd.as_std().get_program().to_string_lossy().to_string();
         assert_eq!(program, "claude");
+    }
+
+    #[test]
+    fn test_token_usage_default() {
+        let usage = TokenUsage::default();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn test_token_usage_accumulate() {
+        let mut usage = TokenUsage::default();
+
+        let json1 = serde_json::json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_creation_input_tokens": 10,
+            "cache_read_input_tokens": 20
+        });
+        usage.accumulate(&json1);
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.cache_creation_input_tokens, 10);
+        assert_eq!(usage.cache_read_input_tokens, 20);
+
+        // Accumulate a second message.
+        let json2 = serde_json::json!({
+            "input_tokens": 200,
+            "output_tokens": 100,
+            "cache_creation_input_tokens": 5,
+            "cache_read_input_tokens": 30
+        });
+        usage.accumulate(&json2);
+        assert_eq!(usage.input_tokens, 300);
+        assert_eq!(usage.output_tokens, 150);
+        assert_eq!(usage.cache_creation_input_tokens, 15);
+        assert_eq!(usage.cache_read_input_tokens, 50);
+    }
+
+    #[test]
+    fn test_token_usage_accumulate_partial() {
+        let mut usage = TokenUsage::default();
+
+        // Only some fields present.
+        let json = serde_json::json!({
+            "input_tokens": 100,
+            "output_tokens": 50
+        });
+        usage.accumulate(&json);
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
     }
 }
