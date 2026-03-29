@@ -728,6 +728,14 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// Merge another `TokenUsage` into this one (struct-to-struct).
+    pub fn merge(&mut self, other: &TokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+    }
+
     /// Accumulate usage from a parsed JSON value.
     /// Expects the `usage` object from a Claude assistant message.
     pub fn accumulate(&mut self, usage: &serde_json::Value) {
@@ -1036,36 +1044,34 @@ impl AgentProcess {
         loop {
             match event_rx.recv().await {
                 Some(StdoutEvent::TextBlock(text, usage)) => {
-                    assistant_turns += 1;
-
                     // Accumulate token usage from this assistant message.
-                    if let Some(u) = usage {
-                        accumulated_usage.input_tokens += u.input_tokens;
-                        accumulated_usage.output_tokens += u.output_tokens;
-                        accumulated_usage.cache_creation_input_tokens +=
-                            u.cache_creation_input_tokens;
-                        accumulated_usage.cache_read_input_tokens += u.cache_read_input_tokens;
-                    }
-
-                    // Check turn limit.
-                    if let Some(max) = limits.max_turns
-                        && assistant_turns > max
-                    {
-                        warn!(
-                            agent = %self.name,
-                            turns = assistant_turns,
-                            max = max,
-                            "turn limit exceeded mid-task, killing process"
-                        );
-                        self.kill().await;
-                        bail!(
-                            "task killed: exceeded {} turn limit ({} turns)",
-                            max,
-                            assistant_turns
-                        );
+                    if let Some(u) = &usage {
+                        accumulated_usage.merge(u);
                     }
 
                     if !text.is_empty() {
+                        // Only count turns with actual text content, not
+                        // tool-use messages that only carry usage metadata.
+                        assistant_turns += 1;
+
+                        // Check turn limit.
+                        if let Some(max) = limits.max_turns
+                            && assistant_turns > max
+                        {
+                            warn!(
+                                agent = %self.name,
+                                turns = assistant_turns,
+                                max = max,
+                                "turn limit exceeded mid-task, killing process"
+                            );
+                            self.kill().await;
+                            bail!(
+                                "task killed: exceeded {} turn limit ({} turns)",
+                                max,
+                                assistant_turns
+                            );
+                        }
+
                         if let Some(tx) = &progress_tx {
                             let _ = tx.send(text.clone());
                         }
