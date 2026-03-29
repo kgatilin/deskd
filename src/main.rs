@@ -1083,6 +1083,10 @@ fn parse_duration_secs(s: &str) -> anyhow::Result<u64> {
             current_num.clear();
 
             match ch {
+                'd' => {
+                    total += n * 86400;
+                    found_any = true;
+                }
                 'h' => {
                     total += n * 3600;
                     found_any = true;
@@ -1096,7 +1100,11 @@ fn parse_duration_secs(s: &str) -> anyhow::Result<u64> {
                     found_any = true;
                 }
                 other => {
-                    anyhow::bail!("unknown unit '{}' in duration '{}' (use h, m, s)", other, s)
+                    anyhow::bail!(
+                        "unknown unit '{}' in duration '{}' (use d, h, m, s)",
+                        other,
+                        s
+                    )
                 }
             }
         }
@@ -1421,8 +1429,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_duration_days() {
+        assert_eq!(parse_duration_secs("5d").unwrap(), 5 * 86400);
+    }
+
+    #[test]
+    fn test_parse_duration_days_and_hours() {
+        assert_eq!(parse_duration_secs("7d12h").unwrap(), 7 * 86400 + 12 * 3600);
+    }
+
+    #[test]
     fn test_parse_duration_invalid_unit() {
-        assert!(parse_duration_secs("5d").is_err());
+        assert!(parse_duration_secs("5w").is_err());
     }
 
     #[test]
