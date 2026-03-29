@@ -4,6 +4,12 @@ description: >
   Review and merge a PR: check CI, review diff, rebase on main,
   run quality checks, squash merge, tag, notify Telegram.
 
+inputs:
+  repo: kgatilin/deskd
+  pr_number: ""
+  branch: ""
+  title: ""
+
 steps:
   - id: check_ci
     tools:

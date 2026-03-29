@@ -351,6 +351,10 @@ fn handle_tools_list(
                 "work_dir": {
                     "type": "string",
                     "description": "Working directory for tool execution (defaults to graph file's parent directory)"
+                },
+                "vars": {
+                    "type": "object",
+                    "description": "Input variables as key-value pairs (e.g. {\"pr_number\": \"42\", \"repo\": \"owner/repo\"})"
                 }
             },
             "required": ["file"]
@@ -756,9 +760,17 @@ async fn call_run_graph(args: &Value) -> Result<Value> {
     let graph_def: crate::graph::GraphDef = serde_yaml::from_str(&yaml)
         .with_context(|| format!("failed to parse graph YAML: {}", abs_path.display()))?;
 
+    // Parse optional vars from MCP args.
+    let inputs: Option<std::collections::HashMap<String, String>> =
+        args.get("vars").and_then(|v| v.as_object()).map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        });
+
     info!(graph = %graph_def.graph, steps = graph_def.steps.len(), "run_graph via MCP");
 
-    let ctx = crate::graph::execute(&graph_def, &work_dir, None)
+    let ctx = crate::graph::execute(&graph_def, &work_dir, None, inputs)
         .await
         .with_context(|| format!("graph execution failed: {}", graph_def.graph))?;
 

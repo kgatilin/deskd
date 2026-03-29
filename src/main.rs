@@ -273,6 +273,9 @@ enum GraphAction {
         /// Working directory for tool execution (defaults to graph file's parent dir).
         #[arg(long)]
         work_dir: Option<String>,
+        /// Input variables as key=value pairs (repeatable).
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
     },
     /// Validate a graph YAML file without executing it (checks DAG, references, conditions).
     Validate {
@@ -611,7 +614,11 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Graph { action } => match action {
-            GraphAction::Run { file, work_dir } => {
+            GraphAction::Run {
+                file,
+                work_dir,
+                vars,
+            } => {
                 let path = std::path::Path::new(&file);
                 let abs_path = if path.is_absolute() {
                     path.to_path_buf()
@@ -647,7 +654,21 @@ async fn main() -> anyhow::Result<()> {
                     println!("  [{status}] {} ({}ms)", result.id, result.duration_ms);
                 });
 
-                let ctx = graph::execute(&graph_def, &work, Some(&progress)).await?;
+                let inputs: Option<std::collections::HashMap<String, String>> = if vars.is_empty() {
+                    None
+                } else {
+                    let mut map = std::collections::HashMap::new();
+                    for kv in &vars {
+                        if let Some((k, v)) = kv.split_once('=') {
+                            map.insert(k.to_string(), v.to_string());
+                        } else {
+                            anyhow::bail!("invalid --var format '{}', expected KEY=VALUE", kv);
+                        }
+                    }
+                    Some(map)
+                };
+
+                let ctx = graph::execute(&graph_def, &work, Some(&progress), inputs).await?;
 
                 println!("\nGraph completed: {} steps executed", ctx.results.len());
                 if !ctx.variables.is_empty() {

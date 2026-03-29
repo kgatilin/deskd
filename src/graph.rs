@@ -43,6 +43,9 @@ pub struct GraphDef {
     /// Optional templates directory (relative to graph file).
     #[serde(default)]
     pub templates_dir: Option<String>,
+    /// Optional default input variables (seeded before execution).
+    #[serde(default)]
+    pub inputs: HashMap<String, String>,
 }
 
 fn default_version() -> u32 {
@@ -698,6 +701,7 @@ pub async fn execute(
     graph: &GraphDef,
     work_dir: &Path,
     on_progress: Option<&ProgressFn>,
+    inputs: Option<HashMap<String, String>>,
 ) -> Result<ExecContext> {
     let order = topo_sort(graph)?;
     let step_map: HashMap<&str, &StepDef> =
@@ -707,6 +711,14 @@ pub async fn execute(
     let templates_path = templates_dir.as_deref();
 
     let mut ctx = ExecContext::default();
+
+    // Seed variables: GraphDef defaults, then caller overrides, then work_dir.
+    ctx.variables.extend(graph.inputs.clone());
+    if let Some(vars) = inputs {
+        ctx.variables.extend(vars);
+    }
+    ctx.variables
+        .insert("work_dir".to_string(), work_dir.display().to_string());
 
     for step_id in &order {
         let step = step_map[step_id.as_str()];
@@ -1276,7 +1288,7 @@ steps:
         .unwrap();
 
         let dir = std::env::temp_dir();
-        let ctx = execute(&graph, &dir, None).await.unwrap();
+        let ctx = execute(&graph, &dir, None, None).await.unwrap();
 
         assert_eq!(ctx.results.len(), 2);
         assert!(!ctx.results["greet"].skipped);
@@ -1302,7 +1314,7 @@ steps:
         .unwrap();
 
         let dir = std::env::temp_dir();
-        let ctx = execute(&graph, &dir, None).await.unwrap();
+        let ctx = execute(&graph, &dir, None, None).await.unwrap();
 
         let results = &ctx.results["multi"].tool_results;
         assert_eq!(results.len(), 3);
@@ -1330,7 +1342,7 @@ steps:
         .unwrap();
 
         let dir = std::env::temp_dir();
-        let ctx = execute(&graph, &dir, None).await.unwrap();
+        let ctx = execute(&graph, &dir, None, None).await.unwrap();
 
         assert!(!ctx.results["always"].skipped);
         assert!(ctx.results["skipped"].skipped);
@@ -1358,7 +1370,7 @@ steps:
         ))
         .unwrap();
 
-        let ctx = execute(&graph, &dir, None).await.unwrap();
+        let ctx = execute(&graph, &dir, None, None).await.unwrap();
 
         assert_eq!(
             ctx.results["read"].tool_results[0].stdout.trim(),
