@@ -46,6 +46,14 @@ pub fn log_path(agent_name: &str) -> PathBuf {
 /// Performs log rotation if the file exceeds MAX_ENTRIES.
 pub fn log_task(agent_name: &str, entry: &TaskLog) -> Result<()> {
     let path = log_path(agent_name);
+    log_task_to_path(&path, entry)
+}
+
+/// Append a task log entry to a specific file path.
+pub fn log_task_to_path(path: &PathBuf, entry: &TaskLog) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
 
     let mut line = serde_json::to_string(entry).context("failed to serialize task log entry")?;
     line.push('\n');
@@ -53,14 +61,14 @@ pub fn log_task(agent_name: &str, entry: &TaskLog) -> Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
         .with_context(|| format!("failed to open task log: {}", path.display()))?;
 
     file.write_all(line.as_bytes())
         .with_context(|| format!("failed to write task log: {}", path.display()))?;
 
     // Check if rotation is needed (count lines).
-    rotate_if_needed(&path)?;
+    rotate_if_needed(path)?;
 
     Ok(())
 }
@@ -93,12 +101,22 @@ pub fn read_logs(
     since: Option<DateTime<Utc>>,
 ) -> Result<Vec<TaskLog>> {
     let path = log_path(agent_name);
+    read_logs_from_path(&path, limit, source_filter, since)
+}
+
+/// Read task log entries from a specific file path, applying optional filters.
+pub fn read_logs_from_path(
+    path: &PathBuf,
+    limit: usize,
+    source_filter: Option<&str>,
+    since: Option<DateTime<Utc>>,
+) -> Result<Vec<TaskLog>> {
     if !path.exists() {
         return Ok(vec![]);
     }
 
     let file =
-        std::fs::File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let reader = std::io::BufReader::new(file);
 
     let mut entries: Vec<TaskLog> = Vec::new();
@@ -286,37 +304,39 @@ mod tests {
         assert!(result.ends_with("..."));
     }
 
-    #[test]
-    fn test_log_and_read() {
-        let tmp = temp_dir();
-        std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { std::env::set_var("HOME", &tmp) };
-
-        let entry = TaskLog {
-            ts: "2026-03-28T14:23:01Z".to_string(),
-            source: "telegram".to_string(),
+    fn test_entry(source: &str, task: &str, ts: &str) -> TaskLog {
+        TaskLog {
+            ts: ts.to_string(),
+            source: source.to_string(),
             turns: 12,
             cost: 0.42,
             duration_ms: 45000,
             status: "ok".to_string(),
-            task: "Test task".to_string(),
+            task: task.to_string(),
             error: None,
             msg_id: "test-uuid".to_string(),
-        };
+        }
+    }
 
-        log_task("test-agent", &entry).unwrap();
+    #[test]
+    fn test_log_and_read() {
+        let tmp = temp_dir();
+        let path = tmp.join("tasks.jsonl");
 
-        let entries = read_logs("test-agent", 20, None, None).unwrap();
+        let entry = test_entry("telegram", "Test task", "2026-03-28T14:23:01Z");
+        log_task_to_path(&path, &entry).unwrap();
+
+        let entries = read_logs_from_path(&path, 20, None, None).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].source, "telegram");
         assert_eq!(entries[0].turns, 12);
         assert_eq!(entries[0].cost, 0.42);
 
         // Test source filter.
-        let filtered = read_logs("test-agent", 20, Some("github_poll"), None).unwrap();
+        let filtered = read_logs_from_path(&path, 20, Some("github_poll"), None).unwrap();
         assert_eq!(filtered.len(), 0);
 
-        let filtered = read_logs("test-agent", 20, Some("telegram"), None).unwrap();
+        let filtered = read_logs_from_path(&path, 20, Some("telegram"), None).unwrap();
         assert_eq!(filtered.len(), 1);
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -326,11 +346,7 @@ mod tests {
     fn test_log_rotation() {
         let tmp = temp_dir();
         std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { std::env::set_var("HOME", &tmp) };
-
-        // Write more than MAX_ENTRIES.
-        // Use a smaller set to keep the test fast — we'll test the rotation logic directly.
-        let path = log_path("rotate-agent");
+        let path = tmp.join("tasks.jsonl");
 
         // Write MAX_ENTRIES + 100 lines directly.
         {
@@ -365,41 +381,18 @@ mod tests {
     #[test]
     fn test_since_filter() {
         let tmp = temp_dir();
-        std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { std::env::set_var("HOME", &tmp) };
+        let path = tmp.join("tasks.jsonl");
 
-        // Log two entries: one old, one recent.
-        let old = TaskLog {
-            ts: "2026-03-27T10:00:00Z".to_string(),
-            source: "telegram".to_string(),
-            turns: 1,
-            cost: 0.1,
-            duration_ms: 1000,
-            status: "ok".to_string(),
-            task: "old task".to_string(),
-            error: None,
-            msg_id: "id-old".to_string(),
-        };
-        let recent = TaskLog {
-            ts: "2026-03-28T14:00:00Z".to_string(),
-            source: "telegram".to_string(),
-            turns: 2,
-            cost: 0.2,
-            duration_ms: 2000,
-            status: "ok".to_string(),
-            task: "recent task".to_string(),
-            error: None,
-            msg_id: "id-recent".to_string(),
-        };
+        let old = test_entry("telegram", "old task", "2026-03-27T10:00:00Z");
+        let recent = test_entry("telegram", "recent task", "2026-03-28T14:00:00Z");
 
-        log_task("since-agent", &old).unwrap();
-        log_task("since-agent", &recent).unwrap();
+        log_task_to_path(&path, &old).unwrap();
+        log_task_to_path(&path, &recent).unwrap();
 
-        // Filter: since 2026-03-28T00:00:00Z — should only get the recent one.
         let cutoff = DateTime::parse_from_rfc3339("2026-03-28T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let entries = read_logs("since-agent", 20, None, Some(cutoff)).unwrap();
+        let entries = read_logs_from_path(&path, 20, None, Some(cutoff)).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].task, "recent task");
 
@@ -409,28 +402,8 @@ mod tests {
     #[test]
     fn test_cost_summary_does_not_panic() {
         let entries = vec![
-            TaskLog {
-                ts: "2026-03-28T14:00:00Z".to_string(),
-                source: "telegram".to_string(),
-                turns: 5,
-                cost: 0.30,
-                duration_ms: 10000,
-                status: "ok".to_string(),
-                task: "task 1".to_string(),
-                error: None,
-                msg_id: "id-1".to_string(),
-            },
-            TaskLog {
-                ts: "2026-03-28T14:05:00Z".to_string(),
-                source: "github_poll".to_string(),
-                turns: 2,
-                cost: 0.10,
-                duration_ms: 5000,
-                status: "ok".to_string(),
-                task: "task 2".to_string(),
-                error: None,
-                msg_id: "id-2".to_string(),
-            },
+            test_entry("telegram", "task 1", "2026-03-28T14:00:00Z"),
+            test_entry("github_poll", "task 2", "2026-03-28T14:05:00Z"),
         ];
         // Just verify it doesn't panic.
         print_cost_summary("test", &entries, Some("24h"));
@@ -439,10 +412,9 @@ mod tests {
     #[test]
     fn test_empty_log_file() {
         let tmp = temp_dir();
-        std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { std::env::set_var("HOME", &tmp) };
+        let path = tmp.join("tasks.jsonl");
 
-        let entries = read_logs("nonexistent-agent", 20, None, None).unwrap();
+        let entries = read_logs_from_path(&path, 20, None, None).unwrap();
         assert!(entries.is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -450,11 +422,11 @@ mod tests {
 
     #[test]
     fn test_log_path() {
-        unsafe { std::env::set_var("HOME", "/tmp/test-home") };
+        // Just verify the path structure contains the expected components.
         let path = log_path("myagent");
-        assert_eq!(
-            path,
-            Path::new("/tmp/test-home/.deskd/logs/myagent/tasks.jsonl")
+        assert!(
+            path.to_string_lossy()
+                .contains(".deskd/logs/myagent/tasks.jsonl")
         );
     }
 }
