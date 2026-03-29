@@ -1,7 +1,10 @@
 //! session2graph — Convert Claude Code session JSONL files into archlint-compatible
-//! architecture.yaml format.
+//! architecture.yaml format, or compute metrics from the session graph.
 //!
-//! Usage: session2graph <input.jsonl> [--output output.yaml]
+//! Usage:
+//!   session2graph <input.jsonl>                    # YAML graph to stdout
+//!   session2graph <input.jsonl> --output out.yaml  # YAML graph to file
+//!   session2graph <input.jsonl> --metrics          # JSON metrics to stdout
 
 use std::collections::HashMap;
 use std::fs;
@@ -26,6 +29,10 @@ struct Cli {
     /// Output file path (default: stdout)
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Output JSON metrics report instead of YAML graph
+    #[arg(long)]
+    metrics: bool,
 }
 
 // ── Input types (JSONL) ──────────────────────────────────────────────
@@ -363,6 +370,188 @@ fn convert(input: &str) -> Result<ArchGraph> {
     Ok(builder.build())
 }
 
+// ── Metrics ─────────────────────────────────────────────────────────
+
+#[derive(Serialize, Debug)]
+struct MetricsReport {
+    summary: MetricsSummary,
+    tool_usage: Vec<ToolUsageEntry>,
+    fan_out: FanOut,
+    patterns: Vec<PatternEntry>,
+    session_stats: SessionStats,
+}
+
+#[derive(Serialize, Debug)]
+struct MetricsSummary {
+    total_nodes: usize,
+    total_edges: usize,
+    nodes_by_type: HashMap<String, usize>,
+    edges_by_type: HashMap<String, usize>,
+}
+
+#[derive(Serialize, Debug)]
+struct ToolUsageEntry {
+    name: String,
+    count: usize,
+}
+
+#[derive(Serialize, Debug)]
+struct FanOut {
+    max: usize,
+    max_node: String,
+    average: f64,
+}
+
+#[derive(Serialize, Debug)]
+struct PatternEntry {
+    from: String,
+    to: String,
+    count: usize,
+}
+
+#[derive(Serialize, Debug)]
+struct SessionStats {
+    user_messages: usize,
+    assistant_messages: usize,
+    tool_calls: usize,
+    thinking_blocks: usize,
+    tool_to_text_ratio: f64,
+}
+
+fn compute_metrics(graph: &ArchGraph) -> MetricsReport {
+    // Summary: nodes by type, edges by type
+    let mut nodes_by_type: HashMap<String, usize> = HashMap::new();
+    for comp in &graph.components {
+        *nodes_by_type.entry(comp.entity.clone()).or_default() += 1;
+    }
+
+    let mut edges_by_type: HashMap<String, usize> = HashMap::new();
+    for link in &graph.links {
+        *edges_by_type.entry(link.r#type.clone()).or_default() += 1;
+    }
+
+    let summary = MetricsSummary {
+        total_nodes: graph.components.len(),
+        total_edges: graph.links.len(),
+        nodes_by_type,
+        edges_by_type,
+    };
+
+    // Tool usage: count per tool name from tool_use titles
+    let mut tool_counts: HashMap<String, usize> = HashMap::new();
+    for comp in &graph.components {
+        if comp.entity == "tool_use" {
+            // Title format: "tool_use: Name(args)"
+            if let Some(name) = comp.title.strip_prefix("tool_use: ") {
+                let name = name.find('(').map(|i| &name[..i]).unwrap_or(name);
+                *tool_counts.entry(name.to_string()).or_default() += 1;
+            }
+        }
+    }
+    let mut tool_usage: Vec<ToolUsageEntry> = tool_counts
+        .into_iter()
+        .map(|(name, count)| ToolUsageEntry { name, count })
+        .collect();
+    tool_usage.sort_by(|a, b| b.count.cmp(&a.count));
+
+    // Fan-out: outgoing edges per node
+    let mut outgoing: HashMap<String, usize> = HashMap::new();
+    for link in &graph.links {
+        *outgoing.entry(link.from.clone()).or_default() += 1;
+    }
+    let max_fan_out = outgoing.iter().max_by_key(|(_, v)| *v);
+    let (max_node, max) = match max_fan_out {
+        Some((node, count)) => (node.clone(), *count),
+        None => (String::new(), 0),
+    };
+    let total_nodes_with_edges = outgoing.len();
+    let sum_outgoing: usize = outgoing.values().sum();
+    let average = if total_nodes_with_edges > 0 {
+        // Round to 1 decimal
+        ((sum_outgoing as f64 / total_nodes_with_edges as f64) * 10.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    let fan_out = FanOut {
+        max,
+        max_node,
+        average,
+    };
+
+    // Patterns: tool_use bigrams that repeat > 3 times
+    // Collect sequential tool_use names in order
+    let tool_names: Vec<String> = graph
+        .components
+        .iter()
+        .filter(|c| c.entity == "tool_use")
+        .filter_map(|c| {
+            c.title.strip_prefix("tool_use: ").map(|name| {
+                name.find('(')
+                    .map(|i| name[..i].to_string())
+                    .unwrap_or_else(|| name.to_string())
+            })
+        })
+        .collect();
+
+    let mut bigram_counts: HashMap<(String, String), usize> = HashMap::new();
+    for pair in tool_names.windows(2) {
+        let key = (pair[0].clone(), pair[1].clone());
+        *bigram_counts.entry(key).or_default() += 1;
+    }
+
+    let mut patterns: Vec<PatternEntry> = bigram_counts
+        .into_iter()
+        .filter(|(_, count)| *count > 3)
+        .map(|((from, to), count)| PatternEntry { from, to, count })
+        .collect();
+    patterns.sort_by(|a, b| b.count.cmp(&a.count));
+
+    // Session stats
+    let user_messages = graph
+        .components
+        .iter()
+        .filter(|c| c.entity == "user_message")
+        .count();
+    let assistant_messages = graph
+        .components
+        .iter()
+        .filter(|c| c.entity == "assistant_message")
+        .count();
+    let tool_calls = graph
+        .components
+        .iter()
+        .filter(|c| c.entity == "tool_use")
+        .count();
+    let thinking_blocks = graph
+        .components
+        .iter()
+        .filter(|c| c.entity == "thinking")
+        .count();
+    let text_count = user_messages + assistant_messages;
+    let tool_to_text_ratio = if text_count > 0 {
+        ((tool_calls as f64 / text_count as f64) * 100.0).round() / 100.0
+    } else {
+        0.0
+    };
+
+    let session_stats = SessionStats {
+        user_messages,
+        assistant_messages,
+        tool_calls,
+        thinking_blocks,
+        tool_to_text_ratio,
+    };
+
+    MetricsReport {
+        summary,
+        tool_usage,
+        fan_out,
+        patterns,
+        session_stats,
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -370,15 +559,23 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to read {}", cli.input.display()))?;
 
     let graph = convert(&input)?;
-    let yaml = serde_yaml::to_string(&graph).context("failed to serialize YAML")?;
 
-    match cli.output {
-        Some(path) => {
-            fs::write(&path, &yaml)
-                .with_context(|| format!("failed to write {}", path.display()))?;
-        }
-        None => {
-            io::stdout().write_all(yaml.as_bytes())?;
+    if cli.metrics {
+        let report = compute_metrics(&graph);
+        let json =
+            serde_json::to_string_pretty(&report).context("failed to serialize metrics JSON")?;
+        io::stdout().write_all(json.as_bytes())?;
+        io::stdout().write_all(b"\n")?;
+    } else {
+        let yaml = serde_yaml::to_string(&graph).context("failed to serialize YAML")?;
+        match cli.output {
+            Some(path) => {
+                fs::write(&path, &yaml)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+            }
+            None => {
+                io::stdout().write_all(yaml.as_bytes())?;
+            }
         }
     }
 
@@ -502,5 +699,147 @@ mod tests {
         let input = "not json at all\n{\"type\":\"user\",\"uuid\":\"u1\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}}";
         let graph = convert(input).unwrap();
         assert_eq!(graph.components.len(), 1);
+    }
+
+    // ── Metrics tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_metrics_summary() {
+        let graph = convert(FIXTURE).unwrap();
+        let report = compute_metrics(&graph);
+
+        assert_eq!(report.summary.total_nodes, 6);
+        assert_eq!(report.summary.total_edges, 5);
+
+        assert_eq!(report.summary.nodes_by_type["user_message"], 1);
+        assert_eq!(report.summary.nodes_by_type["assistant_message"], 2);
+        assert_eq!(report.summary.nodes_by_type["tool_use"], 2);
+        assert_eq!(report.summary.nodes_by_type["tool_result"], 1);
+
+        assert_eq!(report.summary.edges_by_type["response"], 2);
+        assert_eq!(report.summary.edges_by_type["invocation"], 2);
+        assert_eq!(report.summary.edges_by_type["result"], 1);
+    }
+
+    #[test]
+    fn test_metrics_tool_usage() {
+        let graph = convert(FIXTURE).unwrap();
+        let report = compute_metrics(&graph);
+
+        // Read and Edit, each used once
+        assert_eq!(report.tool_usage.len(), 2);
+        let names: Vec<&str> = report.tool_usage.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"Read"));
+        assert!(names.contains(&"Edit"));
+        for entry in &report.tool_usage {
+            assert_eq!(entry.count, 1);
+        }
+    }
+
+    #[test]
+    fn test_metrics_fan_out() {
+        let graph = convert(FIXTURE).unwrap();
+        let report = compute_metrics(&graph);
+
+        // 6 nodes, 5 edges — at least one node has outgoing edges
+        assert!(report.fan_out.max >= 1);
+        assert!(!report.fan_out.max_node.is_empty());
+        assert!(report.fan_out.average > 0.0);
+    }
+
+    #[test]
+    fn test_metrics_session_stats() {
+        let graph = convert(FIXTURE).unwrap();
+        let report = compute_metrics(&graph);
+
+        assert_eq!(report.session_stats.user_messages, 1);
+        assert_eq!(report.session_stats.assistant_messages, 2);
+        assert_eq!(report.session_stats.tool_calls, 2);
+        assert_eq!(report.session_stats.thinking_blocks, 0);
+        // tool_to_text_ratio = 2 / 3 ≈ 0.67
+        assert!(report.session_stats.tool_to_text_ratio > 0.6);
+        assert!(report.session_stats.tool_to_text_ratio < 0.7);
+    }
+
+    #[test]
+    fn test_metrics_patterns_threshold() {
+        // Patterns need > 3 repeats. The small fixture won't have any.
+        let graph = convert(FIXTURE).unwrap();
+        let report = compute_metrics(&graph);
+        assert!(report.patterns.is_empty());
+    }
+
+    #[test]
+    fn test_metrics_patterns_with_repeats() {
+        // Build a fixture with repeated Bash -> Bash tool calls (5 times)
+        let mut lines = Vec::new();
+        // Initial user message
+        lines.push(r#"{"type":"user","uuid":"u0","message":{"role":"user","content":[{"type":"text","text":"do stuff"}]}}"#.to_string());
+        // 5 rounds of assistant->Bash tool_use followed by tool_result
+        for i in 1..=5 {
+            lines.push(format!(
+                r#"{{"type":"assistant","uuid":"a{i}","message":{{"role":"assistant","content":[{{"type":"text","text":"running"}},{{"type":"tool_use","id":"tu{i}","name":"Bash","input":{{"command":"ls"}}}}]}}}}"#
+            ));
+            lines.push(format!(
+                r#"{{"type":"user","uuid":"u{i}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"tu{i}","content":"ok"}}]}}}}"#
+            ));
+        }
+        let input = lines.join("\n");
+        let graph = convert(&input).unwrap();
+        let report = compute_metrics(&graph);
+
+        // 4 Bash->Bash bigrams (between the 5 sequential Bash tool_uses)
+        let bash_bash = report
+            .patterns
+            .iter()
+            .find(|p| p.from == "Bash" && p.to == "Bash");
+        assert!(
+            bash_bash.is_some(),
+            "expected Bash->Bash pattern, got: {:?}",
+            report.patterns
+        );
+        assert_eq!(bash_bash.unwrap().count, 4);
+    }
+
+    #[test]
+    fn test_metrics_empty_graph() {
+        let graph = convert("").unwrap();
+        let report = compute_metrics(&graph);
+
+        assert_eq!(report.summary.total_nodes, 0);
+        assert_eq!(report.summary.total_edges, 0);
+        assert!(report.tool_usage.is_empty());
+        assert_eq!(report.fan_out.max, 0);
+        assert_eq!(report.fan_out.average, 0.0);
+        assert!(report.patterns.is_empty());
+        assert_eq!(report.session_stats.user_messages, 0);
+        assert_eq!(report.session_stats.tool_to_text_ratio, 0.0);
+    }
+
+    #[test]
+    fn test_metrics_with_thinking() {
+        let input = r#"{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
+{"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Let me think..."},{"type":"text","text":"Here is my answer."}]}}"#;
+
+        let graph = convert(input).unwrap();
+        let report = compute_metrics(&graph);
+
+        assert_eq!(report.session_stats.thinking_blocks, 1);
+        assert_eq!(report.summary.nodes_by_type["thinking"], 1);
+    }
+
+    #[test]
+    fn test_metrics_json_serialization() {
+        let graph = convert(FIXTURE).unwrap();
+        let report = compute_metrics(&graph);
+        let json = serde_json::to_string_pretty(&report).unwrap();
+
+        // Verify it's valid JSON and contains expected keys
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("summary").is_some());
+        assert!(parsed.get("tool_usage").is_some());
+        assert!(parsed.get("fan_out").is_some());
+        assert!(parsed.get("patterns").is_some());
+        assert!(parsed.get("session_stats").is_some());
     }
 }
