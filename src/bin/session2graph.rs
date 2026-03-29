@@ -100,8 +100,8 @@ enum ContentBlock {
 
 #[derive(Serialize)]
 struct ArchGraph {
-    components: Vec<Component>,
-    links: Vec<Link>,
+    nodes: Vec<Component>,
+    edges: Vec<Link>,
 }
 
 #[derive(Serialize)]
@@ -166,8 +166,8 @@ fn tool_result_title(content: &serde_json::Value) -> String {
 }
 
 struct GraphBuilder {
-    components: Vec<Component>,
-    links: Vec<Link>,
+    nodes: Vec<Component>,
+    edges: Vec<Link>,
     counter: usize,
     // Map tool_use id -> component id for linking results back
     tool_use_ids: HashMap<String, String>,
@@ -179,8 +179,8 @@ struct GraphBuilder {
 impl GraphBuilder {
     fn new() -> Self {
         Self {
-            components: Vec::new(),
-            links: Vec::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
             counter: 0,
             tool_use_ids: HashMap::new(),
             last_assistant_id: None,
@@ -209,7 +209,7 @@ impl GraphBuilder {
             MessageContent::Empty => return,
         };
 
-        // Track whether we produced any components from this message to link via parentUuid
+        // Track whether we produced any nodes from this message to link via parentUuid
         let mut first_component_of_message: Option<String> = None;
 
         for block in blocks {
@@ -220,14 +220,14 @@ impl GraphBuilder {
 
                     // Link from previous assistant to this user (conversation flow)
                     if let Some(ref prev) = self.last_assistant_id {
-                        self.links.push(Link {
+                        self.edges.push(Link {
                             from: prev.clone(),
                             to: id.clone(),
                             r#type: "response".into(),
                         });
                     }
 
-                    self.components.push(Component {
+                    self.nodes.push(Component {
                         id: id.clone(),
                         title,
                         entity: "user_message".into(),
@@ -243,14 +243,14 @@ impl GraphBuilder {
 
                     // Link user -> assistant
                     if let Some(ref prev) = self.last_user_id {
-                        self.links.push(Link {
+                        self.edges.push(Link {
                             from: prev.clone(),
                             to: id.clone(),
                             r#type: "response".into(),
                         });
                     }
 
-                    self.components.push(Component {
+                    self.nodes.push(Component {
                         id: id.clone(),
                         title,
                         entity: "assistant_message".into(),
@@ -270,7 +270,7 @@ impl GraphBuilder {
 
                     // Link assistant -> tool_use
                     if let Some(ref prev) = self.last_assistant_id {
-                        self.links.push(Link {
+                        self.edges.push(Link {
                             from: prev.clone(),
                             to: comp_id.clone(),
                             r#type: "invocation".into(),
@@ -278,7 +278,7 @@ impl GraphBuilder {
                     }
 
                     self.tool_use_ids.insert(tid.clone(), comp_id.clone());
-                    self.components.push(Component {
+                    self.nodes.push(Component {
                         id: comp_id.clone(),
                         title,
                         entity: "tool_use".into(),
@@ -296,14 +296,14 @@ impl GraphBuilder {
 
                     // Link tool_use -> tool_result
                     if let Some(from_id) = self.tool_use_ids.get(tool_use_id) {
-                        self.links.push(Link {
+                        self.edges.push(Link {
                             from: from_id.clone(),
                             to: comp_id.clone(),
                             r#type: "result".into(),
                         });
                     }
 
-                    self.components.push(Component {
+                    self.nodes.push(Component {
                         id: comp_id.clone(),
                         title,
                         entity: "tool_result".into(),
@@ -321,14 +321,14 @@ impl GraphBuilder {
                     let title = format!("thinking: {}", truncate(thinking, 60));
 
                     if let Some(ref prev) = self.last_user_id {
-                        self.links.push(Link {
+                        self.edges.push(Link {
                             from: prev.clone(),
                             to: id.clone(),
                             r#type: "response".into(),
                         });
                     }
 
-                    self.components.push(Component {
+                    self.nodes.push(Component {
                         id: id.clone(),
                         title,
                         entity: "thinking".into(),
@@ -345,8 +345,8 @@ impl GraphBuilder {
 
     fn build(self) -> ArchGraph {
         ArchGraph {
-            components: self.components,
-            links: self.links,
+            nodes: self.nodes,
+            edges: self.edges,
         }
     }
 }
@@ -421,25 +421,25 @@ struct SessionStats {
 fn compute_metrics(graph: &ArchGraph) -> MetricsReport {
     // Summary: nodes by type, edges by type
     let mut nodes_by_type: HashMap<String, usize> = HashMap::new();
-    for comp in &graph.components {
+    for comp in &graph.nodes {
         *nodes_by_type.entry(comp.entity.clone()).or_default() += 1;
     }
 
     let mut edges_by_type: HashMap<String, usize> = HashMap::new();
-    for link in &graph.links {
+    for link in &graph.edges {
         *edges_by_type.entry(link.r#type.clone()).or_default() += 1;
     }
 
     let summary = MetricsSummary {
-        total_nodes: graph.components.len(),
-        total_edges: graph.links.len(),
+        total_nodes: graph.nodes.len(),
+        total_edges: graph.edges.len(),
         nodes_by_type,
         edges_by_type,
     };
 
     // Tool usage: count per tool name from tool_use titles
     let mut tool_counts: HashMap<String, usize> = HashMap::new();
-    for comp in &graph.components {
+    for comp in &graph.nodes {
         if comp.entity == "tool_use" {
             // Title format: "tool_use: Name(args)"
             if let Some(name) = comp.title.strip_prefix("tool_use: ") {
@@ -456,7 +456,7 @@ fn compute_metrics(graph: &ArchGraph) -> MetricsReport {
 
     // Fan-out: outgoing edges per node
     let mut outgoing: HashMap<String, usize> = HashMap::new();
-    for link in &graph.links {
+    for link in &graph.edges {
         *outgoing.entry(link.from.clone()).or_default() += 1;
     }
     let max_fan_out = outgoing.iter().max_by_key(|(_, v)| *v);
@@ -482,7 +482,7 @@ fn compute_metrics(graph: &ArchGraph) -> MetricsReport {
     // Patterns: tool_use bigrams that repeat > 3 times
     // Collect sequential tool_use names in order
     let tool_names: Vec<String> = graph
-        .components
+        .nodes
         .iter()
         .filter(|c| c.entity == "tool_use")
         .filter_map(|c| {
@@ -509,22 +509,22 @@ fn compute_metrics(graph: &ArchGraph) -> MetricsReport {
 
     // Session stats
     let user_messages = graph
-        .components
+        .nodes
         .iter()
         .filter(|c| c.entity == "user_message")
         .count();
     let assistant_messages = graph
-        .components
+        .nodes
         .iter()
         .filter(|c| c.entity == "assistant_message")
         .count();
     let tool_calls = graph
-        .components
+        .nodes
         .iter()
         .filter(|c| c.entity == "tool_use")
         .count();
     let thinking_blocks = graph
-        .components
+        .nodes
         .iter()
         .filter(|c| c.entity == "thinking")
         .count();
@@ -599,36 +599,32 @@ mod tests {
         let graph = convert(FIXTURE).unwrap();
 
         // Should have: user_msg, assistant_msg, tool_use(Read), tool_result, assistant_msg, tool_use(Edit)
-        assert_eq!(graph.components.len(), 6);
+        assert_eq!(graph.nodes.len(), 6);
 
         // Check entity types
-        assert_eq!(graph.components[0].entity, "user_message");
-        assert_eq!(graph.components[1].entity, "assistant_message");
-        assert_eq!(graph.components[2].entity, "tool_use");
-        assert_eq!(graph.components[3].entity, "tool_result");
-        assert_eq!(graph.components[4].entity, "assistant_message");
-        assert_eq!(graph.components[5].entity, "tool_use");
+        assert_eq!(graph.nodes[0].entity, "user_message");
+        assert_eq!(graph.nodes[1].entity, "assistant_message");
+        assert_eq!(graph.nodes[2].entity, "tool_use");
+        assert_eq!(graph.nodes[3].entity, "tool_result");
+        assert_eq!(graph.nodes[4].entity, "assistant_message");
+        assert_eq!(graph.nodes[5].entity, "tool_use");
 
         // Check titles
-        assert!(
-            graph.components[0]
-                .title
-                .starts_with("user: fix the login bug")
-        );
-        assert!(graph.components[2].title.contains("Read"));
-        assert!(graph.components[3].title.contains("chars]"));
-        assert!(graph.components[5].title.contains("Edit"));
+        assert!(graph.nodes[0].title.starts_with("user: fix the login bug"));
+        assert!(graph.nodes[2].title.contains("Read"));
+        assert!(graph.nodes[3].title.contains("chars]"));
+        assert!(graph.nodes[5].title.contains("Edit"));
 
-        // Check links exist
-        assert!(!graph.links.is_empty());
+        // Check edges exist
+        assert!(!graph.edges.is_empty());
 
         // user -> assistant response link
-        let first_link = &graph.links[0];
+        let first_link = &graph.edges[0];
         assert_eq!(first_link.r#type, "response");
 
         // assistant -> tool invocation link
         let invocation_links: Vec<_> = graph
-            .links
+            .edges
             .iter()
             .filter(|l| l.r#type == "invocation")
             .collect();
@@ -636,7 +632,7 @@ mod tests {
 
         // tool_use -> tool_result link
         let result_links: Vec<_> = graph
-            .links
+            .edges
             .iter()
             .filter(|l| l.r#type == "result")
             .collect();
@@ -661,8 +657,8 @@ mod tests {
     #[test]
     fn test_empty_input() {
         let graph = convert("").unwrap();
-        assert!(graph.components.is_empty());
-        assert!(graph.links.is_empty());
+        assert!(graph.nodes.is_empty());
+        assert!(graph.edges.is_empty());
     }
 
     #[test]
@@ -671,8 +667,8 @@ mod tests {
         let yaml = serde_yaml::to_string(&graph).unwrap();
 
         // Should contain expected keys
-        assert!(yaml.contains("components:"));
-        assert!(yaml.contains("links:"));
+        assert!(yaml.contains("nodes:"));
+        assert!(yaml.contains("edges:"));
         assert!(yaml.contains("entity: user_message"));
         assert!(yaml.contains("entity: tool_use"));
         assert!(yaml.contains("type: response"));
@@ -687,7 +683,7 @@ mod tests {
 
         let graph = convert(input).unwrap();
         let thinking = graph
-            .components
+            .nodes
             .iter()
             .find(|c| c.entity == "thinking")
             .expect("should have thinking component");
@@ -698,7 +694,7 @@ mod tests {
     fn test_skips_malformed_lines() {
         let input = "not json at all\n{\"type\":\"user\",\"uuid\":\"u1\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}}";
         let graph = convert(input).unwrap();
-        assert_eq!(graph.components.len(), 1);
+        assert_eq!(graph.nodes.len(), 1);
     }
 
     // ── Metrics tests ───────────────────────────────────────────────
