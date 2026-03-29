@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::TelegramRoute;
+use crate::unified_inbox;
 
 /// Maximum characters per Telegram message (API limit).
 const TELEGRAM_MAX_LEN: usize = 4096;
@@ -530,6 +531,25 @@ async fn polling_loop(
                 if !allowed.is_empty() && !allowed.contains(&chat_id) {
                     debug!(agent = %agent, chat_id = chat_id, "ignoring message — chat not in whitelist");
                     return Ok(());
+                }
+
+                // Write ALL messages from allowed chats to unified inbox,
+                // regardless of mention_only filtering.
+                let sender_username = msg.from.as_ref().and_then(|u| u.username.clone());
+                let inbox_name = format!("telegram/{}", chat_id);
+                let inbox_msg = unified_inbox::InboxMessage {
+                    ts: chrono::Utc::now(),
+                    source: "telegram".to_string(),
+                    from: sender_username,
+                    text: text.clone(),
+                    metadata: serde_json::json!({
+                        "chat_id": chat_id,
+                        "chat_name": names.get(&chat_id),
+                        "message_id": msg.id.0,
+                    }),
+                };
+                if let Err(e) = unified_inbox::write_message(&inbox_name, &inbox_msg) {
+                    warn!(chat_id = chat_id, error = %e, "failed to write to unified inbox");
                 }
 
                 // If this chat requires a mention, skip unless @bot_user appears in text.

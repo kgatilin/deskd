@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::{ScheduleAction, ScheduleDef};
+use crate::unified_inbox;
 
 /// Spawn one tokio task per schedule entry and return their handles.
 /// Callers can abort the returned handles to cancel running schedules.
@@ -158,6 +159,22 @@ async fn fire_raw(def: &ScheduleDef, bus_socket: &str, agent_name: &str) -> Resu
         .as_ref()
         .and_then(|c| c.as_str())
         .unwrap_or("scheduled event");
+
+    // Write to unified inbox
+    let inbox_name = format!("schedule/{}-raw", agent_name);
+    let inbox_msg = unified_inbox::InboxMessage {
+        ts: chrono::Utc::now(),
+        source: "schedule".to_string(),
+        from: None,
+        text: text.to_string(),
+        metadata: serde_json::json!({
+            "target": def.target,
+            "cron": def.cron,
+        }),
+    };
+    if let Err(e) = unified_inbox::write_message(&inbox_name, &inbox_msg) {
+        warn!(agent = %agent_name, error = %e, "failed to write schedule event to unified inbox");
+    }
 
     post_to_bus(bus_socket, agent_name, &def.target, text, "schedule").await
 }
@@ -368,6 +385,25 @@ async fn poll_issues(
 
         let text = format!("GitHub issue {repo}#{number}: {title}\n{html_url}\n\n{body}");
         info!(agent = %agent_name, repo = %repo, issue = number, "posting github issue to bus");
+
+        // Write to unified inbox
+        let inbox_name = format!("github/{}", repo.replace('/', "-"));
+        let inbox_msg = unified_inbox::InboxMessage {
+            ts: chrono::Utc::now(),
+            source: "github_poll".to_string(),
+            from: Some(user.to_string()),
+            text: text.clone(),
+            metadata: serde_json::json!({
+                "repo": repo,
+                "issue": number,
+                "type": "issue",
+                "url": html_url,
+            }),
+        };
+        if let Err(e) = unified_inbox::write_message(&inbox_name, &inbox_msg) {
+            warn!(repo = %repo, error = %e, "failed to write github issue to unified inbox");
+        }
+
         if let Err(e) = post_to_bus(bus_socket, agent_name, target, &text, "github_poll").await {
             warn!(error = %e, "failed to post github issue to bus");
         }
@@ -432,6 +468,25 @@ async fn poll_issue_comments(
         let text =
             format!("GitHub comment on {repo}#{issue_number} by {user}:\n{html_url}\n\n{body}");
         info!(agent = %agent_name, repo = %repo, issue = %issue_number, user = %user, "posting github comment to bus");
+
+        // Write to unified inbox
+        let inbox_name = format!("github/{}", repo.replace('/', "-"));
+        let inbox_msg = unified_inbox::InboxMessage {
+            ts: chrono::Utc::now(),
+            source: "github_poll".to_string(),
+            from: Some(user.to_string()),
+            text: text.clone(),
+            metadata: serde_json::json!({
+                "repo": repo,
+                "issue": issue_number,
+                "type": "issue_comment",
+                "url": html_url,
+            }),
+        };
+        if let Err(e) = unified_inbox::write_message(&inbox_name, &inbox_msg) {
+            warn!(repo = %repo, error = %e, "failed to write github comment to unified inbox");
+        }
+
         if let Err(e) = post_to_bus(bus_socket, agent_name, target, &text, "github_poll").await {
             warn!(error = %e, "failed to post github comment to bus");
         }
@@ -502,6 +557,25 @@ async fn poll_pull_requests(
 
         let text = format!("New pull request {repo}#{number}: {title}\n{html_url}\n\n{body}");
         info!(agent = %agent_name, repo = %repo, pr = number, "posting github PR to bus");
+
+        // Write to unified inbox
+        let inbox_name = format!("github/{}", repo.replace('/', "-"));
+        let inbox_msg = unified_inbox::InboxMessage {
+            ts: chrono::Utc::now(),
+            source: "github_poll".to_string(),
+            from: Some(user.to_string()),
+            text: text.clone(),
+            metadata: serde_json::json!({
+                "repo": repo,
+                "pr": number,
+                "type": "pull_request",
+                "url": html_url,
+            }),
+        };
+        if let Err(e) = unified_inbox::write_message(&inbox_name, &inbox_msg) {
+            warn!(repo = %repo, error = %e, "failed to write github PR to unified inbox");
+        }
+
         if let Err(e) = post_to_bus(bus_socket, agent_name, target, &text, "github_poll").await {
             warn!(error = %e, "failed to post github PR to bus");
         }
@@ -668,6 +742,22 @@ pub async fn run_reminders(bus_socket: String, agent_name: String) {
             }
 
             info!(agent = %agent_name, target = %reminder.target, "firing reminder");
+
+            // Write to unified inbox
+            let inbox_name = format!("schedule/{}-reminder", agent_name);
+            let inbox_msg = unified_inbox::InboxMessage {
+                ts: chrono::Utc::now(),
+                source: "reminder".to_string(),
+                from: None,
+                text: reminder.message.clone(),
+                metadata: serde_json::json!({
+                    "target": reminder.target,
+                    "scheduled_at": reminder.at,
+                }),
+            };
+            if let Err(e) = unified_inbox::write_message(&inbox_name, &inbox_msg) {
+                warn!(agent = %agent_name, error = %e, "failed to write reminder to unified inbox");
+            }
 
             if let Err(e) = post_to_bus(
                 &bus_socket,

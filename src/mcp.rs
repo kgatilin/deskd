@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::config::UserConfig;
 use crate::statemachine;
+use crate::unified_inbox;
 
 // ─── MCP Protocol types ───────────────────────────────────────────────────────
 
@@ -282,6 +283,60 @@ fn handle_tools_list(
         }
     }));
 
+    // Unified inbox tools
+    tools.push(json!({
+        "name": "list_inboxes",
+        "description": "List all unified inboxes with message counts. Returns inbox names (e.g. telegram/12345, github/owner-repo, agent/dev) and how many messages each contains.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    }));
+    tools.push(json!({
+        "name": "read_inbox",
+        "description": "Read messages from a unified inbox. Messages are returned in chronological order (oldest first). Use list_inboxes to discover available inbox names.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "inbox": {
+                    "type": "string",
+                    "description": "Inbox name (e.g. telegram/12345, github/owner-repo, agent/dev)"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Maximum number of messages to return (default: 50)"
+                },
+                "since": {
+                    "type": "string",
+                    "description": "Only return messages after this RFC3339 timestamp (e.g. 2026-03-29T10:00:00Z)"
+                }
+            },
+            "required": ["inbox"]
+        }
+    }));
+    tools.push(json!({
+        "name": "search_inbox",
+        "description": "Search messages across one or all unified inboxes. Case-insensitive substring match on text, source, and from fields.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "inbox": {
+                    "type": "string",
+                    "description": "Inbox name to search (omit to search all inboxes)"
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Search query (substring match)"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Maximum number of results (default: 50)"
+                }
+            },
+            "required": ["query"]
+        }
+    }));
+
     // Add state machine tools if models are defined.
     if user_config.map(|c| !c.models.is_empty()).unwrap_or(false) {
         tools.push(json!({
@@ -344,6 +399,9 @@ async fn handle_tools_call(
         "send_message" => call_send_message(args, agent_name, bus_socket, user_config).await,
         "add_persistent_agent" => call_add_persistent_agent(args, agent_name, bus_socket).await,
         "create_reminder" => call_create_reminder(args).await,
+        "list_inboxes" => call_list_inboxes().await,
+        "read_inbox" => call_read_inbox(args).await,
+        "search_inbox" => call_search_inbox(args).await,
         "sm_create" => call_sm_create(args, agent_name, bus_socket, user_config).await,
         "sm_move" => call_sm_move(args, agent_name, bus_socket, user_config).await,
         "sm_query" => call_sm_query(args).await,
@@ -558,6 +616,91 @@ async fn call_create_reminder(args: &Value) -> Result<Value> {
                 delay_minutes
             )
         }],
+        "isError": false
+    }))
+}
+
+// ─── Unified inbox tool implementations ──────────────────────────────────────
+
+async fn call_list_inboxes() -> Result<Value> {
+    let inboxes = unified_inbox::list_inboxes().context("failed to list inboxes")?;
+
+    let summary: Vec<Value> = inboxes
+        .iter()
+        .map(|(name, count)| {
+            json!({
+                "inbox": name,
+                "messages": count,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "content": [{"type": "text", "text": serde_json::to_string_pretty(&summary)?}],
+        "isError": false
+    }))
+}
+
+async fn call_read_inbox(args: &Value) -> Result<Value> {
+    let inbox = args
+        .get("inbox")
+        .and_then(|i| i.as_str())
+        .context("missing inbox")?;
+    let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize;
+    let since = args
+        .get("since")
+        .and_then(|s| s.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+
+    let messages =
+        unified_inbox::read_messages(inbox, limit, since).context("failed to read inbox")?;
+
+    let output: Vec<Value> = messages
+        .iter()
+        .map(|m| {
+            json!({
+                "ts": m.ts.to_rfc3339(),
+                "source": m.source,
+                "from": m.from,
+                "text": m.text,
+                "metadata": m.metadata,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "content": [{"type": "text", "text": serde_json::to_string_pretty(&output)?}],
+        "isError": false
+    }))
+}
+
+async fn call_search_inbox(args: &Value) -> Result<Value> {
+    let inbox = args.get("inbox").and_then(|i| i.as_str());
+    let query = args
+        .get("query")
+        .and_then(|q| q.as_str())
+        .context("missing query")?;
+    let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize;
+
+    let results =
+        unified_inbox::search_messages(inbox, query, limit).context("failed to search inbox")?;
+
+    let output: Vec<Value> = results
+        .iter()
+        .map(|m| {
+            json!({
+                "ts": m.ts.to_rfc3339(),
+                "source": m.source,
+                "from": m.from,
+                "text": m.text,
+                "metadata": m.metadata,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "content": [{"type": "text", "text": serde_json::to_string_pretty(&output)?}],
         "isError": false
     }))
 }

@@ -8,6 +8,7 @@ use crate::agent;
 use crate::config::SessionMode;
 use crate::inbox;
 use crate::message::Message;
+use crate::unified_inbox;
 
 /// Connect to the bus, register, and return the stream.
 ///
@@ -193,6 +194,26 @@ pub async fn run(
         if task_raw.is_empty() {
             debug!(agent = %name, "message has no task payload, skipping");
             continue;
+        }
+
+        // Write to unified inbox for inter-agent / bus messages.
+        // Telegram messages are already written by the telegram adapter,
+        // so skip those to avoid duplicates.
+        if !msg.source.starts_with("telegram-") {
+            let inbox_name = format!("agent/{}", name);
+            let inbox_msg = unified_inbox::InboxMessage {
+                ts: chrono::Utc::now(),
+                source: msg.source.clone(),
+                from: None,
+                text: task_raw.to_string(),
+                metadata: serde_json::json!({
+                    "target": msg.target,
+                    "message_id": msg.id,
+                }),
+            };
+            if let Err(e) = unified_inbox::write_message(&inbox_name, &inbox_msg) {
+                warn!(agent = %name, error = %e, "failed to write to unified inbox");
+            }
         }
 
         // Check if this task requests a fresh session (via metadata.fresh flag).

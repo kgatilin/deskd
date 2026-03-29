@@ -7,6 +7,7 @@ mod mcp;
 mod message;
 mod schedule;
 mod statemachine;
+mod unified_inbox;
 mod worker;
 mod workflow;
 
