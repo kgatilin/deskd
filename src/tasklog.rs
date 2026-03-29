@@ -273,7 +273,7 @@ pub fn truncate_task(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+
 
     fn temp_dir() -> PathBuf {
         PathBuf::from(format!(
