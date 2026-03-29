@@ -4,6 +4,7 @@ mod agent;
 mod bus;
 mod config;
 pub mod context;
+pub mod graph;
 mod inbox;
 mod mcp;
 mod message;
