@@ -225,7 +225,47 @@ pub async fn run(
 
     info!(agent = %name, runtime = ?agent_runtime, "agent process ready, waiting for tasks");
 
-    while let Some(line) = lines.next_line().await? {
+    // Task queue polling interval (30 seconds).
+    let mut queue_poll = tokio::time::interval(std::time::Duration::from_secs(30));
+    queue_poll.tick().await; // skip first immediate tick
+
+    let agent_model = initial_state.config.model.clone();
+    let agent_labels: Vec<String> = Vec::new(); // TODO: add labels to AgentConfig
+
+    loop {
+        // Wait for either a bus message or a queue poll tick.
+        let line = tokio::select! {
+            result = lines.next_line() => {
+                match result? {
+                    Some(l) => l,
+                    None => break, // bus closed
+                }
+            }
+            _ = queue_poll.tick() => {
+                // Poll the task queue for pending tasks matching this worker.
+                let store = crate::task::TaskStore::default_for_home();
+                if let Ok(Some(task)) = store.claim_next(name, &agent_model, &agent_labels) {
+                    info!(
+                        agent = %name,
+                        task_id = %task.id,
+                        description = %truncate(&task.description, 80),
+                        "claimed task from queue"
+                    );
+                    // Synthesize a bus message from the claimed task.
+                    let synthetic = serde_json::json!({
+                        "type": "message",
+                        "id": format!("queue-{}", task.id),
+                        "source": format!("task-queue:{}", task.created_by),
+                        "target": format!("agent:{}", name),
+                        "payload": {"task": task.description, "task_queue_id": task.id},
+                    });
+                    serde_json::to_string(&synthetic).unwrap_or_default()
+                } else {
+                    continue; // no tasks available
+                }
+            }
+        };
+
         if line.is_empty() {
             continue;
         }
@@ -303,6 +343,13 @@ pub async fn run(
             .get("task")
             .and_then(|t| t.as_str())
             .unwrap_or_default();
+
+        // Track task queue ID if this came from the pull-based queue.
+        let task_queue_id = msg
+            .payload
+            .get("task_queue_id")
+            .and_then(|t| t.as_str())
+            .map(str::to_string);
 
         if task_raw.is_empty() {
             debug!(agent = %name, "message has no task payload, skipping");
@@ -665,7 +712,24 @@ pub async fn run(
                     full_response
                 };
                 if !response.is_empty() {
-                    write_inbox(name, &msg, task, Some(response), None);
+                    write_inbox(name, &msg, task, Some(response.clone()), None);
+                }
+
+                // Update task queue if this came from the queue.
+                if let Some(ref tq_id) = task_queue_id {
+                    let store = crate::task::TaskStore::default_for_home();
+                    let result_text = if response.len() > 500 {
+                        let mut end = 500;
+                        while !response.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}...", &response[..end])
+                    } else {
+                        response
+                    };
+                    if let Err(e) = store.complete(tq_id, &result_text) {
+                        warn!(agent = %name, task_id = %tq_id, error = %e, "failed to mark queue task done");
+                    }
                 }
 
                 // Send final completion marker to reply_to.
@@ -699,6 +763,14 @@ pub async fn run(
                 };
                 if let Err(le) = tasklog::log_task(name, &log_entry) {
                     warn!(agent = %name, error = %le, "failed to write task log");
+                }
+
+                // Update task queue if this came from the queue.
+                if let Some(ref tq_id) = task_queue_id {
+                    let store = crate::task::TaskStore::default_for_home();
+                    if let Err(e) = store.fail(tq_id, &err_str) {
+                        warn!(agent = %name, task_id = %tq_id, error = %e, "failed to mark queue task failed");
+                    }
                 }
 
                 // If the persistent process died, try to restart it.

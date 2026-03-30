@@ -10,6 +10,7 @@ mod mcp;
 mod message;
 mod schedule;
 mod statemachine;
+mod task;
 mod tasklog;
 mod unified_inbox;
 mod worker;
@@ -113,6 +114,11 @@ enum Commands {
         /// Path to deskd.yaml (default: ./deskd.yaml).
         #[arg(long, global = true, default_value = "./deskd.yaml")]
         config: String,
+    },
+    /// Manage the pull-based task queue.
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
     },
     /// Schedule a one-shot reminder for an agent.
     ///
@@ -299,6 +305,32 @@ enum GraphAction {
     Validate {
         /// Path to the graph YAML file.
         file: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskAction {
+    /// Add a task to the queue.
+    Add {
+        /// Task description.
+        description: String,
+        /// Required model (e.g. claude-sonnet-4-6).
+        #[arg(long)]
+        model: Option<String>,
+        /// Required labels (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        labels: Vec<String>,
+    },
+    /// List tasks in the queue.
+    List {
+        /// Filter by status: pending, active, done, failed, cancelled.
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Cancel a pending task.
+    Cancel {
+        /// Task ID (e.g. task-a1b2c3d4).
+        id: String,
     },
 }
 
@@ -750,6 +782,9 @@ async fn main() -> anyhow::Result<()> {
             let user_cfg = config::UserConfig::load(&config_path)?;
             handle_sm(action, &user_cfg)?;
         }
+        Commands::Task { action } => {
+            handle_task(action)?;
+        }
         Commands::Schedule {
             action,
             config: config_path,
@@ -818,6 +853,16 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                 }
+            }
+
+            // Show task queue summary.
+            let qs = task::TaskStore::default_for_home().queue_summary();
+            if qs.pending > 0 || qs.active > 0 || qs.done > 0 || qs.failed > 0 {
+                println!();
+                println!(
+                    "Task queue: {} pending, {} active, {} done, {} failed",
+                    qs.pending, qs.active, qs.done, qs.failed
+                );
             }
         }
         Commands::Restart { config } => {
@@ -1315,6 +1360,56 @@ fn parse_duration_secs(s: &str) -> anyhow::Result<u64> {
     }
 
     Ok(total)
+}
+
+/// Handle `deskd task {add,list,cancel}`.
+fn handle_task(action: TaskAction) -> anyhow::Result<()> {
+    let store = task::TaskStore::default_for_home();
+    match action {
+        TaskAction::Add {
+            description,
+            model,
+            labels,
+        } => {
+            let criteria = task::TaskCriteria { model, labels };
+            let t = store.create(&description, criteria, "cli")?;
+            println!("Created task {} (pending)", t.id);
+        }
+        TaskAction::List { status } => {
+            let filter = match status.as_deref() {
+                Some("pending") => Some(task::TaskStatus::Pending),
+                Some("active") => Some(task::TaskStatus::Active),
+                Some("done") => Some(task::TaskStatus::Done),
+                Some("failed") => Some(task::TaskStatus::Failed),
+                Some("cancelled") => Some(task::TaskStatus::Cancelled),
+                Some(other) => anyhow::bail!("Unknown status: {}", other),
+                None => None,
+            };
+            let tasks = store.list(filter)?;
+            if tasks.is_empty() {
+                println!("No tasks.");
+                return Ok(());
+            }
+            println!(
+                "{:<14} {:<10} {:<14} DESCRIPTION",
+                "ID", "STATUS", "ASSIGNEE"
+            );
+            for t in &tasks {
+                let assignee = t.assignee.as_deref().unwrap_or("-");
+                let desc = if t.description.len() > 60 {
+                    format!("{}…", &t.description[..60])
+                } else {
+                    t.description.clone()
+                };
+                println!("{:<14} {:<10} {:<14} {}", t.id, t.status, assignee, desc);
+            }
+        }
+        TaskAction::Cancel { id } => {
+            let t = store.cancel(&id)?;
+            println!("Cancelled task {}", t.id);
+        }
+    }
+    Ok(())
 }
 
 /// Handle `deskd schedule {list,add,rm}`.
