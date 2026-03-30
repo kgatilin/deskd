@@ -61,6 +61,9 @@ pub struct AgentState {
     /// Truncated text of the task currently being processed.
     #[serde(default)]
     pub current_task: String,
+    /// Name of the parent agent that spawned this sub-agent, if any.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 fn default_status() -> String {
@@ -109,6 +112,7 @@ pub async fn create(cfg: &AgentConfig) -> Result<AgentState> {
         created_at: Utc::now().to_rfc3339(),
         status: "idle".to_string(),
         current_task: String::new(),
+        parent: None,
     };
 
     save_state(&state)?;
@@ -137,6 +141,7 @@ pub async fn create_or_update_from_config(cfg: &AgentConfig) -> Result<AgentStat
         created_at: Utc::now().to_rfc3339(),
         status: "idle".to_string(),
         current_task: String::new(),
+        parent: None,
     };
     save_state(&state)?;
     info!(agent = %cfg.name, "sub-agent created");
@@ -196,6 +201,7 @@ pub async fn create_or_recover(
         created_at: Utc::now().to_rfc3339(),
         status: "idle".to_string(),
         current_task: String::new(),
+        parent: None,
     };
     save_state(&state)?;
     info!(agent = %def.name, "agent created");
@@ -1225,6 +1231,7 @@ created_at: "2024-01-01T00:00:00Z"
             created_at: Utc::now().to_rfc3339(),
             status: "idle".to_string(),
             current_task: String::new(),
+            parent: None,
         };
         let yaml = serde_yaml::to_string(&state).unwrap();
         let restored: AgentState = serde_yaml::from_str(&yaml).unwrap();

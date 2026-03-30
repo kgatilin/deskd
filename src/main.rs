@@ -855,14 +855,24 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Show task queue summary.
-            let qs = task::TaskStore::default_for_home().queue_summary();
+            // Show task queue summary with per-worker active task info.
+            let task_store = task::TaskStore::default_for_home();
+            let qs = task_store.queue_summary();
             if qs.pending > 0 || qs.active > 0 || qs.done > 0 || qs.failed > 0 {
                 println!();
                 println!(
                     "Task queue: {} pending, {} active, {} done, {} failed",
                     qs.pending, qs.active, qs.done, qs.failed
                 );
+
+                // Show per-worker queue assignments.
+                if let Ok(active_tasks) = task_store.list(Some(task::TaskStatus::Active)) {
+                    for t in &active_tasks {
+                        if let Some(ref assignee) = t.assignee {
+                            println!("  {} → {}", assignee, truncate_main(&t.description, 50));
+                        }
+                    }
+                }
             }
         }
         Commands::Restart { config } => {
@@ -1396,11 +1406,7 @@ fn handle_task(action: TaskAction) -> anyhow::Result<()> {
             );
             for t in &tasks {
                 let assignee = t.assignee.as_deref().unwrap_or("-");
-                let desc = if t.description.len() > 60 {
-                    format!("{}…", &t.description[..60])
-                } else {
-                    t.description.clone()
-                };
+                let desc = truncate_main(&t.description, 60);
                 println!("{:<14} {:<10} {:<14} {}", t.id, t.status, assignee, desc);
             }
         }

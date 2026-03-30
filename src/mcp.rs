@@ -496,7 +496,7 @@ async fn handle_tools_call(
         "task_create" => call_task_create(args, agent_name).await,
         "task_list" => call_task_list(args).await,
         "task_cancel" => call_task_cancel(args).await,
-        "remove_agent" => call_remove_agent(args).await,
+        "remove_agent" => call_remove_agent(args, agent_name).await,
         "sm_create" => call_sm_create(args, agent_name, bus_socket, user_config).await,
         "sm_move" => call_sm_move(args, agent_name, bus_socket, user_config).await,
         "sm_query" => call_sm_query(args).await,
@@ -629,6 +629,12 @@ async fn call_add_persistent_agent(
         Ok(_) => {
             info!(parent = %parent_name, agent = %name, model = %model, "agent state created");
         }
+    }
+
+    // Set parent field on the created agent state.
+    if let Ok(mut state) = crate::agent::load_state(name) {
+        state.parent = Some(parent_name.to_string());
+        crate::agent::save_state_pub(&state).ok();
     }
 
     // Start the worker as a background process connected to the parent's bus.
@@ -995,25 +1001,58 @@ async fn call_task_cancel(args: &Value) -> Result<Value> {
     }))
 }
 
-async fn call_remove_agent(args: &Value) -> Result<Value> {
+async fn call_remove_agent(args: &Value, caller: &str) -> Result<Value> {
     let name = args
         .get("name")
         .and_then(|n| n.as_str())
         .context("missing name")?;
 
-    // Try to kill the process if it has a PID.
-    if let Ok(state) = crate::agent::load_state(name)
-        && state.pid > 0
-    {
+    // Verify the target agent exists and is a sub-agent of the caller.
+    let state =
+        crate::agent::load_state(name).with_context(|| format!("agent '{}' not found", name))?;
+
+    match &state.parent {
+        Some(parent) if parent == caller => {}
+        _ => bail!(
+            "agent '{}' is not a sub-agent of '{}' — removal denied",
+            name,
+            caller
+        ),
+    }
+
+    // Graceful shutdown: send SIGTERM and wait for process to exit.
+    if state.pid > 0 {
         let _ = std::process::Command::new("kill")
             .args(["-TERM", &state.pid.to_string()])
             .status();
-        info!(agent = %name, pid = state.pid, "sent SIGTERM to agent process");
+        info!(agent = %name, pid = state.pid, "sent SIGTERM, waiting for exit");
+
+        // Wait up to 30 seconds for the process to exit.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            // Check if process is still alive (kill -0).
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &state.pid.to_string()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(agent = %name, pid = state.pid, "process did not exit in 30s, force killing");
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &state.pid.to_string()])
+                    .status();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
     }
 
     crate::agent::remove(name).await?;
 
-    info!(agent = %name, "remove_agent via MCP");
+    info!(agent = %name, caller = %caller, "remove_agent via MCP");
 
     Ok(json!({
         "content": [{"type": "text", "text": format!("Agent '{}' removed", name)}],
