@@ -1,5 +1,6 @@
 //! deskd library — exposes modules for integration testing.
 
+pub mod agent;
 pub mod bus;
 pub mod config;
 #[allow(dead_code)]
