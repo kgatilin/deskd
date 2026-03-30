@@ -1359,8 +1359,12 @@ fn handle_schedule(action: ScheduleSubcommand, config_path: &str) -> anyhow::Res
 
             // Parse action string.
             let schedule_action: config::ScheduleAction =
-                serde_yaml::from_str(&format!("\"{}\"", action))
-                    .map_err(|_| anyhow::anyhow!("invalid action: {} (expected: github_poll, raw, shell)", action))?;
+                serde_yaml::from_str(&format!("\"{}\"", action)).map_err(|_| {
+                    anyhow::anyhow!(
+                        "invalid action: {} (expected: github_poll, raw, shell)",
+                        action
+                    )
+                })?;
 
             // Parse optional config JSON to YAML value.
             let config_val = match config_json {
@@ -1391,7 +1395,10 @@ fn handle_schedule(action: ScheduleSubcommand, config_path: &str) -> anyhow::Res
                 .with_context(|| format!("failed to write {}", config_path))?;
 
             let idx = user_cfg.schedules.len() - 1;
-            println!("Added schedule #{}: {} {} → {}", idx, cron_expr, action, target);
+            println!(
+                "Added schedule #{}: {} {} → {}",
+                idx, cron_expr, action, target
+            );
         }
         ScheduleSubcommand::Rm { index } => {
             let raw = std::fs::read_to_string(config_path)
@@ -1831,11 +1838,7 @@ schedules:
         assert_eq!(user_cfg.schedules[1].cron, "0 0 9 * * *");
 
         // Verify list handler runs without error.
-        handle_schedule(
-            ScheduleSubcommand::List,
-            cfg_path.to_str().unwrap(),
-        )
-        .unwrap();
+        handle_schedule(ScheduleSubcommand::List, cfg_path.to_str().unwrap()).unwrap();
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1851,11 +1854,7 @@ schedules:
         ));
         std::fs::create_dir_all(&tmp).unwrap();
         let cfg_path = tmp.join("deskd.yaml");
-        std::fs::write(
-            &cfg_path,
-            "model: claude-sonnet-4-6\nschedules: []\n",
-        )
-        .unwrap();
+        std::fs::write(&cfg_path, "model: claude-sonnet-4-6\nschedules: []\n").unwrap();
 
         let path_str = cfg_path.to_str().unwrap();
 
