@@ -197,6 +197,12 @@ Every issue/ticket MUST include an **Acceptance Criteria** section before work b
 ```
 If an issue lacks acceptance criteria, add them before starting work.
 
+### Issue Triage: `agent-ready` Label
+The `agent-ready` label means "this issue is ready for an agent to pick up and implement." Do NOT add `agent-ready` until the issue has acceptance criteria. Flow:
+1. Issue created → check for acceptance criteria
+2. No criteria → add them first, THEN label `agent-ready`
+3. Has criteria → label `agent-ready`
+
 ### PR Review: Checklist
 Every PR review MUST verify each acceptance criterion from the linked issue:
 1. Read the linked issue's acceptance criteria
