@@ -184,6 +184,27 @@ Rust files are auto-formatted via two mechanisms:
 
 If you edit .rs files, formatting is handled automatically. No need to run `cargo fmt` manually.
 
+## QA Process
+
+### Issues: Acceptance Criteria
+Every issue/ticket MUST include an **Acceptance Criteria** section before work begins:
+```
+## Acceptance Criteria
+- [ ] Specific, testable condition 1
+- [ ] Specific, testable condition 2
+- [ ] Tests pass: cargo test
+- [ ] Quality gate: cargo fmt + clippy + test
+```
+If an issue lacks acceptance criteria, add them before starting work.
+
+### PR Review: Checklist
+Every PR review MUST verify each acceptance criterion from the linked issue:
+1. Read the linked issue's acceptance criteria
+2. Check each criterion against the diff — does the code satisfy it?
+3. Run quality gate: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`
+4. If any criterion is not met, request changes with specific feedback
+5. Only merge when ALL criteria are checked off
+
 ## Conventions
 
 - Merge directly to main (squash merge, no PRs for owner repos)
