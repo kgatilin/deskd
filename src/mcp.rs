@@ -361,6 +361,72 @@ fn handle_tools_list(
         }
     }));
 
+    // Task queue tools
+    tools.push(json!({
+        "name": "task_create",
+        "description": "Create a task in the pull-based task queue. Idle workers matching the criteria will pick it up automatically.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "Task description — what the worker should do"
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Required model (e.g. claude-sonnet-4-6). Only workers with this model will pick up the task."
+                },
+                "labels": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Required labels. Only workers with ALL listed labels will pick up the task."
+                }
+            },
+            "required": ["description"]
+        }
+    }));
+    tools.push(json!({
+        "name": "task_list",
+        "description": "List tasks in the task queue. Returns task ID, status, assignee, and description.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "description": "Filter by status: pending, active, done, failed, cancelled. Omit to list all."
+                }
+            }
+        }
+    }));
+    tools.push(json!({
+        "name": "task_cancel",
+        "description": "Cancel a pending task in the task queue. Only pending tasks can be cancelled.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Task ID (e.g. task-a1b2c3d4)"
+                }
+            },
+            "required": ["id"]
+        }
+    }));
+    tools.push(json!({
+        "name": "remove_agent",
+        "description": "Stop and remove a sub-agent. The agent's worker process is terminated and its state file is deleted.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of the agent to remove"
+                }
+            },
+            "required": ["name"]
+        }
+    }));
+
     // Add state machine tools if models are defined.
     if user_config.map(|c| !c.models.is_empty()).unwrap_or(false) {
         tools.push(json!({
@@ -427,6 +493,10 @@ async fn handle_tools_call(
         "read_inbox" => call_read_inbox(args).await,
         "search_inbox" => call_search_inbox(args).await,
         "run_graph" => call_run_graph(args).await,
+        "task_create" => call_task_create(args, agent_name).await,
+        "task_list" => call_task_list(args).await,
+        "task_cancel" => call_task_cancel(args).await,
+        "remove_agent" => call_remove_agent(args, agent_name).await,
         "sm_create" => call_sm_create(args, agent_name, bus_socket, user_config).await,
         "sm_move" => call_sm_move(args, agent_name, bus_socket, user_config).await,
         "sm_query" => call_sm_query(args).await,
@@ -559,6 +629,12 @@ async fn call_add_persistent_agent(
         Ok(_) => {
             info!(parent = %parent_name, agent = %name, model = %model, "agent state created");
         }
+    }
+
+    // Set parent field on the created agent state.
+    if let Ok(mut state) = crate::agent::load_state(name) {
+        state.parent = Some(parent_name.to_string());
+        crate::agent::save_state_pub(&state).ok();
     }
 
     // Start the worker as a background process connected to the parent's bus.
@@ -835,6 +911,151 @@ async fn call_run_graph(args: &Value) -> Result<Value> {
 
     Ok(json!({
         "content": [{"type": "text", "text": summary}],
+        "isError": false
+    }))
+}
+
+// ─── Task queue tool implementations ─────────────────────────────────────────
+
+async fn call_task_create(args: &Value, agent_name: &str) -> Result<Value> {
+    let description = args
+        .get("description")
+        .and_then(|d| d.as_str())
+        .context("missing description")?;
+    let model = args.get("model").and_then(|m| m.as_str()).map(String::from);
+    let labels: Vec<String> = args
+        .get("labels")
+        .and_then(|l| l.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let store = crate::task::TaskStore::default_for_home();
+    let criteria = crate::task::TaskCriteria { model, labels };
+    let task = store.create(description, criteria, agent_name)?;
+
+    info!(agent = %agent_name, task_id = %task.id, "task_create via MCP");
+
+    Ok(json!({
+        "content": [{"type": "text", "text": format!(
+            "Task created: {} (status=pending, id={})", task.description, task.id
+        )}],
+        "isError": false
+    }))
+}
+
+async fn call_task_list(args: &Value) -> Result<Value> {
+    let status_filter = args
+        .get("status")
+        .and_then(|s| s.as_str())
+        .and_then(|s| match s {
+            "pending" => Some(crate::task::TaskStatus::Pending),
+            "active" => Some(crate::task::TaskStatus::Active),
+            "done" => Some(crate::task::TaskStatus::Done),
+            "failed" => Some(crate::task::TaskStatus::Failed),
+            "cancelled" => Some(crate::task::TaskStatus::Cancelled),
+            _ => None,
+        });
+
+    let store = crate::task::TaskStore::default_for_home();
+    let tasks = store.list(status_filter)?;
+
+    let summary: Vec<Value> = tasks
+        .iter()
+        .map(|t| {
+            json!({
+                "id": t.id,
+                "description": t.description,
+                "status": t.status,
+                "assignee": t.assignee,
+                "created_by": t.created_by,
+                "created_at": t.created_at,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "content": [{"type": "text", "text": serde_json::to_string_pretty(&summary)?}],
+        "isError": false
+    }))
+}
+
+async fn call_task_cancel(args: &Value) -> Result<Value> {
+    let id = args
+        .get("id")
+        .and_then(|i| i.as_str())
+        .context("missing id")?;
+
+    let store = crate::task::TaskStore::default_for_home();
+    let task = store.cancel(id)?;
+
+    info!(task_id = %task.id, "task_cancel via MCP");
+
+    Ok(json!({
+        "content": [{"type": "text", "text": format!("Task {} cancelled", task.id)}],
+        "isError": false
+    }))
+}
+
+async fn call_remove_agent(args: &Value, caller: &str) -> Result<Value> {
+    let name = args
+        .get("name")
+        .and_then(|n| n.as_str())
+        .context("missing name")?;
+
+    // Verify the target agent exists and is a sub-agent of the caller.
+    let state =
+        crate::agent::load_state(name).with_context(|| format!("agent '{}' not found", name))?;
+
+    match &state.parent {
+        Some(parent) if parent == caller => {}
+        _ => bail!(
+            "agent '{}' is not a sub-agent of '{}' — removal denied",
+            name,
+            caller
+        ),
+    }
+
+    // Graceful shutdown: send SIGTERM and wait for process to exit.
+    if state.pid > 0 {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &state.pid.to_string()])
+            .status();
+        info!(agent = %name, pid = state.pid, "sent SIGTERM, waiting for exit");
+
+        // Wait up to 30 seconds for the process to exit.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            // Check if process is still alive (kill -0).
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &state.pid.to_string()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(agent = %name, pid = state.pid, "process did not exit in 30s, force killing");
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &state.pid.to_string()])
+                    .status();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    crate::agent::remove(name).await?;
+
+    info!(agent = %name, caller = %caller, "remove_agent via MCP");
+
+    Ok(json!({
+        "content": [{"type": "text", "text": format!("Agent '{}' removed", name)}],
         "isError": false
     }))
 }

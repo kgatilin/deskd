@@ -7,4 +7,5 @@ pub mod config;
 mod context;
 pub mod message;
 pub mod statemachine;
+pub mod task;
 pub mod tasklog;
