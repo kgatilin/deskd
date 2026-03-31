@@ -15,17 +15,56 @@ rules:
     enabled: true
     level: personal
 
+# Layer definitions map CURRENT module locations to architectural layers.
+# Modules in the wrong layer will show as layer violations — this is
+# intentional: we want archlint to highlight what needs to move.
+#
+# Target structure (after refactoring):
+#   src/domain/   — pure types, no I/O
+#   src/ports/    — trait definitions
+#   src/infra/    — trait impls, I/O, persistence
+#   src/app/      — orchestration, use cases
+#   src/adapters/ — external platform bridges
+#   src/cli/      — CLI structs and command handlers
+#   src/main.rs   — thin entry, DI wiring
+#
+# Current state: most modules are in flat src/ and assigned to layers
+# based on what they SHOULD be, so violations reveal what to refactor.
+
 layers:
   - name: domain
-    paths: ["src/domain"]
+    paths:
+      - "src/domain"
+      - "src/message"       # already clean domain type — needs move to domain/
+      - "src/context"       # context graph — core domain, needs move to domain/
   - name: ports
-    paths: ["src/ports"]
+    paths:
+      - "src/ports"
   - name: infra
-    paths: ["src/infra", "src/adapters"]
+    paths:
+      - "src/infra"
+      - "src/adapters"
+      - "src/bus"           # Unix socket transport — infrastructure
+      - "src/agent"         # process management — infrastructure (domain types should split out)
+      - "src/acp"           # ACP JSON-RPC — infrastructure
+      - "src/task"          # file-based persistence — infrastructure (domain types already in domain/)
+      - "src/statemachine"  # file-based persistence — infrastructure (domain types should split out)
+      - "src/config"        # YAML parsing, path helpers — infrastructure
+      - "src/inbox"         # legacy file inbox — infrastructure
+      - "src/unified_inbox" # JSONL inbox — infrastructure
+      - "src/tasklog"       # task log persistence — infrastructure
   - name: app
-    paths: ["src/worker", "src/schedule", "src/workflow", "src/mcp"]
+    paths:
+      - "src/worker"        # orchestration loop
+      - "src/schedule"      # cron scheduling
+      - "src/workflow"      # SM-driven workflow engine
+      - "src/mcp"           # MCP server
+      - "src/graph"         # skill graph execution
   - name: main
-    paths: ["src/main"]
+    paths:
+      - "src/main"
+      - "src/lib"
+      - "src/bin"
 
 allowed_dependencies:
   domain: []
