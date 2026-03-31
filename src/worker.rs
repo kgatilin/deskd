@@ -16,7 +16,7 @@ use crate::unified_inbox;
 /// Wrapper for either a Claude or ACP agent process.
 enum RuntimeProcess {
     Claude(agent::AgentProcess),
-    Acp(acp::AcpProcess),
+    Acp(Box<acp::AcpProcess>),
 }
 
 impl RuntimeProcess {
@@ -28,7 +28,7 @@ impl RuntimeProcess {
             }
             AgentRuntime::Acp => {
                 let p = acp::AcpProcess::start(name, bus_socket).await?;
-                Ok(Self::Acp(p))
+                Ok(Self::Acp(Box::new(p)))
             }
         }
     }
@@ -41,7 +41,7 @@ impl RuntimeProcess {
             }
             AgentRuntime::Acp => {
                 let p = acp::AcpProcess::start_fresh(name, bus_socket).await?;
-                Ok(Self::Acp(p))
+                Ok(Self::Acp(Box::new(p)))
             }
         }
     }
