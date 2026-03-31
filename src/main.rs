@@ -6,7 +6,6 @@ mod config;
 pub mod context;
 mod domain;
 pub mod graph;
-mod inbox;
 #[allow(dead_code)]
 mod infra;
 mod mcp;
@@ -530,50 +529,61 @@ async fn main() -> anyhow::Result<()> {
             }
             AgentAction::Read {
                 name,
-                clear,
+                clear: _,
                 follow,
             } => {
-                let entries = inbox::read(&name)?;
+                let inbox_name = format!("replies/{}", name);
+                let entries = unified_inbox::read_messages(&inbox_name, 100, None)?;
                 if entries.is_empty() && !follow {
                     println!("No messages for {}", name);
                 } else {
-                    let paths: Vec<_> = entries.iter().map(|(p, _)| p.clone()).collect();
-                    for (_, entry) in &entries {
-                        print_inbox_entry(entry);
-                    }
-                    if clear {
-                        inbox::clear(&paths)?;
-                        println!("({} message(s) cleared)", paths.len());
+                    for entry in &entries {
+                        print_inbox_message(entry);
                     }
                 }
                 if follow {
-                    let mut seen: std::collections::HashSet<std::path::PathBuf> =
-                        inbox::read(&name)?.into_iter().map(|(p, _)| p).collect();
+                    let mut last_ts = entries.last().map(|m| m.ts);
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        let current = inbox::read(&name)?;
-                        for (path, entry) in &current {
-                            if !seen.contains(path) {
-                                seen.insert(path.clone());
-                                print_inbox_entry(entry);
-                            }
+                        let newer = unified_inbox::read_messages(&inbox_name, 100, last_ts)?;
+                        for entry in &newer {
+                            print_inbox_message(entry);
+                            last_ts = Some(entry.ts);
                         }
                     }
                 }
             }
             AgentAction::Tasks { name, limit } => {
-                let all_entries = inbox::read_all()?;
                 let show_all = name == "all";
-                let mut filtered: Vec<_> = if show_all {
-                    all_entries
+
+                // Read task results from unified inbox.
+                // If "all", search across all replies/* inboxes; otherwise just this agent's.
+                let mut filtered: Vec<unified_inbox::InboxMessage> = if show_all {
+                    // Search all inboxes for task_result entries.
+                    let inboxes = unified_inbox::list_inboxes()?;
+                    let mut all = Vec::new();
+                    for (inbox_name, _) in &inboxes {
+                        if inbox_name.starts_with("replies/") {
+                            let msgs = unified_inbox::read_messages(inbox_name, 1000, None)?;
+                            all.extend(msgs.into_iter().filter(|m| {
+                                m.metadata.get("type").and_then(|v| v.as_str())
+                                    == Some("task_result")
+                            }));
+                        }
+                    }
+                    all
                 } else {
-                    all_entries
-                        .into_iter()
-                        .filter(|e| e.agent == name)
+                    let inbox_name = format!("replies/{}", name);
+                    let msgs = unified_inbox::read_messages(&inbox_name, 1000, None)?;
+                    msgs.into_iter()
+                        .filter(|m| {
+                            m.metadata.get("type").and_then(|v| v.as_str()) == Some("task_result")
+                        })
                         .collect()
                 };
+
                 // Sort by timestamp descending (newest first).
-                filtered.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                filtered.sort_by(|a, b| b.ts.cmp(&a.ts));
                 filtered.truncate(limit);
 
                 if filtered.is_empty() {
@@ -586,26 +596,40 @@ async fn main() -> anyhow::Result<()> {
                     println!("COMPLETED ({}):", filtered.len());
                     let now = chrono::Utc::now();
                     for entry in &filtered {
-                        let age = if let Ok(ts) =
-                            chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
-                        {
-                            let dur = now.signed_duration_since(ts);
-                            format_relative_time(dur)
+                        let dur = now.signed_duration_since(entry.ts);
+                        let age = format_relative_time(dur);
+                        let agent = entry
+                            .metadata
+                            .get("agent")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
+                        let task_text = entry
+                            .metadata
+                            .get("task")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let task_excerpt = truncate_main(task_text, 36);
+                        let has_error = entry
+                            .metadata
+                            .get("has_error")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let status = if has_error { "err" } else { "done" };
+                        let msg_id = entry
+                            .metadata
+                            .get("message_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let id_short = if msg_id.len() > 6 {
+                            &msg_id[..6]
                         } else {
-                            "??".to_string()
+                            msg_id
                         };
-                        let id_short = if entry.id.len() > 6 {
-                            &entry.id[..6]
-                        } else {
-                            &entry.id
-                        };
-                        let task_excerpt = truncate_main(&entry.task, 36);
-                        let status = if entry.error.is_some() { "err" } else { "done" };
                         if show_all {
                             println!(
                                 "  {:<8} {:<12} from:{:<6} {:38} {} {} ago",
                                 id_short,
-                                entry.agent,
+                                agent,
                                 entry.source,
                                 format!("\"{}\"", task_excerpt),
                                 status,
@@ -1063,20 +1087,11 @@ fn handle_sm(action: SmAction, user_cfg: &config::UserConfig) -> anyhow::Result<
     Ok(())
 }
 
-fn print_inbox_entry(entry: &inbox::InboxEntry) {
-    println!(
-        "─── {} → {} [{}] ───",
-        entry.source,
-        entry.agent,
-        &entry.timestamp[..19.min(entry.timestamp.len())]
-    );
-    println!("Task: {}", truncate_main(&entry.task, 120));
-    if let Some(ref result) = entry.result {
-        println!("{}", result);
-    }
-    if let Some(ref error) = entry.error {
-        println!("ERROR: {}", error);
-    }
+fn print_inbox_message(msg: &unified_inbox::InboxMessage) {
+    let ts = msg.ts.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let from = msg.from.as_deref().unwrap_or(&msg.source);
+    println!("─── {} [{}] ───", from, ts);
+    println!("{}", msg.text);
     println!();
 }
 
