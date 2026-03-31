@@ -782,11 +782,12 @@ pub async fn run(
 
                 // If the persistent process died, try to restart it.
                 if err_str.contains("process exited") || err_str.contains("stdin closed") {
-                    warn!(agent = %name, "agent process crashed, restarting");
-                    match RuntimeProcess::start(name, &effective_bus, &agent_runtime).await {
+                    warn!(agent = %name, "agent process crashed, restarting with fresh session");
+                    // Use start_fresh to avoid retrying a stale session_id (#149).
+                    match RuntimeProcess::start_fresh(name, &effective_bus, &agent_runtime).await {
                         Ok(new_proc) => {
                             process = new_proc;
-                            info!(agent = %name, "agent process restarted");
+                            info!(agent = %name, "agent process restarted (fresh session)");
                         }
                         Err(re) => {
                             warn!(agent = %name, error = %re, "failed to restart agent process");
