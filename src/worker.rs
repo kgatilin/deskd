@@ -1098,3 +1098,158 @@ fn truncate(s: &str, max: usize) -> &str {
     }
     &s[..end]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ─── truncate tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_truncate_short_string() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_exact_length() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_long_string() {
+        assert_eq!(truncate("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_empty_string() {
+        assert_eq!(truncate("", 10), "");
+    }
+
+    #[test]
+    fn test_truncate_unicode_boundary() {
+        // '€' is 3 bytes in UTF-8; truncating at byte 1 should snap back to 0.
+        let s = "€abc";
+        let result = truncate(s, 1);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_truncate_multibyte_safe() {
+        let s = "a€b"; // a=1byte, €=3bytes, b=1byte → total 5
+        assert_eq!(truncate(s, 4), "a€");
+        assert_eq!(truncate(s, 3), "a"); // byte 3 is mid-€, snaps back
+    }
+
+    // ─── extract_task_context tests ──────────────────────────────────────────
+
+    fn make_message(payload: serde_json::Value) -> Message {
+        Message {
+            id: "msg-1".into(),
+            source: "cli".into(),
+            target: "agent:test".into(),
+            payload,
+            reply_to: None,
+            metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_extract_task_context_empty_payload() {
+        let msg = make_message(json!({}));
+        assert!(extract_task_context(&msg, "test").is_none());
+    }
+
+    #[test]
+    fn test_extract_task_context_empty_task() {
+        let msg = make_message(json!({"task": ""}));
+        assert!(extract_task_context(&msg, "test").is_none());
+    }
+
+    #[test]
+    fn test_extract_task_context_basic() {
+        let msg = make_message(json!({"task": "do something"}));
+        let ctx = extract_task_context(&msg, "test").unwrap();
+        assert_eq!(ctx.task_raw, "do something");
+        assert!(ctx.task_formatted.contains("[source: cli]"));
+        assert!(ctx.task_formatted.contains("do something"));
+        assert_eq!(ctx.reply_target, "cli");
+        assert!(ctx.telegram_chat_id.is_none());
+        assert!(ctx.github_repo.is_none());
+    }
+
+    #[test]
+    fn test_extract_task_context_with_reply_to() {
+        let mut msg = make_message(json!({"task": "work"}));
+        msg.reply_to = Some("agent:dev".into());
+        let ctx = extract_task_context(&msg, "test").unwrap();
+        assert_eq!(ctx.reply_target, "agent:dev");
+    }
+
+    #[test]
+    fn test_extract_task_context_telegram() {
+        let msg = make_message(json!({
+            "task": "hello",
+            "telegram_chat_id": -1234567890_i64,
+            "telegram_chat_name": "Dev Chat"
+        }));
+        let ctx = extract_task_context(&msg, "test").unwrap();
+        assert!(
+            ctx.task_formatted
+                .contains("[Telegram: Dev Chat (-1234567890)]")
+        );
+        assert!(ctx.task_formatted.contains("hello"));
+    }
+
+    #[test]
+    fn test_extract_task_context_telegram_with_quote() {
+        let msg = make_message(json!({
+            "task": "reply to this",
+            "telegram_chat_id": -100,
+            "telegram_reply_to_text": "original message"
+        }));
+        let ctx = extract_task_context(&msg, "test").unwrap();
+        assert!(ctx.task_formatted.contains("> original message"));
+    }
+
+    #[test]
+    fn test_extract_task_context_github() {
+        let msg = make_message(json!({
+            "task": "review PR",
+            "github_repo": "kgatilin/deskd",
+            "github_pr": 42
+        }));
+        let ctx = extract_task_context(&msg, "test").unwrap();
+        assert_eq!(ctx.github_repo.as_deref(), Some("kgatilin/deskd"));
+        assert_eq!(ctx.github_pr, Some(42));
+    }
+
+    #[test]
+    fn test_extract_task_context_sm_reply() {
+        let msg = make_message(json!({
+            "task": "handle this",
+            "sm_instance_id": "sm-abc-123"
+        }));
+        let ctx = extract_task_context(&msg, "test").unwrap();
+        assert_eq!(ctx.reply_target, "sm:sm-abc-123");
+    }
+
+    #[test]
+    fn test_extract_task_context_telegram_out_reply() {
+        let mut msg = make_message(json!({"task": "respond"}));
+        msg.reply_to = Some("telegram.out:-1234".into());
+        let ctx = extract_task_context(&msg, "test").unwrap();
+        assert_eq!(ctx.reply_target, "telegram.out:-1234");
+        assert_eq!(ctx.telegram_chat_id, Some(-1234));
+    }
+
+    #[test]
+    fn test_extract_task_context_task_queue_id() {
+        let msg = make_message(json!({
+            "task": "queued work",
+            "task_queue_id": "tq-456"
+        }));
+        let ctx = extract_task_context(&msg, "test").unwrap();
+        assert_eq!(ctx.task_queue_id.as_deref(), Some("tq-456"));
+    }
+}

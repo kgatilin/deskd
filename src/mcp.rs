@@ -1549,6 +1549,127 @@ mod tests {
     }
 
     #[test]
+    fn test_response_ok() {
+        let resp = Response::ok(Some(json!(1)), json!({"status": "ok"}));
+        assert_eq!(resp.jsonrpc, "2.0");
+        assert_eq!(resp.id, Some(json!(1)));
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result["status"], "ok");
+    }
+
+    #[test]
+    fn test_response_ok_null_id() {
+        let resp = Response::ok(None, json!("done"));
+        assert!(resp.id.is_none());
+        assert!(resp.result.is_some());
+    }
+
+    #[test]
+    fn test_response_err() {
+        let resp = Response::err(Some(json!(42)), -32601, "Method not found");
+        assert_eq!(resp.jsonrpc, "2.0");
+        assert_eq!(resp.id, Some(json!(42)));
+        assert!(resp.result.is_none());
+        let err = resp.error.unwrap();
+        assert_eq!(err["code"], -32601);
+        assert_eq!(err["message"], "Method not found");
+    }
+
+    #[test]
+    fn test_response_err_null_id() {
+        let resp = Response::err(None, -32700, "Parse error");
+        assert!(resp.id.is_none());
+        assert_eq!(resp.error.unwrap()["code"], -32700);
+    }
+
+    #[test]
+    fn test_response_ok_serialization() {
+        let resp = Response::ok(Some(json!(1)), json!({"key": "value"}));
+        let s = serde_json::to_string(&resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 1);
+        assert!(v.get("error").is_none());
+        assert_eq!(v["result"]["key"], "value");
+    }
+
+    #[test]
+    fn test_response_err_serialization() {
+        let resp = Response::err(Some(json!(2)), -32603, "Internal error");
+        let s = serde_json::to_string(&resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(v.get("result").is_none());
+        assert_eq!(v["error"]["code"], -32603);
+    }
+
+    #[test]
+    fn test_handle_initialize() {
+        let resp = handle_initialize(Some(json!(1)));
+        let result = resp.result.unwrap();
+        assert_eq!(result["protocolVersion"], "2024-11-05");
+        assert!(result["capabilities"]["tools"].is_object());
+        assert_eq!(result["serverInfo"]["name"], "deskd");
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_handle_initialize_null_id() {
+        let resp = handle_initialize(None);
+        assert!(resp.id.is_none());
+        assert!(resp.result.is_some());
+    }
+
+    #[test]
+    fn test_handle_tools_list_no_config() {
+        let resp = handle_tools_list(Some(json!(1)), "test-agent", None);
+        let result = resp.result.unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        assert!(!tools.is_empty());
+        // send_message should always be present.
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"send_message"));
+        assert!(names.contains(&"add_persistent_agent"));
+        assert!(names.contains(&"create_reminder"));
+        assert!(names.contains(&"list_inboxes"));
+        assert!(names.contains(&"read_inbox"));
+        assert!(names.contains(&"search_inbox"));
+        assert!(names.contains(&"run_graph"));
+        assert!(names.contains(&"task_create"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_unknown_method() {
+        let internal_bus = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let req = Request {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(99)),
+            method: "nonexistent/method".into(),
+            params: None,
+        };
+        let resp = handle_request(&req, "test", "/tmp/fake.sock", None, &internal_bus).await;
+        assert!(resp.error.is_some());
+        let err = resp.error.unwrap();
+        assert_eq!(err["code"], -32601);
+        assert_eq!(err["message"], "Method not found");
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_initialize() {
+        let internal_bus = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let req = Request {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "initialize".into(),
+            params: None,
+        };
+        let resp = handle_request(&req, "test", "/tmp/fake.sock", None, &internal_bus).await;
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap()["serverInfo"]["name"], "deskd");
+    }
+
+    #[test]
     fn test_send_message_description() {
         use crate::config::*;
 

@@ -1743,4 +1743,162 @@ created_at: "2024-01-01T00:00:00Z"
         assert_eq!(usage.cache_creation_input_tokens, 0);
         assert_eq!(usage.cache_read_input_tokens, 0);
     }
+
+    #[test]
+    fn test_token_usage_merge() {
+        let mut a = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 10,
+            cache_read_input_tokens: 20,
+        };
+        let b = TokenUsage {
+            input_tokens: 200,
+            output_tokens: 75,
+            cache_creation_input_tokens: 5,
+            cache_read_input_tokens: 15,
+        };
+        a.merge(&b);
+        assert_eq!(a.input_tokens, 300);
+        assert_eq!(a.output_tokens, 125);
+        assert_eq!(a.cache_creation_input_tokens, 15);
+        assert_eq!(a.cache_read_input_tokens, 35);
+    }
+
+    #[test]
+    fn test_split_command_empty() {
+        let cmd: Vec<String> = vec![];
+        let (bin, args) = split_command(&cmd);
+        assert_eq!(bin, "claude");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_split_command_single() {
+        let cmd = vec!["my-agent".to_string()];
+        let (bin, args) = split_command(&cmd);
+        assert_eq!(bin, "my-agent");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_split_command_with_args() {
+        let cmd = vec![
+            "claude".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+        ];
+        let (bin, args) = split_command(&cmd);
+        assert_eq!(bin, "claude");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--output-format");
+    }
+
+    #[test]
+    fn test_inject_required_flags_empty_command() {
+        let mut args = Vec::new();
+        let command = vec!["claude".to_string()];
+        inject_required_flags(&mut args, &command);
+        assert!(args.contains(&"--input-format=stream-json".to_string()));
+        assert!(args.contains(&"--output-format".to_string()));
+        assert!(args.contains(&"--verbose".to_string()));
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn test_inject_required_flags_no_duplicates() {
+        let mut args = Vec::new();
+        let command = vec![
+            "claude".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ];
+        inject_required_flags(&mut args, &command);
+        // Only input-format should be injected; others already in command.
+        assert!(args.contains(&"--input-format=stream-json".to_string()));
+        assert!(!args.contains(&"--verbose".to_string()));
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
+        // output-format should NOT be injected since command already has it.
+        let output_format_count = args.iter().filter(|a| a.contains("output-format")).count();
+        assert_eq!(output_format_count, 0);
+    }
+
+    #[test]
+    fn test_state_save_load_roundtrip() {
+        let tmp =
+            std::env::temp_dir().join(format!("deskd-test-agent-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe { std::env::set_var("HOME", &tmp) };
+
+        let cfg = AgentConfig {
+            name: "roundtrip-test".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            system_prompt: "test prompt".to_string(),
+            work_dir: "/tmp".to_string(),
+            max_turns: 50,
+            unix_user: None,
+            budget_usd: 25.0,
+            command: vec!["claude".to_string()],
+            config_path: None,
+            container: None,
+            session: SessionMode::default(),
+            runtime: AgentRuntime::default(),
+        };
+        let state = AgentState {
+            config: cfg,
+            pid: 0,
+            session_id: "sess-xyz".to_string(),
+            total_turns: 10,
+            total_cost: 1.23,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            status: "idle".to_string(),
+            current_task: String::new(),
+            parent: Some("parent-agent".to_string()),
+        };
+
+        save_state(&state).unwrap();
+        let loaded = load_state("roundtrip-test").unwrap();
+
+        assert_eq!(loaded.config.name, "roundtrip-test");
+        assert_eq!(loaded.session_id, "sess-xyz");
+        assert_eq!(loaded.total_turns, 10);
+        assert_eq!(loaded.total_cost, 1.23);
+        assert_eq!(loaded.parent.as_deref(), Some("parent-agent"));
+        assert_eq!(loaded.config.budget_usd, 25.0);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_build_command_with_unix_user() {
+        let cfg = AgentConfig {
+            name: "test".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            system_prompt: String::new(),
+            work_dir: "/tmp".to_string(),
+            max_turns: 100,
+            unix_user: Some("agent-user".to_string()),
+            budget_usd: 50.0,
+            command: vec!["claude".to_string()],
+            config_path: None,
+            container: None,
+            session: SessionMode::default(),
+            runtime: AgentRuntime::default(),
+        };
+        let extra_env = [("DESKD_BUS_SOCKET", "/tmp/bus.sock")];
+        let cmd = build_command(&cfg, &[], &extra_env);
+        let program = cmd.as_std().get_program().to_string_lossy().to_string();
+        assert_eq!(program, "sudo");
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.contains(&"-u".to_string()));
+        assert!(args.contains(&"agent-user".to_string()));
+        assert!(args.contains(&"DESKD_BUS_SOCKET=/tmp/bus.sock".to_string()));
+    }
 }
