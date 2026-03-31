@@ -8,7 +8,6 @@ use uuid::Uuid;
 use crate::acp;
 use crate::agent::{self, TokenUsage};
 use crate::config::{AgentRuntime, SessionMode};
-use crate::inbox;
 use crate::message::Message;
 use crate::tasklog;
 use crate::unified_inbox;
@@ -162,18 +161,30 @@ fn write_inbox(
     result: Option<String>,
     error: Option<String>,
 ) {
-    let entry = inbox::InboxEntry {
-        id: msg.id.clone(),
-        agent: name.to_string(),
-        source: msg.source.clone(),
-        task: task.to_string(),
-        result,
-        error,
-        in_reply_to: msg.id.clone(),
-        timestamp: chrono::Utc::now().to_rfc3339(),
+    let text = if let Some(ref err) = error {
+        format!("ERROR: {}", err)
+    } else if let Some(ref res) = result {
+        res.clone()
+    } else {
+        "(no output)".to_string()
     };
-    // Write to the sender's inbox (e.g. "cli"), so they can read replies.
-    if let Err(e) = inbox::write(&msg.source, &entry) {
+
+    let inbox_name = format!("replies/{}", msg.source);
+    let inbox_msg = unified_inbox::InboxMessage {
+        ts: chrono::Utc::now(),
+        source: format!("agent:{}", name),
+        from: Some(name.to_string()),
+        text,
+        metadata: serde_json::json!({
+            "type": "task_result",
+            "agent": name,
+            "task": task,
+            "message_id": msg.id,
+            "in_reply_to": msg.id,
+            "has_error": error.is_some(),
+        }),
+    };
+    if let Err(e) = unified_inbox::write_message(&inbox_name, &inbox_msg) {
         warn!(agent = %name, error = %e, "failed to write inbox entry");
     }
 }
