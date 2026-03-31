@@ -285,54 +285,41 @@ pub async fn run(
             }
         };
 
-        // Extract optional github metadata from payload (set by github_poll).
-        let github_repo = msg
-            .payload
-            .get("github_repo")
-            .and_then(|r| r.as_str())
-            .map(str::to_string);
-        let github_pr = msg.payload.get("github_pr").and_then(|p| p.as_u64());
-
-        // Check budget against the configured cap.
-        let current_state = agent::load_state(name)?;
-        if current_state.total_cost >= budget_usd {
-            warn!(
-                agent = %name,
-                cost = current_state.total_cost,
-                budget = budget_usd,
-                "budget exceeded, rejecting task"
-            );
-
-            // Log budget skip.
-            let skip_task = msg
-                .payload
-                .get("task")
-                .and_then(|t| t.as_str())
-                .unwrap_or_default();
-            let log_entry = tasklog::TaskLog {
-                ts: chrono::Utc::now().to_rfc3339(),
-                source: msg.source.clone(),
-                turns: 0,
-                cost: 0.0,
-                duration_ms: 0,
-                status: "skip".to_string(),
-                task: tasklog::truncate_task(skip_task, 60),
-                error: Some("budget exceeded".to_string()),
-                msg_id: msg.id.clone(),
-                github_repo: github_repo.clone(),
-                github_pr,
-                input_tokens: None,
-                output_tokens: None,
-            };
-            if let Err(e) = tasklog::log_task(name, &log_entry) {
-                warn!(agent = %name, error = %e, "failed to write task log");
+        // Extract task context from the message.
+        let ctx = match extract_task_context(&msg, name) {
+            Some(c) => c,
+            None => {
+                debug!(agent = %name, "message has no task payload, skipping");
+                // Log empty message with minimal context.
+                let empty_log = tasklog::TaskLog {
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    source: msg.source.clone(),
+                    turns: 0,
+                    cost: 0.0,
+                    duration_ms: 0,
+                    status: "empty".to_string(),
+                    task: String::new(),
+                    error: None,
+                    msg_id: msg.id.clone(),
+                    github_repo: msg
+                        .payload
+                        .get("github_repo")
+                        .and_then(|r| r.as_str())
+                        .map(str::to_string),
+                    github_pr: msg.payload.get("github_pr").and_then(|p| p.as_u64()),
+                    input_tokens: None,
+                    output_tokens: None,
+                };
+                if let Err(e) = tasklog::log_task(name, &empty_log) {
+                    warn!(agent = %name, error = %e, "failed to write task log");
+                }
+                continue;
             }
+        };
 
-            // Notify the sender so they get a visible error instead of silence.
-            let budget_error = format!(
-                "Budget limit reached (${:.2} / ${:.2}). Task not processed.",
-                current_state.total_cost, budget_usd,
-            );
+        // Check budget.
+        if let Some(budget_error) = check_budget(name, budget_usd) {
+            log_skip(name, &msg, &ctx, "skip", Some("budget exceeded"));
             let reply_target = msg.reply_to.as_deref().unwrap_or(&msg.source);
             write_bus_envelope(
                 &writer,
@@ -341,56 +328,17 @@ pub async fn run(
                 serde_json::json!({"error": budget_error, "in_reply_to": msg.id}),
             )
             .await;
-
             continue;
         }
 
-        let task_raw = msg
-            .payload
-            .get("task")
-            .and_then(|t| t.as_str())
-            .unwrap_or_default();
-
-        // Track task queue ID if this came from the pull-based queue.
-        let task_queue_id = msg
-            .payload
-            .get("task_queue_id")
-            .and_then(|t| t.as_str())
-            .map(str::to_string);
-
-        if task_raw.is_empty() {
-            debug!(agent = %name, "message has no task payload, skipping");
-            let log_entry = tasklog::TaskLog {
-                ts: chrono::Utc::now().to_rfc3339(),
-                source: msg.source.clone(),
-                turns: 0,
-                cost: 0.0,
-                duration_ms: 0,
-                status: "empty".to_string(),
-                task: String::new(),
-                error: None,
-                msg_id: msg.id.clone(),
-                github_repo: github_repo.clone(),
-                github_pr,
-                input_tokens: None,
-                output_tokens: None,
-            };
-            if let Err(e) = tasklog::log_task(name, &log_entry) {
-                warn!(agent = %name, error = %e, "failed to write task log");
-            }
-            continue;
-        }
-
-        // Write to unified inbox for inter-agent / bus messages.
-        // Telegram messages are already written by the telegram adapter,
-        // so skip those to avoid duplicates.
+        // Write to unified inbox (skip Telegram — adapter already writes those).
         if !msg.source.starts_with("telegram-") {
             let inbox_name = format!("agent/{}", name);
             let inbox_msg = unified_inbox::InboxMessage {
                 ts: chrono::Utc::now(),
                 source: msg.source.clone(),
                 from: None,
-                text: task_raw.to_string(),
+                text: ctx.task_raw.clone(),
                 metadata: serde_json::json!({
                     "target": msg.target,
                     "message_id": msg.id,
@@ -401,8 +349,7 @@ pub async fn run(
             }
         }
 
-        // Check if this task requests a fresh session (via metadata.fresh flag).
-        // Also check if the agent's session mode is ephemeral.
+        // Fresh session if requested or agent is ephemeral.
         let needs_fresh =
             msg.metadata.fresh || initial_state.config.session == SessionMode::Ephemeral;
         if needs_fresh {
@@ -411,122 +358,19 @@ pub async fn run(
             process = RuntimeProcess::start_fresh(name, &effective_bus, &agent_runtime).await?;
         }
 
-        // Extract optional image data from payload (sent by Telegram adapter for photos).
-        let image_base64 = msg
-            .payload
-            .get("image_base64")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let image_media_type = msg
-            .payload
-            .get("image_media_type")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        // Prepend channel context so the agent knows where the message came from.
-        let task_owned;
-        let task =
-            if let Some(chat_id) = msg.payload.get("telegram_chat_id").and_then(|v| v.as_i64()) {
-                let label = msg
-                    .payload
-                    .get("telegram_chat_name")
-                    .and_then(|v| v.as_str())
-                    .map(|n| format!("{} ({})", n, chat_id))
-                    .unwrap_or_else(|| chat_id.to_string());
-                let quoted = msg
-                    .payload
-                    .get("telegram_reply_to_text")
-                    .and_then(|v| v.as_str());
-                task_owned = if let Some(q) = quoted {
-                    format!("[Telegram: {}]\n> {}\n\n{}", label, q, task_raw)
-                } else {
-                    format!("[Telegram: {}]\n{}", label, task_raw)
-                };
-                &task_owned as &str
-            } else {
-                // Non-Telegram sources: tag with source so agent can distinguish
-                // automated messages (schedules, other agents) from user messages.
-                task_owned = format!("[source: {}]\n{}", msg.source, task_raw);
-                &task_owned as &str
-            };
-
+        let task = &ctx.task_formatted;
         info!(agent = %name, source = %msg.source, task = %truncate(task, 80), "processing task");
-        let _task_start = std::time::Instant::now();
 
-        // Mark agent as working so `deskd status` can report live state.
+        // Mark agent as working.
         if let Ok(mut st) = agent::load_state(name) {
             st.status = "working".to_string();
             st.current_task = truncate(task, 80).to_string();
             let _ = agent::save_state_pub(&st);
         }
 
-        // Determine reply target: workflow engine tasks route back to sm:<id>.
-        let reply_target =
-            if let Some(sm_id) = msg.payload.get("sm_instance_id").and_then(|v| v.as_str()) {
-                format!("sm:{}", sm_id)
-            } else {
-                msg.reply_to.as_deref().unwrap_or(&msg.source).to_string()
-            };
-        let is_telegram = reply_target.starts_with("telegram.out:");
-        let telegram_chat_id = if is_telegram {
-            reply_target
-                .strip_prefix("telegram.out:")
-                .and_then(|id| id.parse::<i64>().ok())
-        } else {
-            None
-        };
-
-        // Telegram-specific: typing indicators + progress message timer.
-        let progress_cancel_tx = if let Some(chat_id) = telegram_chat_id {
-            let ctrl_target = format!("telegram.ctrl:{}", chat_id);
-
-            // Signal typing start
-            write_bus_envelope(
-                &writer,
-                name,
-                &ctrl_target,
-                serde_json::json!({"typing": true}),
-            )
-            .await;
-
-            // Send initial progress message
-            write_bus_envelope(
-                &writer,
-                name,
-                &ctrl_target,
-                serde_json::json!({"progress_start": true}),
-            )
-            .await;
-
-            // Spawn a task that edits the progress message every 5 seconds
-            let start_time = std::time::Instant::now();
-            let progress_writer = writer.clone();
-            let progress_name = name.to_string();
-            let progress_ctrl = ctrl_target;
-            let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
-
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-                interval.tick().await; // skip first immediate tick
-                loop {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            let elapsed = start_time.elapsed().as_secs();
-                            let text = format!("⏳ Working... {}s", elapsed);
-                            write_bus_envelope(
-                                &progress_writer,
-                                &progress_name,
-                                &progress_ctrl,
-                                serde_json::json!({"progress_update": text}),
-                            )
-                            .await;
-                        }
-                        _ = &mut cancel_rx => break,
-                    }
-                }
-            });
-
-            Some(cancel_tx)
+        // Start Telegram typing/progress indicators if applicable.
+        let telegram_progress = if let Some(chat_id) = ctx.telegram_chat_id {
+            Some(TelegramProgress::start(chat_id, &writer, name).await)
         } else {
             None
         };
@@ -535,14 +379,13 @@ pub async fn run(
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let writer_fwd = writer.clone();
         let name_owned = name.to_string();
-        let reply_owned = reply_target.clone();
+        let reply_owned = ctx.reply_target.clone();
         let msg_id_owned = msg.id.clone();
-        let fwd_chat_id = telegram_chat_id;
+        let fwd_chat_id = ctx.telegram_chat_id;
         let fwd_task = tokio::spawn(async move {
             let mut full_response = String::new();
             let mut typing_stopped = false;
             while let Some(text) = progress_rx.recv().await {
-                // On first output chunk, stop typing indicator and progress message.
                 if !typing_stopped {
                     if let Some(chat_id) = fwd_chat_id {
                         let ctrl_target = format!("telegram.ctrl:{}", chat_id);
@@ -564,8 +407,6 @@ pub async fn run(
                     typing_stopped = true;
                 }
                 full_response.push_str(&text);
-                // Skip forwarding empty/whitespace-only chunks to avoid
-                // "(no content)" messages reaching Telegram.
                 if !text.trim().is_empty() {
                     write_bus_envelope(
                         &writer_fwd,
@@ -579,7 +420,10 @@ pub async fn run(
             full_response
         });
 
-        let image = image_base64.as_deref().zip(image_media_type.as_deref());
+        let image = ctx
+            .image_base64
+            .as_deref()
+            .zip(ctx.image_media_type.as_deref());
 
         let task_start = std::time::Instant::now();
 
@@ -612,7 +456,7 @@ pub async fn run(
                             );
                             let _ = process.inject_message(inject_task);
                             // Restart typing indicator for the new message
-                            if let Some(chat_id) = telegram_chat_id {
+                            if let Some(chat_id) = ctx.telegram_chat_id {
                                 let ctrl_target = format!("telegram.ctrl:{}", chat_id);
                                 write_bus_envelope(
                                     &writer,
@@ -642,148 +486,36 @@ pub async fn run(
         drop(progress_tx);
         let full_response = fwd_task.await.unwrap_or_default();
 
-        // Cancel progress timer if running.
-        if let Some(cancel_tx) = progress_cancel_tx {
-            let _ = cancel_tx.send(());
-        }
-
-        // Always send typing stop for Telegram tasks — even if already stopped
-        // in the fwd_task on first chunk, this ensures cleanup on error/empty responses.
-        if let Some(chat_id) = telegram_chat_id {
-            let ctrl_target = format!("telegram.ctrl:{}", chat_id);
-            write_bus_envelope(
-                &writer,
-                name,
-                &ctrl_target,
-                serde_json::json!({"progress_done": true}),
-            )
-            .await;
-            write_bus_envelope(
-                &writer,
-                name,
-                &ctrl_target,
-                serde_json::json!({"typing": false}),
-            )
-            .await;
+        // Stop Telegram progress indicators.
+        if let Some(tp) = telegram_progress {
+            tp.stop(&writer, name).await;
         }
 
         set_idle(name);
-        let task_duration = task_start.elapsed().as_secs();
+        let task_duration_secs = task_start.elapsed().as_secs();
         let task_duration_ms = task_start.elapsed().as_millis() as u64;
+
         match result {
             Ok(ref turn) => {
-                info!(
-                    agent = %name,
-                    cost = turn.cost_usd,
-                    turns = turn.num_turns,
-                    "task completed (persistent)"
-                );
-
-                // Log token usage to JSONL file.
-                log_token_usage(
+                handle_task_success(
+                    name,
+                    &msg,
+                    &ctx,
+                    turn,
+                    full_response,
+                    task_duration_ms,
+                    task_duration_secs,
                     &initial_state.config.work_dir,
-                    name,
-                    &msg.source,
-                    task,
-                    &turn.token_usage,
-                    task_duration,
                     &initial_state.config.model,
-                    github_repo.as_deref(),
-                    github_pr,
-                );
-
-                // Log task completion.
-                let log_entry = tasklog::TaskLog {
-                    ts: chrono::Utc::now().to_rfc3339(),
-                    source: msg.source.clone(),
-                    turns: turn.num_turns,
-                    cost: turn.cost_usd,
-                    duration_ms: task_duration_ms,
-                    status: "ok".to_string(),
-                    task: tasklog::truncate_task(task_raw, 60),
-                    error: None,
-                    msg_id: msg.id.clone(),
-                    github_repo: github_repo.clone(),
-                    github_pr,
-                    input_tokens: Some(turn.token_usage.input_tokens),
-                    output_tokens: Some(turn.token_usage.output_tokens),
-                };
-                if let Err(e) = tasklog::log_task(name, &log_entry) {
-                    warn!(agent = %name, error = %e, "failed to write task log");
-                }
-
-                // Write to file-based inbox for all senders.
-                let response = if full_response.is_empty() {
-                    turn.response_text.clone()
-                } else {
-                    full_response
-                };
-                if !response.is_empty() {
-                    write_inbox(name, &msg, task, Some(response.clone()), None);
-                }
-
-                // Update task queue if this came from the queue.
-                if let Some(ref tq_id) = task_queue_id {
-                    let store = crate::task::TaskStore::default_for_home();
-                    let result_text = if response.len() > 500 {
-                        let mut end = 500;
-                        while !response.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        format!("{}...", &response[..end])
-                    } else {
-                        response
-                    };
-                    if let Err(e) = store.complete(tq_id, &result_text) {
-                        warn!(agent = %name, task_id = %tq_id, error = %e, "failed to mark queue task done");
-                    }
-                }
-
-                // Send final completion marker to reply_to.
-                write_bus_envelope(
                     &writer,
-                    name,
-                    &reply_target,
-                    serde_json::json!({"final": true, "in_reply_to": msg.id}),
                 )
                 .await;
             }
-            Err(e) => {
-                let err_str = format!("{}", e);
-                warn!(agent = %name, error = %err_str, "task failed");
-
-                // Log task failure.
-                let log_entry = tasklog::TaskLog {
-                    ts: chrono::Utc::now().to_rfc3339(),
-                    source: msg.source.clone(),
-                    turns: 0,
-                    cost: 0.0,
-                    duration_ms: task_duration_ms,
-                    status: "error".to_string(),
-                    task: tasklog::truncate_task(task_raw, 60),
-                    error: Some(err_str.clone()),
-                    msg_id: msg.id.clone(),
-                    github_repo: github_repo.clone(),
-                    github_pr,
-                    input_tokens: None,
-                    output_tokens: None,
-                };
-                if let Err(le) = tasklog::log_task(name, &log_entry) {
-                    warn!(agent = %name, error = %le, "failed to write task log");
-                }
-
-                // Update task queue if this came from the queue.
-                if let Some(ref tq_id) = task_queue_id {
-                    let store = crate::task::TaskStore::default_for_home();
-                    if let Err(e) = store.fail(tq_id, &err_str) {
-                        warn!(agent = %name, task_id = %tq_id, error = %e, "failed to mark queue task failed");
-                    }
-                }
-
-                // If the persistent process died, try to restart it.
-                if err_str.contains("process exited") || err_str.contains("stdin closed") {
+            Err(ref e) => {
+                let needs_restart =
+                    handle_task_failure(name, &msg, &ctx, e, task_duration_ms, &writer).await;
+                if needs_restart {
                     warn!(agent = %name, "agent process crashed, restarting with fresh session");
-                    // Use start_fresh to avoid retrying a stale session_id (#149).
                     match RuntimeProcess::start_fresh(name, &effective_bus, &agent_runtime).await {
                         Ok(new_proc) => {
                             process = new_proc;
@@ -794,15 +526,6 @@ pub async fn run(
                         }
                     }
                 }
-
-                write_inbox(name, &msg, task, None, Some(err_str.clone()));
-                write_bus_envelope(
-                    &writer,
-                    name,
-                    &reply_target,
-                    serde_json::json!({"error": err_str, "in_reply_to": msg.id}),
-                )
-                .await;
             }
         }
     }
@@ -893,6 +616,380 @@ fn set_idle(name: &str) {
         st.status = "idle".to_string();
         st.current_task = String::new();
         let _ = agent::save_state_pub(&st);
+    }
+}
+
+// ─── Extracted helpers for worker decomposition (#141) ───────────────────────
+
+/// Context for a single task extracted from a bus message.
+struct TaskContext {
+    task_raw: String,
+    task_formatted: String,
+    task_queue_id: Option<String>,
+    reply_target: String,
+    telegram_chat_id: Option<i64>,
+    github_repo: Option<String>,
+    github_pr: Option<u64>,
+    image_base64: Option<String>,
+    image_media_type: Option<String>,
+}
+
+/// Extract task context from a bus message. Returns None if the message has no task.
+fn extract_task_context(msg: &Message, _name: &str) -> Option<TaskContext> {
+    let github_repo = msg
+        .payload
+        .get("github_repo")
+        .and_then(|r| r.as_str())
+        .map(str::to_string);
+    let github_pr = msg.payload.get("github_pr").and_then(|p| p.as_u64());
+
+    let task_raw = msg
+        .payload
+        .get("task")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    if task_raw.is_empty() {
+        return None;
+    }
+
+    let task_queue_id = msg
+        .payload
+        .get("task_queue_id")
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+
+    // Format task with source context.
+    let task_formatted =
+        if let Some(chat_id) = msg.payload.get("telegram_chat_id").and_then(|v| v.as_i64()) {
+            let label = msg
+                .payload
+                .get("telegram_chat_name")
+                .and_then(|v| v.as_str())
+                .map(|n| format!("{} ({})", n, chat_id))
+                .unwrap_or_else(|| chat_id.to_string());
+            let quoted = msg
+                .payload
+                .get("telegram_reply_to_text")
+                .and_then(|v| v.as_str());
+            if let Some(q) = quoted {
+                format!("[Telegram: {}]\n> {}\n\n{}", label, q, task_raw)
+            } else {
+                format!("[Telegram: {}]\n{}", label, task_raw)
+            }
+        } else {
+            format!("[source: {}]\n{}", msg.source, task_raw)
+        };
+
+    // Determine reply target.
+    let reply_target =
+        if let Some(sm_id) = msg.payload.get("sm_instance_id").and_then(|v| v.as_str()) {
+            format!("sm:{}", sm_id)
+        } else {
+            msg.reply_to.as_deref().unwrap_or(&msg.source).to_string()
+        };
+
+    let telegram_chat_id = if reply_target.starts_with("telegram.out:") {
+        reply_target
+            .strip_prefix("telegram.out:")
+            .and_then(|id| id.parse::<i64>().ok())
+    } else {
+        None
+    };
+
+    let image_base64 = msg
+        .payload
+        .get("image_base64")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let image_media_type = msg
+        .payload
+        .get("image_media_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    Some(TaskContext {
+        task_raw,
+        task_formatted,
+        task_queue_id,
+        reply_target,
+        telegram_chat_id,
+        github_repo,
+        github_pr,
+        image_base64,
+        image_media_type,
+    })
+}
+
+/// Check if budget is exceeded. Returns Some(error_message) if over budget.
+fn check_budget(name: &str, budget_usd: f64) -> Option<String> {
+    let current_state = agent::load_state(name).ok()?;
+    if current_state.total_cost >= budget_usd {
+        warn!(
+            agent = %name,
+            cost = current_state.total_cost,
+            budget = budget_usd,
+            "budget exceeded, rejecting task"
+        );
+        Some(format!(
+            "Budget limit reached (${:.2} / ${:.2}). Task not processed.",
+            current_state.total_cost, budget_usd,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Log a skipped task (budget exceeded or empty payload).
+fn log_skip(name: &str, msg: &Message, ctx: &TaskContext, status: &str, error: Option<&str>) {
+    let log_entry = tasklog::TaskLog {
+        ts: chrono::Utc::now().to_rfc3339(),
+        source: msg.source.clone(),
+        turns: 0,
+        cost: 0.0,
+        duration_ms: 0,
+        status: status.to_string(),
+        task: tasklog::truncate_task(&ctx.task_raw, 60),
+        error: error.map(str::to_string),
+        msg_id: msg.id.clone(),
+        github_repo: ctx.github_repo.clone(),
+        github_pr: ctx.github_pr,
+        input_tokens: None,
+        output_tokens: None,
+    };
+    if let Err(e) = tasklog::log_task(name, &log_entry) {
+        warn!(agent = %name, error = %e, "failed to write task log");
+    }
+}
+
+/// Handle successful task completion: log, inbox, queue update, bus reply.
+#[allow(clippy::too_many_arguments)]
+async fn handle_task_success(
+    name: &str,
+    msg: &Message,
+    ctx: &TaskContext,
+    turn: &agent::TurnResult,
+    full_response: String,
+    task_duration_ms: u64,
+    task_duration_secs: u64,
+    work_dir: &str,
+    model: &str,
+    writer: &std::sync::Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+) {
+    info!(
+        agent = %name,
+        cost = turn.cost_usd,
+        turns = turn.num_turns,
+        "task completed (persistent)"
+    );
+
+    log_token_usage(
+        work_dir,
+        name,
+        &msg.source,
+        &ctx.task_formatted,
+        &turn.token_usage,
+        task_duration_secs,
+        model,
+        ctx.github_repo.as_deref(),
+        ctx.github_pr,
+    );
+
+    let log_entry = tasklog::TaskLog {
+        ts: chrono::Utc::now().to_rfc3339(),
+        source: msg.source.clone(),
+        turns: turn.num_turns,
+        cost: turn.cost_usd,
+        duration_ms: task_duration_ms,
+        status: "ok".to_string(),
+        task: tasklog::truncate_task(&ctx.task_raw, 60),
+        error: None,
+        msg_id: msg.id.clone(),
+        github_repo: ctx.github_repo.clone(),
+        github_pr: ctx.github_pr,
+        input_tokens: Some(turn.token_usage.input_tokens),
+        output_tokens: Some(turn.token_usage.output_tokens),
+    };
+    if let Err(e) = tasklog::log_task(name, &log_entry) {
+        warn!(agent = %name, error = %e, "failed to write task log");
+    }
+
+    let response = if full_response.is_empty() {
+        turn.response_text.clone()
+    } else {
+        full_response
+    };
+    if !response.is_empty() {
+        write_inbox(name, msg, &ctx.task_formatted, Some(response.clone()), None);
+    }
+
+    // Update task queue if this came from the queue.
+    if let Some(ref tq_id) = ctx.task_queue_id {
+        let store = crate::task::TaskStore::default_for_home();
+        let result_text = if response.len() > 500 {
+            let mut end = 500;
+            while !response.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...", &response[..end])
+        } else {
+            response
+        };
+        if let Err(e) = store.complete(tq_id, &result_text) {
+            warn!(agent = %name, task_id = %tq_id, error = %e, "failed to mark queue task done");
+        }
+    }
+
+    write_bus_envelope(
+        writer,
+        name,
+        &ctx.reply_target,
+        serde_json::json!({"final": true, "in_reply_to": msg.id}),
+    )
+    .await;
+}
+
+/// Handle task failure: log, queue update, crash recovery, bus reply.
+/// Returns true if the process crashed and needs restart.
+async fn handle_task_failure(
+    name: &str,
+    msg: &Message,
+    ctx: &TaskContext,
+    error: &anyhow::Error,
+    task_duration_ms: u64,
+    writer: &std::sync::Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+) -> bool {
+    let err_str = format!("{}", error);
+    warn!(agent = %name, error = %err_str, "task failed");
+
+    let log_entry = tasklog::TaskLog {
+        ts: chrono::Utc::now().to_rfc3339(),
+        source: msg.source.clone(),
+        turns: 0,
+        cost: 0.0,
+        duration_ms: task_duration_ms,
+        status: "error".to_string(),
+        task: tasklog::truncate_task(&ctx.task_raw, 60),
+        error: Some(err_str.clone()),
+        msg_id: msg.id.clone(),
+        github_repo: ctx.github_repo.clone(),
+        github_pr: ctx.github_pr,
+        input_tokens: None,
+        output_tokens: None,
+    };
+    if let Err(le) = tasklog::log_task(name, &log_entry) {
+        warn!(agent = %name, error = %le, "failed to write task log");
+    }
+
+    if let Some(ref tq_id) = ctx.task_queue_id {
+        let store = crate::task::TaskStore::default_for_home();
+        if let Err(e) = store.fail(tq_id, &err_str) {
+            warn!(agent = %name, task_id = %tq_id, error = %e, "failed to mark queue task failed");
+        }
+    }
+
+    let needs_restart = err_str.contains("process exited") || err_str.contains("stdin closed");
+
+    write_inbox(name, msg, &ctx.task_formatted, None, Some(err_str.clone()));
+    write_bus_envelope(
+        writer,
+        name,
+        &ctx.reply_target,
+        serde_json::json!({"error": err_str, "in_reply_to": msg.id}),
+    )
+    .await;
+
+    needs_restart
+}
+
+/// Telegram typing indicator and progress message management.
+struct TelegramProgress {
+    cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    chat_id: i64,
+}
+
+impl TelegramProgress {
+    /// Start typing indicator and progress timer for a Telegram-targeted task.
+    async fn start(
+        chat_id: i64,
+        writer: &std::sync::Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+        name: &str,
+    ) -> Self {
+        let ctrl_target = format!("telegram.ctrl:{}", chat_id);
+
+        write_bus_envelope(
+            writer,
+            name,
+            &ctrl_target,
+            serde_json::json!({"typing": true}),
+        )
+        .await;
+        write_bus_envelope(
+            writer,
+            name,
+            &ctrl_target,
+            serde_json::json!({"progress_start": true}),
+        )
+        .await;
+
+        let start_time = std::time::Instant::now();
+        let progress_writer = writer.clone();
+        let progress_name = name.to_string();
+        let progress_ctrl = ctrl_target;
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let elapsed = start_time.elapsed().as_secs();
+                        let text = format!("⏳ Working... {}s", elapsed);
+                        write_bus_envelope(
+                            &progress_writer,
+                            &progress_name,
+                            &progress_ctrl,
+                            serde_json::json!({"progress_update": text}),
+                        )
+                        .await;
+                    }
+                    _ = &mut cancel_rx => break,
+                }
+            }
+        });
+
+        Self {
+            cancel_tx: Some(cancel_tx),
+            chat_id,
+        }
+    }
+
+    /// Stop typing and progress indicators.
+    async fn stop(
+        mut self,
+        writer: &std::sync::Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+        name: &str,
+    ) {
+        if let Some(tx) = self.cancel_tx.take() {
+            let _ = tx.send(());
+        }
+        let ctrl_target = format!("telegram.ctrl:{}", self.chat_id);
+        write_bus_envelope(
+            writer,
+            name,
+            &ctrl_target,
+            serde_json::json!({"progress_done": true}),
+        )
+        .await;
+        write_bus_envelope(
+            writer,
+            name,
+            &ctrl_target,
+            serde_json::json!({"typing": false}),
+        )
+        .await;
     }
 }
 
