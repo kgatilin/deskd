@@ -185,6 +185,40 @@ pub fn is_terminal(model: &ModelDef, inst: &Instance) -> bool {
     model.terminal.contains(&inst.state)
 }
 
+impl crate::ports::store::StateMachineRepository for StateMachineStore {
+    fn save(&self, inst: &Instance) -> Result<()> {
+        self.save(inst)
+    }
+    fn load(&self, id: &str) -> Result<Instance> {
+        self.load(id)
+    }
+    fn list_all(&self) -> Result<Vec<Instance>> {
+        self.list_all()
+    }
+    fn delete(&self, id: &str) -> Result<()> {
+        self.delete(id)
+    }
+    fn create(
+        &self,
+        model: &ModelDef,
+        title: &str,
+        body: &str,
+        created_by: &str,
+    ) -> Result<Instance> {
+        self.create(model, title, body, created_by)
+    }
+    fn move_to(
+        &self,
+        inst: &mut Instance,
+        model: &ModelDef,
+        target_state: &str,
+        trigger: &str,
+        note: Option<&str>,
+    ) -> Result<()> {
+        self.move_to(inst, model, target_state, trigger, note)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

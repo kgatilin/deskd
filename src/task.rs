@@ -257,6 +257,47 @@ impl TaskStore {
     }
 }
 
+impl crate::ports::store::TaskRepository for TaskStore {
+    fn load(&self, id: &str) -> Result<Task> {
+        self.load(id)
+    }
+    fn create(&self, description: &str, criteria: TaskCriteria, created_by: &str) -> Result<Task> {
+        self.create(description, criteria, created_by)
+    }
+    fn create_for_sm(
+        &self,
+        description: &str,
+        criteria: TaskCriteria,
+        created_by: &str,
+        sm_instance_id: &str,
+    ) -> Result<Task> {
+        self.create_for_sm(description, criteria, created_by, sm_instance_id)
+    }
+    fn list(&self, status_filter: Option<TaskStatus>) -> Result<Vec<Task>> {
+        self.list(status_filter)
+    }
+    fn cancel(&self, id: &str) -> Result<Task> {
+        self.cancel(id)
+    }
+    fn claim_next(
+        &self,
+        agent_name: &str,
+        agent_model: &str,
+        agent_labels: &[String],
+    ) -> Result<Option<Task>> {
+        self.claim_next(agent_name, agent_model, agent_labels)
+    }
+    fn complete(&self, id: &str, result_text: &str) -> Result<Task> {
+        self.complete(id, result_text)
+    }
+    fn fail(&self, id: &str, error_msg: &str) -> Result<Task> {
+        self.fail(id, error_msg)
+    }
+    fn queue_summary(&self) -> QueueSummary {
+        self.queue_summary()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
