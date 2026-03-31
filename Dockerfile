@@ -5,8 +5,9 @@ WORKDIR /build
 
 # Cache dependencies separately from source
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs \
+RUN mkdir -p src/bin && echo 'fn main() {}' > src/main.rs \
     && echo '' > src/lib.rs \
+    && echo 'fn main() {}' > src/bin/session2graph.rs \
     && cargo build --release \
     && rm -rf src
 
