@@ -10,6 +10,7 @@ pub mod config;
 #[allow(dead_code)]
 mod context;
 pub mod message;
+pub mod paths;
 pub mod statemachine;
 pub mod task;
 pub mod tasklog;
