@@ -1487,6 +1487,7 @@ fn handle_schedule(action: ScheduleSubcommand, config_path: &str) -> anyhow::Res
                 target: target.clone(),
                 action: schedule_action,
                 config: config_val,
+                timezone: None,
             };
 
             // Load, append, write back.

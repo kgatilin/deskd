@@ -7,7 +7,10 @@
 ///   raw         — post a static `task` payload to the target
 ///   github_poll — poll GitHub API for issues/comments, post new events to target
 use anyhow::{Context, Result};
+#[cfg(test)]
+use chrono::Timelike;
 use chrono::Utc;
+use chrono_tz::Tz;
 use cron::Schedule;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -117,12 +120,30 @@ async fn run_schedule(def: ScheduleDef, bus_socket: String, agent_name: String, 
         }
     };
 
+    let tz: Option<Tz> = def.timezone.as_deref().and_then(|tz_str| {
+        match tz_str.parse::<Tz>() {
+            Ok(tz) => {
+                info!(agent = %agent_name, cron = %def.cron, timezone = tz_str, "schedule using timezone");
+                Some(tz)
+            }
+            Err(e) => {
+                warn!(agent = %agent_name, cron = %def.cron, timezone = tz_str, error = %e, "invalid timezone, falling back to UTC");
+                None
+            }
+        }
+    });
+
     info!(agent = %agent_name, cron = %def.cron, target = %def.target, "schedule started");
 
     loop {
-        // Compute next fire time
-        let now = Utc::now();
-        let next = match schedule.upcoming(chrono::Utc).next() {
+        // Compute next fire time in the configured timezone (or UTC)
+        let next_utc = if let Some(tz) = tz {
+            schedule.upcoming(tz).next().map(|t| t.with_timezone(&Utc))
+        } else {
+            schedule.upcoming(Utc).next()
+        };
+
+        let next = match next_utc {
             Some(t) => t,
             None => {
                 warn!(agent = %agent_name, cron = %def.cron, "no upcoming occurrence, schedule stopped");
@@ -130,6 +151,7 @@ async fn run_schedule(def: ScheduleDef, bus_socket: String, agent_name: String, 
             }
         };
 
+        let now = Utc::now();
         let duration = (next - now)
             .to_std()
             .unwrap_or(std::time::Duration::from_secs(60));
@@ -992,6 +1014,7 @@ mod tests {
             target: String::new(), // empty target — output won't be posted
             action: ScheduleAction::Shell,
             config: Some(config),
+            timezone: None,
         };
 
         // fire_shell should succeed because marker.txt exists in home_dir
@@ -1062,12 +1085,14 @@ mod tests {
                     target: "agent:family".into(),
                     action: ScheduleAction::Raw,
                     config: Some(serde_yaml::Value::String("morning brief".into())),
+                    timezone: None,
                 },
                 ScheduleDef {
                     cron: "0 21 * * *".into(),
                     target: "agent:family".into(),
                     action: ScheduleAction::Raw,
                     config: Some(serde_yaml::Value::String("evening check".into())),
+                    timezone: None,
                 },
             ];
 
@@ -1137,6 +1162,75 @@ schedules:
         assert!(matches!(cfg.schedules[2].action, ScheduleAction::Shell));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_timezone_field_parsed_from_config() {
+        let dir = std::env::temp_dir().join("deskd_test_tz_config");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config_path = dir.join("deskd.yaml");
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "test"
+
+schedules:
+  - cron: "0 7 * * *"
+    target: "agent:test"
+    action: raw
+    config: "Morning"
+    timezone: "Europe/Berlin"
+  - cron: "0 9 * * *"
+    target: "agent:test"
+    action: raw
+    config: "No timezone"
+"#;
+        std::fs::write(&config_path, yaml).unwrap();
+
+        let cfg = crate::config::UserConfig::load(&config_path.to_string_lossy()).unwrap();
+
+        assert_eq!(cfg.schedules.len(), 2);
+        assert_eq!(cfg.schedules[0].timezone.as_deref(), Some("Europe/Berlin"));
+        assert_eq!(cfg.schedules[1].timezone, None);
+
+        // Verify the timezone string parses to a valid Tz
+        let tz: Tz = cfg.schedules[0]
+            .timezone
+            .as_deref()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(tz, chrono_tz::Europe::Berlin);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_timezone_affects_next_fire_time() {
+        // A cron that fires at "0 7 * * *" in Europe/Berlin should fire at 5:00 or 6:00 UTC
+        // (depending on DST), NOT at 7:00 UTC.
+        let schedule = Schedule::from_str("0 0 7 * * *").unwrap();
+        let tz: Tz = "Europe/Berlin".parse().unwrap();
+
+        let next_berlin = schedule
+            .upcoming(tz)
+            .next()
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let next_utc = schedule.upcoming(chrono::Utc).next().unwrap();
+
+        // Berlin is UTC+1 or UTC+2 (DST), so the UTC fire time should differ
+        assert_ne!(
+            next_berlin, next_utc,
+            "timezone-aware fire time should differ from UTC fire time"
+        );
+        // Berlin time 07:00 = UTC 05:00 (CEST) or 06:00 (CET)
+        assert!(
+            next_berlin.hour() == 5 || next_berlin.hour() == 6,
+            "expected UTC hour 5 or 6, got {}",
+            next_berlin.hour()
+        );
     }
 
     #[test]
