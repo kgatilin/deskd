@@ -320,6 +320,10 @@ pub struct ScheduleDef {
     pub action: ScheduleAction,
     /// Action-specific configuration (e.g. repos list for github_poll).
     pub config: Option<serde_yaml::Value>,
+    /// IANA timezone name (e.g. "Europe/Berlin"). Cron fires in this timezone.
+    /// Falls back to UTC if not specified.
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
