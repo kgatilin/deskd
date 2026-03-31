@@ -831,8 +831,23 @@ enum StdoutEvent {
     TextBlock(String, Option<TokenUsage>),
     /// The `result` event marking end of a turn.
     Result(TurnResult),
-    /// Process exited (stdout closed).
-    ProcessExited,
+    /// Process exited (stdout closed) with diagnostic context.
+    ProcessExited {
+        exit_code: Option<i32>,
+        stderr_tail: String,
+        lifetime_secs: u64,
+        used_resume: bool,
+    },
+}
+
+/// Truncate stderr output for display in error messages (max 200 chars).
+fn truncate_stderr(s: &str) -> &str {
+    let trimmed = s.trim();
+    if trimmed.len() <= 200 {
+        trimmed
+    } else {
+        &trimmed[trimmed.len() - 200..]
+    }
 }
 
 /// A long-lived Claude process that accepts multiple tasks via stdin.
@@ -847,8 +862,8 @@ pub struct AgentProcess {
     stdin_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// Receive stdout events (text blocks + result).
     event_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<StdoutEvent>>,
-    /// Child process handle for shutdown.
-    child: tokio::sync::Mutex<Option<tokio::process::Child>>,
+    /// Child process handle for shutdown (shared with stdout reader for exit code capture).
+    child: std::sync::Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
     /// Agent name.
     name: String,
     /// Last cumulative cost reported by Claude (for computing deltas).
@@ -880,7 +895,7 @@ impl AgentProcess {
                     // Peek: if we get ProcessExited quickly, session was stale.
                     loop {
                         match event_rx_guard.try_recv() {
-                            Ok(StdoutEvent::ProcessExited) => return true,
+                            Ok(StdoutEvent::ProcessExited { .. }) => return true,
                             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                             }
@@ -913,7 +928,7 @@ impl AgentProcess {
                 return Ok(Self {
                     stdin_tx: stdin_tx2,
                     event_rx: tokio::sync::Mutex::new(event_rx2),
-                    child: tokio::sync::Mutex::new(Some(child2)),
+                    child: child2,
                     name: name.to_string(),
                     last_reported_cost: tokio::sync::Mutex::new(0.0),
                     last_reported_turns: tokio::sync::Mutex::new(0),
@@ -924,7 +939,7 @@ impl AgentProcess {
             return Ok(Self {
                 stdin_tx,
                 event_rx: tokio::sync::Mutex::new(event_rx_guard),
-                child: tokio::sync::Mutex::new(Some(child)),
+                child,
                 name: name.to_string(),
                 last_reported_cost: tokio::sync::Mutex::new(0.0),
                 last_reported_turns: tokio::sync::Mutex::new(0),
@@ -934,7 +949,7 @@ impl AgentProcess {
         Ok(Self {
             stdin_tx,
             event_rx: tokio::sync::Mutex::new(event_rx),
-            child: tokio::sync::Mutex::new(Some(child)),
+            child,
             name: name.to_string(),
             last_reported_cost: tokio::sync::Mutex::new(0.0),
             last_reported_turns: tokio::sync::Mutex::new(0),
@@ -948,7 +963,7 @@ impl AgentProcess {
         Ok(Self {
             stdin_tx,
             event_rx: tokio::sync::Mutex::new(event_rx),
-            child: tokio::sync::Mutex::new(Some(child)),
+            child,
             name: name.to_string(),
             last_reported_cost: tokio::sync::Mutex::new(0.0),
             last_reported_turns: tokio::sync::Mutex::new(0),
@@ -964,7 +979,7 @@ impl AgentProcess {
     ) -> Result<(
         tokio::sync::mpsc::UnboundedSender<String>,
         tokio::sync::mpsc::UnboundedReceiver<StdoutEvent>,
-        tokio::process::Child,
+        std::sync::Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
     )> {
         let state = load_state(name)?;
 
@@ -1037,12 +1052,19 @@ impl AgentProcess {
 
         info!(agent = %name, model = %state.config.model, "persistent process started");
 
+        let spawn_instant = std::time::Instant::now();
+
         // Take stdin/stdout.
         let child_stdin = child.stdin.take().expect("stdin is piped");
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
 
-        // Drain stderr in background.
+        // Shared stderr buffer (capped at 2 KB) for exit diagnostics.
+        const STDERR_CAP: usize = 2048;
+        let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let stderr_buf_writer = stderr_buf.clone();
+
+        // Drain stderr in background into shared buffer.
         let agent_name = name.to_string();
         tokio::spawn(async move {
             let mut buf = String::new();
@@ -1050,6 +1072,14 @@ impl AgentProcess {
             let _ = reader.read_to_string(&mut buf).await;
             if !buf.is_empty() {
                 warn!(agent = %agent_name, stderr = %buf.trim(), "persistent process stderr");
+                if let Ok(mut shared) = stderr_buf_writer.lock() {
+                    if buf.len() > STDERR_CAP {
+                        // Keep the tail (most relevant for crash diagnostics).
+                        *shared = buf[buf.len() - STDERR_CAP..].to_string();
+                    } else {
+                        *shared = buf;
+                    }
+                }
             }
         });
 
@@ -1064,9 +1094,15 @@ impl AgentProcess {
             }
         });
 
+        // Wrap child in Arc so both the reader task and AgentProcess can access it.
+        let child_arc = std::sync::Arc::new(tokio::sync::Mutex::new(Some(child)));
+        let child_for_reader = child_arc.clone();
+
         // Stdout reader task — parses stream-json and sends events.
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<StdoutEvent>();
         let agent_name2 = name.to_string();
+        let stderr_buf_reader = stderr_buf;
+        let task_use_resume = use_resume;
         tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -1132,12 +1168,30 @@ impl AgentProcess {
                     }
                 }
             }
-            // stdout closed — process exited.
-            let _ = event_tx.send(StdoutEvent::ProcessExited);
+            // stdout closed — process exited. Capture exit context.
+            let lifetime_secs = spawn_instant.elapsed().as_secs();
+            let exit_code = if let Some(mut ch) = child_for_reader.lock().await.take() {
+                ch.wait().await.ok().and_then(|s| s.code())
+            } else {
+                None // already taken by kill()
+            };
+            // Give stderr task a moment to finish writing.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let stderr_tail = stderr_buf_reader
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or_default();
+
+            let _ = event_tx.send(StdoutEvent::ProcessExited {
+                exit_code,
+                stderr_tail,
+                lifetime_secs,
+                used_resume: task_use_resume,
+            });
             debug!(agent = %agent_name2, "persistent process stdout closed");
         });
 
-        Ok((stdin_tx, event_rx, child))
+        Ok((stdin_tx, event_rx, child_arc))
     }
 
     /// Send a task to the persistent process and collect the response.
@@ -1163,8 +1217,22 @@ impl AgentProcess {
             let mut drained = 0u32;
             loop {
                 match event_rx.try_recv() {
-                    Ok(StdoutEvent::ProcessExited) => {
-                        bail!("persistent process exited between turns");
+                    Ok(StdoutEvent::ProcessExited {
+                        exit_code,
+                        stderr_tail,
+                        lifetime_secs,
+                        used_resume,
+                    }) => {
+                        bail!(
+                            "persistent process exited between turns \
+                             (exit_code={}, lifetime={}s, resume={}, stderr={:?})",
+                            exit_code
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "signal".into()),
+                            lifetime_secs,
+                            used_resume,
+                            truncate_stderr(&stderr_tail),
+                        );
                     }
                     Ok(_) => {
                         drained += 1;
@@ -1188,8 +1256,22 @@ impl AgentProcess {
             let mut event_rx = self.event_rx.lock().await;
             loop {
                 match event_rx.try_recv() {
-                    Ok(StdoutEvent::ProcessExited) => {
-                        bail!("persistent process exited between turns");
+                    Ok(StdoutEvent::ProcessExited {
+                        exit_code,
+                        stderr_tail,
+                        lifetime_secs,
+                        used_resume,
+                    }) => {
+                        bail!(
+                            "persistent process exited between turns \
+                             (exit_code={}, lifetime={}s, resume={}, stderr={:?})",
+                            exit_code
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "signal".into()),
+                            lifetime_secs,
+                            used_resume,
+                            truncate_stderr(&stderr_tail),
+                        );
                     }
                     Ok(_) => {
                         drained += 1;
@@ -1341,8 +1423,25 @@ impl AgentProcess {
 
                     return Ok(result);
                 }
-                Some(StdoutEvent::ProcessExited) | None => {
-                    bail!("persistent process exited mid-task");
+                Some(StdoutEvent::ProcessExited {
+                    exit_code,
+                    stderr_tail,
+                    lifetime_secs,
+                    used_resume,
+                }) => {
+                    bail!(
+                        "persistent process exited mid-task \
+                         (exit_code={}, lifetime={}s, resume={}, stderr={:?})",
+                        exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signal".into()),
+                        lifetime_secs,
+                        used_resume,
+                        truncate_stderr(&stderr_tail),
+                    );
+                }
+                None => {
+                    bail!("persistent process exited mid-task (channel closed)");
                 }
             }
         }

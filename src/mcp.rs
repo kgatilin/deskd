@@ -497,6 +497,14 @@ fn handle_tools_list(
         }
     }));
     tools.push(json!({
+        "name": "list_agents",
+        "description": "List all sub-agents spawned by this agent on its internal bus. Returns name, model, status (running/finished), turns, and cost for each agent.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    }));
+    tools.push(json!({
         "name": "remove_agent",
         "description": "Stop and remove a sub-agent. The agent's worker process is terminated and its state file is deleted.",
         "inputSchema": {
@@ -585,6 +593,7 @@ async fn handle_tools_call(
         "task_create" => call_task_create(args, agent_name).await,
         "task_list" => call_task_list(args).await,
         "task_cancel" => call_task_cancel(args).await,
+        "list_agents" => call_list_agents(internal_bus).await,
         "remove_agent" => call_remove_agent(args, agent_name, internal_bus).await,
         "sm_create" => call_sm_create(args, agent_name, bus_socket, user_config).await,
         "sm_move" => call_sm_move(args, agent_name, bus_socket, user_config).await,
@@ -1135,6 +1144,54 @@ async fn call_task_cancel(args: &Value) -> Result<Value> {
 
     Ok(json!({
         "content": [{"type": "text", "text": format!("Task {} cancelled", task.id)}],
+        "isError": false
+    }))
+}
+
+async fn call_list_agents(internal_bus: &Arc<Mutex<Option<InternalBus>>>) -> Result<Value> {
+    let ibus_guard = internal_bus.lock().await;
+    let agents: Vec<Value> = match &*ibus_guard {
+        None => Vec::new(),
+        Some(ibus) => {
+            let mut list = Vec::new();
+            for name in &ibus.sub_agents {
+                let (model, turns, cost_usd) = match crate::agent::load_state(name) {
+                    Ok(state) => (
+                        state.config.model.clone(),
+                        state.total_turns,
+                        state.total_cost,
+                    ),
+                    Err(_) => ("unknown".to_string(), 0, 0.0),
+                };
+
+                // Determine status from the worker JoinHandle.
+                let status = ibus
+                    .worker_handles
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, handle)| {
+                        if handle.is_finished() {
+                            "finished"
+                        } else {
+                            "running"
+                        }
+                    })
+                    .unwrap_or("unknown");
+
+                list.push(json!({
+                    "name": name,
+                    "model": model,
+                    "status": status,
+                    "turns": turns,
+                    "cost_usd": cost_usd,
+                }));
+            }
+            list
+        }
+    };
+
+    Ok(json!({
+        "content": [{"type": "text", "text": serde_json::to_string_pretty(&agents)?}],
         "isError": false
     }))
 }
