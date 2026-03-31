@@ -810,8 +810,76 @@ pub struct AgentProcess {
 
 impl AgentProcess {
     /// Spawn a persistent Claude process for the named agent.
+    ///
+    /// If a stale session_id causes an immediate exit (e.g. container restart
+    /// cleared the session), automatically retries with a fresh session and
+    /// clears the stale session_id from state. See #149.
     pub async fn start(name: &str, bus_socket: &str) -> Result<Self> {
+        let state = load_state(name)?;
+        let will_resume =
+            state.config.session == SessionMode::Persistent && !state.session_id.is_empty();
+
         let (stdin_tx, event_rx, child) = Self::spawn_process(name, bus_socket, false).await?;
+
+        if will_resume {
+            // Check if the process exits immediately (stale session).
+            // Give it up to 5 seconds — a healthy process stays alive.
+            let mut event_rx_guard = event_rx;
+            let exited_immediately =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    // Peek: if we get ProcessExited quickly, session was stale.
+                    loop {
+                        match event_rx_guard.try_recv() {
+                            Ok(StdoutEvent::ProcessExited) => return true,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            }
+                            _ => {
+                                // Got a real event (TextBlock, Result) — process is alive.
+                                return false;
+                            }
+                        }
+                    }
+                })
+                .await
+                .unwrap_or(false); // timeout = process is alive
+
+            if exited_immediately {
+                warn!(
+                    agent = %name,
+                    session_id = %state.session_id,
+                    "process exited immediately with --resume (stale session), retrying fresh"
+                );
+
+                // Clear stale session_id from state.
+                if let Ok(mut s) = load_state(name) {
+                    s.session_id.clear();
+                    save_state_pub(&s).ok();
+                }
+
+                // Retry with fresh session.
+                let (stdin_tx2, event_rx2, child2) =
+                    Self::spawn_process(name, bus_socket, true).await?;
+                return Ok(Self {
+                    stdin_tx: stdin_tx2,
+                    event_rx: tokio::sync::Mutex::new(event_rx2),
+                    child: tokio::sync::Mutex::new(Some(child2)),
+                    name: name.to_string(),
+                    last_reported_cost: tokio::sync::Mutex::new(0.0),
+                    last_reported_turns: tokio::sync::Mutex::new(0),
+                });
+            }
+
+            // Process is alive — use the original channels.
+            return Ok(Self {
+                stdin_tx,
+                event_rx: tokio::sync::Mutex::new(event_rx_guard),
+                child: tokio::sync::Mutex::new(Some(child)),
+                name: name.to_string(),
+                last_reported_cost: tokio::sync::Mutex::new(0.0),
+                last_reported_turns: tokio::sync::Mutex::new(0),
+            });
+        }
 
         Ok(Self {
             stdin_tx,
