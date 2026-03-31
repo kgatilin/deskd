@@ -12,6 +12,7 @@ pub mod graph;
 mod infra;
 mod mcp;
 mod message;
+mod paths;
 #[allow(dead_code)]
 mod ports;
 mod schedule;

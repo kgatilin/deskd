@@ -266,7 +266,7 @@ fn handle_tools_list(
     user_config: Option<&UserConfig>,
 ) -> Response {
     let send_message_desc = user_config
-        .map(|c| c.send_message_description(agent_name))
+        .map(|c| build_send_message_description(c, agent_name))
         .unwrap_or_else(|| "Send a message to a target on the bus.".to_string());
 
     // Build sm_create description dynamically listing available models.
@@ -1496,6 +1496,44 @@ fn glob_match(pattern: &str, value: &str) -> bool {
     }
 }
 
+/// Build the MCP tool description for `send_message` based on available
+/// channels, sub-agents, and telegram routes defined in the user config.
+fn build_send_message_description(cfg: &UserConfig, agent_name: &str) -> String {
+    let mut lines = vec![
+        "Send a message to a target on the bus.".to_string(),
+        String::new(),
+        "Available targets:".to_string(),
+    ];
+
+    for a in &cfg.agents {
+        lines.push(format!(
+            "  agent:{}  — {} ({}). {}",
+            a.name,
+            a.name,
+            a.model,
+            a.system_prompt.lines().next().unwrap_or("")
+        ));
+    }
+
+    for ch in &cfg.channels {
+        lines.push(format!("  {}  — {}", ch.name, ch.description));
+    }
+
+    if let Some(tg) = &cfg.telegram {
+        for route in &tg.routes {
+            lines.push(format!(
+                "  telegram.out:{}  — Telegram chat {}",
+                route.chat_id, route.chat_id
+            ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(format!("You are agent '{}'.", agent_name));
+
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1508,5 +1546,47 @@ mod tests {
         assert!(glob_match("agent:dev", "agent:dev"));
         assert!(!glob_match("agent:dev", "agent:researcher"));
         assert!(!glob_match("telegram.out:*", "telegram.in:-1234"));
+    }
+
+    #[test]
+    fn test_send_message_description() {
+        use crate::config::*;
+
+        let cfg = UserConfig {
+            model: "claude-opus-4-6".into(),
+            system_prompt: String::new(),
+            max_turns: 100,
+            channels: vec![ChannelDef {
+                name: "news:ecosystem".into(),
+                description: "Ecosystem updates".into(),
+            }],
+            agents: vec![SubAgentDef {
+                name: "dev".into(),
+                model: "claude-sonnet-4-6".into(),
+                system_prompt: "Implements code changes.".into(),
+                subscribe: vec!["agent:dev".into()],
+                publish: None,
+                session: SessionMode::default(),
+                runtime: AgentRuntime::default(),
+            }],
+            telegram: Some(TelegramRoutesConfig {
+                routes: vec![TelegramRoute {
+                    chat_id: -1003733725513,
+                    mention_only: false,
+                    name: None,
+                    route_to: None,
+                }],
+            }),
+            discord: None,
+            schedules: vec![],
+            mcp_config: None,
+            models: vec![],
+            context: None,
+        };
+        let desc = build_send_message_description(&cfg, "kira");
+        assert!(desc.contains("agent:dev"));
+        assert!(desc.contains("news:ecosystem"));
+        assert!(desc.contains("telegram.out:-1003733725513"));
+        assert!(desc.contains("You are agent 'kira'"));
     }
 }

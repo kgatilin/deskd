@@ -4,29 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Where agent state files are stored (relative to $HOME).
-pub fn state_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let dir = PathBuf::from(home).join(".deskd").join("agents");
-    std::fs::create_dir_all(&dir).ok();
-    dir
-}
-
-/// Where agent logs are stored (relative to $HOME).
-pub fn log_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let dir = PathBuf::from(home).join(".deskd").join("logs");
-    std::fs::create_dir_all(&dir).ok();
-    dir
-}
-
-/// Where one-shot reminder JSON files are stored.
-pub fn reminders_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let dir = PathBuf::from(home).join(".deskd").join("reminders");
-    std::fs::create_dir_all(&dir).ok();
-    dir
-}
+// Re-export path helpers for backward compatibility.
+pub use crate::paths::{agent_bus_socket, log_dir, reminders_dir, state_dir};
 
 /// A one-shot reminder that fires at a specific time and posts a message to the bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,16 +16,6 @@ pub struct RemindDef {
     pub target: String,
     /// Payload text to post.
     pub message: String,
-}
-
-/// Derive the bus socket path for an agent from its work directory.
-/// Convention: {work_dir}/.deskd/bus.sock
-pub fn agent_bus_socket(work_dir: &str) -> String {
-    PathBuf::from(work_dir)
-        .join(".deskd")
-        .join("bus.sock")
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn default_max_turns() -> u32 {
@@ -376,7 +345,7 @@ pub struct TransitionDef {
     /// Task queue criteria for this transition (model, labels).
     /// When set, dispatch creates a task in the queue instead of direct bus message.
     #[serde(default)]
-    pub criteria: Option<crate::task::TaskCriteria>,
+    pub criteria: Option<crate::domain::task::TaskCriteria>,
 }
 
 impl UserConfig {
@@ -388,47 +357,6 @@ impl UserConfig {
         let cfg: UserConfig =
             serde_yaml::from_str(&expanded).context("failed to parse user config")?;
         Ok(cfg)
-    }
-
-    /// Build the MCP tool description for `send_message` based on available
-    /// channels, sub-agents, and telegram routes.
-    pub fn send_message_description(&self, agent_name: &str) -> String {
-        let mut lines = vec![
-            "Send a message to a target on the bus.".to_string(),
-            String::new(),
-            "Available targets:".to_string(),
-        ];
-
-        // Sub-agents
-        for a in &self.agents {
-            lines.push(format!(
-                "  agent:{}  — {} ({}). {}",
-                a.name,
-                a.name,
-                a.model,
-                a.system_prompt.lines().next().unwrap_or("")
-            ));
-        }
-
-        // Named channels
-        for ch in &self.channels {
-            lines.push(format!("  {}  — {}", ch.name, ch.description));
-        }
-
-        // Telegram outbound routes
-        if let Some(tg) = &self.telegram {
-            for route in &tg.routes {
-                lines.push(format!(
-                    "  telegram.out:{}  — Telegram chat {}",
-                    route.chat_id, route.chat_id
-                ));
-            }
-        }
-
-        lines.push(String::new());
-        lines.push(format!("You are agent '{}'.", agent_name));
-
-        lines.join("\n")
     }
 }
 
@@ -687,46 +615,6 @@ agents:
         let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.agents[0].session, SessionMode::Ephemeral);
         assert_eq!(cfg.agents[1].session, SessionMode::Persistent); // default
-    }
-
-    #[test]
-    fn test_send_message_description() {
-        let cfg = UserConfig {
-            model: "claude-opus-4-6".into(),
-            system_prompt: String::new(),
-            max_turns: 100,
-            channels: vec![ChannelDef {
-                name: "news:ecosystem".into(),
-                description: "Ecosystem updates".into(),
-            }],
-            agents: vec![SubAgentDef {
-                name: "dev".into(),
-                model: "claude-sonnet-4-6".into(),
-                system_prompt: "Implements code changes.".into(),
-                subscribe: vec!["agent:dev".into()],
-                publish: None,
-                session: SessionMode::default(),
-                runtime: AgentRuntime::default(),
-            }],
-            telegram: Some(TelegramRoutesConfig {
-                routes: vec![TelegramRoute {
-                    chat_id: -1003733725513,
-                    mention_only: false,
-                    name: None,
-                    route_to: None,
-                }],
-            }),
-            discord: None,
-            schedules: vec![],
-            mcp_config: None,
-            models: vec![],
-            context: None,
-        };
-        let desc = cfg.send_message_description("kira");
-        assert!(desc.contains("agent:dev"));
-        assert!(desc.contains("news:ecosystem"));
-        assert!(desc.contains("telegram.out:-1003733725513"));
-        assert!(desc.contains("You are agent 'kira'"));
     }
 
     #[test]
