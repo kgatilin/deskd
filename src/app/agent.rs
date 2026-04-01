@@ -79,6 +79,11 @@ fn log_path(name: &str) -> PathBuf {
     config::log_dir().join(format!("{}.log", name))
 }
 
+/// Path to the agent's stderr log file.
+pub fn stderr_log_path(name: &str) -> PathBuf {
+    config::log_dir().join(format!("{}.stderr.log", name))
+}
+
 pub fn load_state(name: &str) -> Result<AgentState> {
     let path = state_path(name);
     let content =
@@ -760,6 +765,12 @@ pub async fn remove(name: &str) -> Result<()> {
     {
         warn!(agent = %name, error = %e, "failed to remove log file");
     }
+    let stderr_log = stderr_log_path(name);
+    if stderr_log.exists()
+        && let Err(e) = std::fs::remove_file(&stderr_log)
+    {
+        warn!(agent = %name, error = %e, "failed to remove stderr log file");
+    }
     info!(agent = %name, "agent removed");
     Ok(())
 }
@@ -1065,22 +1076,39 @@ impl AgentProcess {
         let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let stderr_buf_writer = stderr_buf.clone();
 
-        // Drain stderr in background into shared buffer.
+        // Drain stderr in background: persist to file + keep in-memory buffer for exit diagnostics.
         let agent_name = name.to_string();
         tokio::spawn(async move {
-            let mut buf = String::new();
+            use tokio::io::AsyncBufReadExt;
+
             let mut reader = tokio::io::BufReader::new(stderr);
-            let _ = reader.read_to_string(&mut buf).await;
-            if !buf.is_empty() {
-                warn!(agent = %agent_name, stderr = %buf.trim(), "persistent process stderr");
+            let log_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(stderr_log_path(&agent_name));
+            let mut file_writer = log_file.ok().map(std::io::BufWriter::new);
+
+            let mut line = String::new();
+            while let Ok(n) = reader.read_line(&mut line).await {
+                if n == 0 {
+                    break;
+                }
+                // Persist to file with timestamp.
+                if let Some(ref mut f) = file_writer {
+                    use std::io::Write;
+                    let ts = chrono::Utc::now().format("%H:%M:%S");
+                    let _ = write!(f, "[{}] {}", ts, line);
+                    let _ = f.flush();
+                }
+                // Keep in-memory buffer (capped) for exit diagnostics.
                 if let Ok(mut shared) = stderr_buf_writer.lock() {
-                    if buf.len() > STDERR_CAP {
-                        // Keep the tail (most relevant for crash diagnostics).
-                        *shared = buf[buf.len() - STDERR_CAP..].to_string();
-                    } else {
-                        *shared = buf;
+                    shared.push_str(&line);
+                    if shared.len() > STDERR_CAP {
+                        let excess = shared.len() - STDERR_CAP;
+                        shared.drain(..excess);
                     }
                 }
+                line.clear();
             }
         });
 

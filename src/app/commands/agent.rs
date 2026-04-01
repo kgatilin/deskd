@@ -304,6 +304,111 @@ pub async fn handle(action: AgentAction) -> Result<()> {
                 tasklog::print_table(&entries);
             }
         }
+        AgentAction::Status { name } => match name {
+            Some(name) => {
+                let s = agent::load_state(&name)?;
+                let pid_alive =
+                    s.pid > 0 && std::path::Path::new(&format!("/proc/{}", s.pid)).exists();
+                let status_str = if pid_alive { &s.status } else { "offline" };
+                println!("Agent:       {}", s.config.name);
+                println!("Status:      {}", status_str);
+                println!(
+                    "PID:         {}",
+                    if pid_alive {
+                        s.pid.to_string()
+                    } else {
+                        "-".into()
+                    }
+                );
+                println!("Model:       {}", s.config.model);
+                println!("Turns:       {}", s.total_turns);
+                println!("Cost:        ${:.4}", s.total_cost);
+                println!("Budget:      ${:.2}", s.config.budget_usd);
+                println!("Created:     {}", s.created_at);
+                println!("Work dir:    {}", s.config.work_dir);
+                if !s.current_task.is_empty() {
+                    println!("Current:     {}", truncate(&s.current_task, 60));
+                }
+                if let Some(ref parent) = s.parent {
+                    println!("Parent:      {}", parent);
+                }
+                // Show stderr tail if available.
+                let stderr_path = agent::stderr_log_path(&name);
+                if stderr_path.exists() {
+                    let content = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+                    let lines: Vec<&str> = content.lines().collect();
+                    if !lines.is_empty() {
+                        let start = lines.len().saturating_sub(5);
+                        println!("Stderr (last {}):", lines.len().min(5));
+                        for line in &lines[start..] {
+                            println!("  {}", line);
+                        }
+                    }
+                }
+            }
+            None => {
+                let agents = agent::list().await?;
+                if agents.is_empty() {
+                    println!("No agents registered");
+                } else {
+                    println!(
+                        "{:<15} {:<9} {:<6} {:<10} {:<20} MODEL",
+                        "NAME", "STATUS", "TURNS", "COST", "CREATED"
+                    );
+                    println!("{}", "─".repeat(75));
+                    for a in &agents {
+                        let pid_alive =
+                            a.pid > 0 && std::path::Path::new(&format!("/proc/{}", a.pid)).exists();
+                        let status = if pid_alive { &a.status } else { "offline" };
+                        let created = if a.created_at.len() > 19 {
+                            &a.created_at[..19]
+                        } else {
+                            &a.created_at
+                        };
+                        println!(
+                            "{:<15} {:<9} {:<6} ${:<9.4} {:<20} {}",
+                            a.config.name,
+                            status,
+                            a.total_turns,
+                            a.total_cost,
+                            created,
+                            a.config.model,
+                        );
+                    }
+                }
+            }
+        },
+        AgentAction::Stderr { name, tail, follow } => {
+            let path = agent::stderr_log_path(&name);
+            if !path.exists() {
+                println!("No stderr logs for {}", name);
+                return Ok(());
+            }
+            let content = std::fs::read_to_string(&path)?;
+            let lines: Vec<&str> = content.lines().collect();
+            let start = lines.len().saturating_sub(tail);
+            for line in &lines[start..] {
+                println!("{}", line);
+            }
+            if follow {
+                let mut pos = std::fs::metadata(&path)?.len();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        let new_len = meta.len();
+                        if new_len > pos {
+                            let mut f = std::fs::File::open(&path)?;
+                            use std::io::{Read, Seek, SeekFrom};
+                            f.seek(SeekFrom::Start(pos))?;
+                            let mut buf = String::new();
+                            f.read_to_string(&mut buf)?;
+                            print!("{}", buf);
+                            pos = new_len;
+                        }
+                    }
+                }
+            }
+        }
         AgentAction::Rm { name } => {
             agent::remove(&name).await?;
             println!("Agent {} removed", name);
