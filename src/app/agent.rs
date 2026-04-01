@@ -8,7 +8,7 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 use crate::config::{self, ContainerConfig, UserConfig};
-use crate::infra::dto::{ConfigAgentRuntime, ConfigSessionMode};
+use crate::infra::dto::{ConfigAgentRuntime, ConfigContextConfig, ConfigSessionMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -38,6 +38,9 @@ pub struct AgentConfig {
     /// Agent runtime protocol: claude (default) or acp.
     #[serde(default)]
     pub runtime: ConfigAgentRuntime,
+    /// Context system configuration (main branch, compaction).
+    #[serde(default)]
+    pub context: Option<ConfigContextConfig>,
 }
 
 fn default_budget_usd() -> f64 {
@@ -211,6 +214,7 @@ pub async fn create_or_recover(
         container: def.container.clone(),
         session: ConfigSessionMode::default(),
         runtime: def.runtime.clone(),
+        context: user_cfg.and_then(|c| c.context.clone()),
     };
 
     let path = state_path(&def.name);
@@ -743,6 +747,7 @@ pub async fn spawn_ephemeral(
         container: None,
         session: ConfigSessionMode::default(),
         runtime: ConfigAgentRuntime::default(),
+        context: None,
     };
 
     create(&cfg).await?;
@@ -1596,6 +1601,7 @@ created_at: "2024-01-01T00:00:00Z"
             container: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            context: None,
         };
         let state = AgentState {
             config: cfg,
@@ -1713,6 +1719,7 @@ created_at: "2024-01-01T00:00:00Z"
             container: Some(container),
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            context: None,
         };
 
         let extra_env = [("DESKD_BUS_SOCKET", "/home/test/.deskd/bus.sock")];
@@ -1763,6 +1770,7 @@ created_at: "2024-01-01T00:00:00Z"
             container: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            context: None,
         };
         let cmd = build_command(&cfg, &[], &[]);
         let program = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -1925,6 +1933,7 @@ created_at: "2024-01-01T00:00:00Z"
             container: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            context: None,
         };
         let state = AgentState {
             config: cfg,
@@ -1966,6 +1975,7 @@ created_at: "2024-01-01T00:00:00Z"
             container: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            context: None,
         };
         let extra_env = [("DESKD_BUS_SOCKET", "/tmp/bus.sock")];
         let cmd = build_command(&cfg, &[], &extra_env);

@@ -305,6 +305,9 @@ pub struct SubAgentDef {
     /// Agent runtime protocol: claude (default) or acp.
     #[serde(default)]
     pub runtime: ConfigAgentRuntime,
+    /// Per-agent context configuration (overrides global UserConfig.context).
+    #[serde(default)]
+    pub context: Option<ConfigContextConfig>,
 }
 
 /// Telegram channel routing config in the per-user deskd.yaml.
@@ -763,5 +766,48 @@ schedules:
             ScheduleAction::GithubPoll
         ));
         assert!(matches!(cfg.schedules[2].action, ScheduleAction::Shell));
+    }
+
+    #[test]
+    fn test_sub_agent_context_config() {
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Test"
+
+agents:
+  - name: memory-arch
+    model: claude-haiku-4-5
+    system_prompt: "You hold architecture context."
+    subscribe:
+      - "agent:memory-arch"
+    context:
+      enabled: true
+      main_path: contexts/arch-main.yaml
+      main_budget_tokens: 50000
+      compact_threshold_tokens: 40000
+
+  - name: worker
+    model: claude-sonnet-4-6
+    system_prompt: "Worker"
+    subscribe:
+      - "agent:worker"
+
+context:
+  enabled: true
+  main_path: contexts/default.yaml
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        // Per-agent context on memory-arch
+        let ctx = cfg.agents[0].context.as_ref().unwrap();
+        assert!(ctx.enabled);
+        assert_eq!(ctx.main_path.as_deref(), Some("contexts/arch-main.yaml"));
+        assert_eq!(ctx.main_budget_tokens, Some(50000));
+        assert_eq!(ctx.compact_threshold_tokens, Some(40000));
+        // Worker has no per-agent context
+        assert!(cfg.agents[1].context.is_none());
+        // Global context fallback exists
+        let global = cfg.context.as_ref().unwrap();
+        assert!(global.enabled);
+        assert_eq!(global.main_path.as_deref(), Some("contexts/default.yaml"));
     }
 }
