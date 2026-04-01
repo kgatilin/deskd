@@ -125,6 +125,9 @@ pub async fn serve(config_path: String) -> Result<()> {
                 })
                 .to_string();
 
+                // Per-agent context config falls back to global UserConfig.context.
+                let context_cfg = sub.context.clone().or_else(|| ucfg.context.clone());
+
                 let sub_cfg = agent::AgentConfig {
                     name: sub.name.clone(),
                     model: sub.model.clone(),
@@ -150,6 +153,7 @@ pub async fn serve(config_path: String) -> Result<()> {
                     container: def.container.clone(),
                     session: sub.session.clone(),
                     runtime: sub.runtime.clone(),
+                    context: context_cfg,
                 };
                 agent::create_or_update_from_config(&sub_cfg).await?;
 

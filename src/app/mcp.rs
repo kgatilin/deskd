@@ -1665,6 +1665,7 @@ mod tests {
                 publish: None,
                 session: crate::infra::dto::ConfigSessionMode::default(),
                 runtime: crate::infra::dto::ConfigAgentRuntime::default(),
+                context: None,
             }],
             telegram: Some(TelegramRoutesConfig {
                 routes: vec![TelegramRoute {
