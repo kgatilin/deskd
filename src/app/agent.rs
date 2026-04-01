@@ -84,6 +84,31 @@ pub fn stderr_log_path(name: &str) -> PathBuf {
     config::log_dir().join(format!("{}.stderr.log", name))
 }
 
+/// Path to the agent's stream-json log file.
+pub fn stream_log_path(name: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let dir = PathBuf::from(home).join(".deskd").join("logs").join(name);
+    dir.join("stream.jsonl")
+}
+
+/// Rotate stream log: if file exceeds max_bytes, keep the last half.
+fn rotate_stream_log(path: &PathBuf, max_bytes: u64) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= max_bytes {
+        return;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    // Keep the last half of lines.
+    let lines: Vec<&str> = content.lines().collect();
+    let keep_from = lines.len() / 2;
+    let truncated: String = lines[keep_from..].iter().flat_map(|l| [*l, "\n"]).collect();
+    let _ = std::fs::write(path, truncated);
+}
+
 pub fn load_state(name: &str) -> Result<AgentState> {
     let path = state_path(name);
     let content =
@@ -771,6 +796,12 @@ pub async fn remove(name: &str) -> Result<()> {
     {
         warn!(agent = %name, error = %e, "failed to remove stderr log file");
     }
+    let stream_log = stream_log_path(name);
+    if stream_log.exists()
+        && let Err(e) = std::fs::remove_file(&stream_log)
+    {
+        warn!(agent = %name, error = %e, "failed to remove stream log file");
+    }
     info!(agent = %name, "agent removed");
     Ok(())
 }
@@ -1133,8 +1164,26 @@ impl AgentProcess {
         let stderr_buf_reader = stderr_buf;
         let task_use_resume = use_resume;
         tokio::spawn(async move {
+            // Open stream log file for persistence.
+            let stream_log = stream_log_path(&agent_name2);
+            if let Some(parent) = stream_log.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            let stream_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&stream_log);
+            let mut stream_writer = stream_file.ok().map(std::io::BufWriter::new);
+
             let mut lines = tokio::io::BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                // Persist raw stream-json line.
+                if let Some(ref mut f) = stream_writer {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", line);
+                    let _ = f.flush();
+                }
+
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                     match v.get("type").and_then(|t| t.as_str()) {
                         Some("assistant") => {
@@ -1192,6 +1241,8 @@ impl AgentProcess {
                             {
                                 break;
                             }
+                            // Rotate stream log after each turn if over 10MB.
+                            rotate_stream_log(&stream_log, 10 * 1024 * 1024);
                         }
                         _ => {}
                     }

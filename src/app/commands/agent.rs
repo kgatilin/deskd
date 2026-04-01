@@ -435,6 +435,52 @@ pub async fn handle(action: AgentAction) -> Result<()> {
                 }
             }
         }
+        AgentAction::Stream {
+            name,
+            tail,
+            follow,
+            raw,
+        } => {
+            let path = agent::stream_log_path(&name);
+            if !path.exists() {
+                println!("No stream log for {}", name);
+                return Ok(());
+            }
+            let content = std::fs::read_to_string(&path)?;
+            let lines: Vec<&str> = content.lines().collect();
+            let start = lines.len().saturating_sub(tail);
+            for line in &lines[start..] {
+                if raw {
+                    println!("{}", line);
+                } else {
+                    print_stream_event(line);
+                }
+            }
+            if follow {
+                let mut pos = std::fs::metadata(&path)?.len();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        let new_len = meta.len();
+                        if new_len > pos {
+                            let mut f = std::fs::File::open(&path)?;
+                            use std::io::{Read, Seek, SeekFrom};
+                            f.seek(SeekFrom::Start(pos))?;
+                            let mut buf = String::new();
+                            f.read_to_string(&mut buf)?;
+                            for line in buf.lines() {
+                                if raw {
+                                    println!("{}", line);
+                                } else {
+                                    print_stream_event(line);
+                                }
+                            }
+                            pos = new_len;
+                        }
+                    }
+                }
+            }
+        }
         AgentAction::Rm { name } => {
             agent::remove(&name).await?;
             println!("Agent {} removed", name);
@@ -471,6 +517,79 @@ pub async fn handle(action: AgentAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Parse a stream-json line and print a human-readable summary.
+fn print_stream_event(line: &str) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("assistant") => {
+            if let Some(blocks) = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
+                for block in blocks {
+                    match block.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(text) = block.get("text").and_then(|t| t.as_str())
+                                && !text.is_empty()
+                            {
+                                println!("[assistant] {}", truncate(text, 200));
+                            }
+                        }
+                        Some("tool_use") => {
+                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                            let input = block
+                                .get("input")
+                                .map(|i| {
+                                    let s = i.to_string();
+                                    truncate(&s, 120).to_string()
+                                })
+                                .unwrap_or_default();
+                            println!("[tool_use] {} {}", name, input);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Some("tool") | Some("tool_result") => {
+            let tool_id = v
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+                .and_then(|b| b.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let is_error = v
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+                .and_then(|b| b.get("is_error"))
+                .and_then(|e| e.as_bool())
+                .unwrap_or(false);
+            if is_error {
+                println!("[tool_error] {}", truncate(tool_id, 200));
+            } else if !tool_id.is_empty() {
+                println!("[tool_result] {}", truncate(tool_id, 200));
+            }
+        }
+        Some("result") => {
+            let cost = v
+                .get("total_cost_usd")
+                .and_then(|c| c.as_f64())
+                .unwrap_or(0.0);
+            let turns = v.get("num_turns").and_then(|t| t.as_u64()).unwrap_or(0);
+            println!("[result] turns={} cost=${:.4}", turns, cost);
+        }
+        Some(other) => {
+            println!("[{}]", other);
+        }
+        None => {}
+    }
 }
 
 fn print_inbox_message(msg: &unified_inbox::InboxMessage) {
