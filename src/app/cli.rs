@@ -213,6 +213,22 @@ pub enum AgentAction {
         #[arg(long, default_value = "false")]
         by_pr: bool,
     },
+    /// Show agent status: all agents (no name) or detail for one agent.
+    Status {
+        /// Agent name. Omit to show all agents.
+        name: Option<String>,
+    },
+    /// Show stderr output from the agent's process.
+    Stderr {
+        /// Agent name.
+        name: String,
+        /// Show last N lines (default 50).
+        #[arg(long, default_value = "50")]
+        tail: usize,
+        /// Keep watching for new output.
+        #[arg(long, default_value = "false")]
+        follow: bool,
+    },
     /// Remove an agent (state file + log).
     Rm { name: String },
     /// Spawn an ephemeral sub-agent, run a task, print result, clean up.
