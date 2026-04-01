@@ -3,8 +3,6 @@
 //! Pure data types — no I/O, no persistence logic.
 //! Serde lives on infra DTOs (infra::dto), not here.
 
-use serde::{Deserialize, Serialize};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
     Pending,
@@ -27,13 +25,11 @@ impl std::fmt::Display for TaskStatus {
 }
 
 /// Criteria for matching tasks to workers.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct TaskCriteria {
     /// Required model (e.g. "claude-sonnet-4-6").
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Required labels.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
 }
 
