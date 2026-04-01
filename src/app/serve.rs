@@ -16,6 +16,29 @@ pub async fn serve(config_path: String) -> Result<()> {
         tracing::warn!("No agents defined in workspace config");
     }
 
+    // Write serve state so other commands can auto-discover config.
+    let mut serve_state = config::ServeState {
+        workspace_config: std::fs::canonicalize(&config_path)
+            .unwrap_or_else(|_| config_path.clone().into())
+            .to_string_lossy()
+            .into_owned(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+        agents: std::collections::HashMap::new(),
+    };
+    for def in &workspace.agents {
+        serve_state.agents.insert(
+            def.name.clone(),
+            config::AgentServeState {
+                work_dir: def.work_dir.clone(),
+                bus_socket: def.bus_socket(),
+                config_path: def.config_path(),
+            },
+        );
+    }
+    if let Err(e) = serve_state.save() {
+        tracing::warn!(error = %e, "failed to write serve state");
+    }
+
     for def in &workspace.agents {
         let cfg_path = def.config_path();
         let user_cfg = config::UserConfig::load(&cfg_path).ok();
@@ -163,6 +186,7 @@ pub async fn serve(config_path: String) -> Result<()> {
 
     info!("all agents started — press Ctrl-C to stop");
     tokio::signal::ctrl_c().await?;
+    config::ServeState::remove();
     info!("shutting down");
     Ok(())
 }

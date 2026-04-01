@@ -46,9 +46,9 @@ pub enum Commands {
     },
     /// Show live status of all agents defined in workspace config.
     Status {
-        /// Path to workspace.yaml.
+        /// Path to workspace.yaml. Auto-detected from running serve if omitted.
         #[arg(long)]
-        config: String,
+        config: Option<String>,
     },
     /// Kill the running `deskd serve` process and restart it with the same config.
     Restart {
@@ -71,9 +71,9 @@ pub enum Commands {
     },
     /// State machine: manage models and instances.
     Sm {
-        /// Path to deskd.yaml with model definitions.
+        /// Path to deskd.yaml with model definitions. Auto-detected from running serve if omitted.
         #[arg(long, env = "DESKD_AGENT_CONFIG")]
-        config: String,
+        config: Option<String>,
         #[command(subcommand)]
         action: SmAction,
     },
@@ -89,9 +89,9 @@ pub enum Commands {
     Schedule {
         #[command(subcommand)]
         action: ScheduleSubcommand,
-        /// Path to deskd.yaml (default: ./deskd.yaml).
-        #[arg(long, global = true, default_value = "./deskd.yaml")]
-        config: String,
+        /// Path to deskd.yaml. Auto-detected from running serve if omitted.
+        #[arg(long, global = true)]
+        config: Option<String>,
     },
     /// Manage the pull-based task queue.
     Task {
