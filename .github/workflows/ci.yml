@@ -24,6 +24,34 @@ jobs:
       - name: Tests
         run: cargo test
 
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+      - name: Run coverage
+        run: cargo tarpaulin --out xml --out html --output-dir coverage --skip-clean
+      - name: Upload to Codecov
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage/cobertura.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Coverage summary
+        run: |
+          # Extract coverage % from tarpaulin output
+          COVERAGE=$(cargo tarpaulin --skip-clean 2>&1 | grep -oP '\d+\.\d+% coverage' | tail -1 || echo "unknown")
+          echo "## Test Coverage: $COVERAGE" >> $GITHUB_STEP_SUMMARY
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 30
+
   archlint:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'

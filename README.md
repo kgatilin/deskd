@@ -1,5 +1,8 @@
 # deskd
 
+[![CI](https://github.com/kgatilin/deskd/actions/workflows/ci.yml/badge.svg)](https://github.com/kgatilin/deskd/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/kgatilin/deskd/graph/badge.svg)](https://codecov.io/gh/kgatilin/deskd)
+
 **Agent orchestration runtime — fractal message bus for AI agents**
 
 Spawn, route, and manage AI agents. Each agent gets its own isolated message bus (Unix socket), persistent session, and worker loop. Agents communicate via pub/sub routing; adapters bridge external platforms (Telegram, Discord). Skill graphs encode multi-step workflows as executable DAGs.
