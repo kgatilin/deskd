@@ -828,6 +828,7 @@ async fn handle_task_success(
         warn!(agent = %name, error = %e, "failed to write task log");
     }
 
+    let progress_was_streamed = !full_response.is_empty();
     let response = if full_response.is_empty() {
         turn.response_text.clone()
     } else {
@@ -854,13 +855,18 @@ async fn handle_task_success(
         }
     }
 
-    write_bus_envelope(
-        writer,
-        name,
-        &ctx.reply_target,
-        serde_json::json!({"result": response, "final": true, "in_reply_to": msg.id}),
-    )
-    .await;
+    // Skip final bus write for telegram targets when progress was already streamed —
+    // the progress forwarder already delivered the content to the adapter.
+    let already_streamed = progress_was_streamed && ctx.reply_target.starts_with("telegram.out:");
+    if !already_streamed {
+        write_bus_envelope(
+            writer,
+            name,
+            &ctx.reply_target,
+            serde_json::json!({"result": response, "final": true, "in_reply_to": msg.id}),
+        )
+        .await;
+    }
 }
 
 /// Handle task failure: log, queue update, crash recovery, bus reply.
