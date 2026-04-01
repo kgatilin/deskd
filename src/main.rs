@@ -1,32 +1,7 @@
-mod acp;
-mod adapters;
-mod agent;
-mod bus;
-mod cli;
-mod commands;
-mod config;
-pub mod context;
-mod domain;
-pub mod graph;
-#[allow(dead_code)]
-mod infra;
-mod mcp;
-mod message;
-mod paths;
-#[allow(dead_code)]
-mod ports;
-mod schedule;
-mod serve;
-mod statemachine;
-mod task;
-mod tasklog;
-mod unified_inbox;
-mod worker;
-mod workflow;
-
 use clap::Parser;
 
-use cli::{Cli, Commands};
+use deskd::cli::{Cli, Commands};
+use deskd::{commands, config, mcp, serve};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -98,8 +73,8 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::commands::{parse_duration_secs, remind};
-    use crate::config;
+    use deskd::commands::{parse_duration_secs, remind};
+    use deskd::config;
 
     #[test]
     fn test_handle_remind_writes_file() {
@@ -178,8 +153,8 @@ schedules:
         assert_eq!(user_cfg.schedules[0].target, "agent:dev");
         assert_eq!(user_cfg.schedules[1].cron, "0 0 9 * * *");
 
-        use crate::cli::ScheduleSubcommand;
-        crate::commands::schedule::handle(ScheduleSubcommand::List, cfg_path.to_str().unwrap())
+        use deskd::cli::ScheduleSubcommand;
+        deskd::commands::schedule::handle(ScheduleSubcommand::List, cfg_path.to_str().unwrap())
             .unwrap();
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -200,9 +175,9 @@ schedules:
 
         let path_str = cfg_path.to_str().unwrap();
 
-        use crate::cli::ScheduleSubcommand;
+        use deskd::cli::ScheduleSubcommand;
 
-        crate::commands::schedule::handle(
+        deskd::commands::schedule::handle(
             ScheduleSubcommand::Add {
                 cron: "0 0 9 * * *".to_string(),
                 action: "raw".to_string(),
@@ -218,7 +193,7 @@ schedules:
         assert_eq!(cfg.schedules[0].cron, "0 0 9 * * *");
         assert_eq!(cfg.schedules[0].target, "agent:dev");
 
-        crate::commands::schedule::handle(
+        deskd::commands::schedule::handle(
             ScheduleSubcommand::Add {
                 cron: "0 */5 * * * *".to_string(),
                 action: "github_poll".to_string(),
@@ -232,14 +207,14 @@ schedules:
         let cfg = config::UserConfig::load(path_str).unwrap();
         assert_eq!(cfg.schedules.len(), 2);
 
-        crate::commands::schedule::handle(ScheduleSubcommand::Rm { index: 0 }, path_str).unwrap();
+        deskd::commands::schedule::handle(ScheduleSubcommand::Rm { index: 0 }, path_str).unwrap();
 
         let cfg = config::UserConfig::load(path_str).unwrap();
         assert_eq!(cfg.schedules.len(), 1);
         assert_eq!(cfg.schedules[0].cron, "0 */5 * * * *");
 
         assert!(
-            crate::commands::schedule::handle(ScheduleSubcommand::Rm { index: 5 }, path_str)
+            deskd::commands::schedule::handle(ScheduleSubcommand::Rm { index: 5 }, path_str)
                 .is_err()
         );
 
