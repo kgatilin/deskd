@@ -363,6 +363,12 @@ async fn dispatch_pending(
             continue;
         }
 
+        // Skip instances that already have a result — work was completed
+        // but the instance hasn't transitioned to a terminal state yet.
+        if inst.result.as_ref().is_some_and(|r| !r.is_empty()) {
+            continue;
+        }
+
         // Dispatch if has assignee (pending work).
         if !inst.assignee.is_empty()
             && let Err(e) = dispatch_instance(writer, model, inst).await
