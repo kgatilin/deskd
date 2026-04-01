@@ -55,14 +55,28 @@ pub async fn handle(action: AgentAction) -> Result<()> {
                     None
                 }
             } else {
-                agent::load_state(&name).ok().and_then(|s| {
-                    let bus = config::agent_bus_socket(&s.config.work_dir);
-                    if std::path::Path::new(&bus).exists() {
-                        Some(bus)
-                    } else {
-                        None
-                    }
-                })
+                // Try agent state file first, then serve state.
+                agent::load_state(&name)
+                    .ok()
+                    .and_then(|s| {
+                        let bus = config::agent_bus_socket(&s.config.work_dir);
+                        if std::path::Path::new(&bus).exists() {
+                            Some(bus)
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        config::ServeState::load().and_then(|state| {
+                            state.agent(&name).and_then(|a| {
+                                if std::path::Path::new(&a.bus_socket).exists() {
+                                    Some(a.bus_socket.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                    })
             };
 
             if let Some(sock) = effective_socket {
@@ -94,9 +108,21 @@ pub async fn handle(action: AgentAction) -> Result<()> {
         }
         AgentAction::List { socket } => {
             let agents = agent::list().await?;
-            let live = crate::app::serve::query_live_agents(&socket)
+            // Query all known bus sockets for live agents.
+            let mut live = crate::app::serve::query_live_agents(&socket)
                 .await
                 .unwrap_or_default();
+            // Also check sockets from serve state (per-agent buses).
+            if let Some(state) = config::ServeState::load() {
+                for agent_state in state.agents.values() {
+                    if agent_state.bus_socket != socket
+                        && let Ok(more) =
+                            crate::app::serve::query_live_agents(&agent_state.bus_socket).await
+                    {
+                        live.extend(more);
+                    }
+                }
+            }
 
             if agents.is_empty() {
                 println!("No agents registered");

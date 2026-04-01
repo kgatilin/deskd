@@ -1,8 +1,33 @@
+use anyhow::bail;
 use clap::Parser;
 
 use deskd::app::cli::{Cli, Commands};
 use deskd::app::{commands, mcp, serve};
 use deskd::config;
+
+/// Resolve workspace config path: explicit flag > serve state > error.
+fn resolve_workspace_config(explicit: Option<String>) -> anyhow::Result<String> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    if let Some(state) = config::ServeState::load() {
+        return Ok(state.workspace_config);
+    }
+    bail!("no --config provided and deskd serve is not running (no serve state found)")
+}
+
+/// Resolve agent config (deskd.yaml) path: explicit flag > serve state > error.
+fn resolve_agent_config(explicit: Option<String>) -> anyhow::Result<String> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    if let Some(state) = config::ServeState::load()
+        && let Some(agent) = state.find_agent_config()
+    {
+        return Ok(agent.config_path.clone());
+    }
+    bail!("no --config provided and deskd serve is not running (no serve state found)")
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,9 +57,10 @@ async fn main() -> anyhow::Result<()> {
             commands::graph::handle(action).await?;
         }
         Commands::Sm {
-            config: config_path,
+            config: config_opt,
             action,
         } => {
+            let config_path = resolve_agent_config(config_opt)?;
             let user_cfg = config::UserConfig::load(&config_path)?;
             commands::sm::handle(action, &user_cfg, &config_path).await?;
         }
@@ -43,8 +69,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Schedule {
             action,
-            config: config_path,
+            config: config_opt,
         } => {
+            let config_path = resolve_agent_config(config_opt)?;
             commands::schedule::handle(action, &config_path)?;
         }
         Commands::Remind {
@@ -56,9 +83,8 @@ async fn main() -> anyhow::Result<()> {
         } => {
             commands::remind::handle(name, duration_str, at, target, message)?;
         }
-        Commands::Status {
-            config: config_path,
-        } => {
+        Commands::Status { config: config_opt } => {
+            let config_path = resolve_workspace_config(config_opt)?;
             commands::status::handle(&config_path).await?;
         }
         Commands::Restart { config } => {

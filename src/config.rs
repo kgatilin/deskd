@@ -161,6 +161,74 @@ impl WorkspaceConfig {
     }
 }
 
+// ─── Runtime serve state ────────────────────────────────────────────────────
+
+/// Runtime state written by `deskd serve` so other commands can auto-discover config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServeState {
+    /// Path to the workspace.yaml that serve was started with.
+    pub workspace_config: String,
+    /// ISO 8601 timestamp when serve started.
+    pub started_at: String,
+    /// Per-agent runtime info.
+    #[serde(default)]
+    pub agents: HashMap<String, AgentServeState>,
+}
+
+/// Per-agent runtime info in serve state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentServeState {
+    pub work_dir: String,
+    pub bus_socket: String,
+    pub config_path: String,
+}
+
+impl ServeState {
+    /// Path to the serve state file: `~/.deskd/serve.state.yaml`.
+    pub fn path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(home).join(".deskd").join("serve.state.yaml")
+    }
+
+    /// Load serve state from disk. Returns None if not running.
+    pub fn load() -> Option<Self> {
+        let path = Self::path();
+        let content = std::fs::read_to_string(&path).ok()?;
+        serde_yaml::from_str(&content).ok()
+    }
+
+    /// Write serve state to disk.
+    pub fn save(&self) -> Result<()> {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let content = serde_yaml::to_string(self).context("failed to serialize serve state")?;
+        std::fs::write(&path, content).context("failed to write serve state")?;
+        Ok(())
+    }
+
+    /// Remove the serve state file (on shutdown).
+    pub fn remove() {
+        let _ = std::fs::remove_file(Self::path());
+    }
+
+    /// Find the first agent that has a user config with SM models.
+    pub fn find_agent_config(&self) -> Option<&AgentServeState> {
+        self.agents.values().next()
+    }
+
+    /// Find a specific agent by name.
+    pub fn agent(&self, name: &str) -> Option<&AgentServeState> {
+        self.agents.get(name)
+    }
+
+    /// Get any bus socket from the running agents.
+    pub fn any_bus_socket(&self) -> Option<&str> {
+        self.agents.values().next().map(|a| a.bus_socket.as_str())
+    }
+}
+
 // ─── Per-user deskd.yaml ─────────────────────────────────────────────────────
 
 /// Per-user agent config (deskd.yaml, lives in the agent's work_dir).
