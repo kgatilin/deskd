@@ -4,6 +4,7 @@
 //! from domain types. Conversion happens at port boundaries via From/Into.
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 // ─── Bus wire format ─────────────────────────────────────────────────────────
 
@@ -42,7 +43,7 @@ pub struct BusRegister {
 }
 
 /// Wire-level envelope: tagged union for all bus protocol messages.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum BusEnvelope {
     Register(BusRegister),
@@ -136,11 +137,15 @@ impl From<StoredTask> for Task {
             id: dto.id,
             description: dto.description,
             status: match dto.status.as_str() {
+                "pending" => TaskStatus::Pending,
                 "active" => TaskStatus::Active,
                 "done" => TaskStatus::Done,
                 "failed" => TaskStatus::Failed,
                 "cancelled" => TaskStatus::Cancelled,
-                _ => TaskStatus::Pending,
+                other => {
+                    warn!(status = other, "unknown task status, defaulting to Pending");
+                    TaskStatus::Pending
+                }
             },
             assignee: dto.assignee,
             result: dto.result,

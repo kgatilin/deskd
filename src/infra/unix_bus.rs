@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::infra::dto::BusMessage;
+use crate::infra::dto::{BusEnvelope, BusMessage};
 use crate::ports::bus::MessageBus;
 
 /// Production bus client backed by a Unix socket connection.
@@ -102,15 +102,7 @@ impl MessageBus for UnixBus {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let dto: BusMessage = msg.into();
-            let envelope = serde_json::json!({
-                "type": "message",
-                "id": &dto.id,
-                "source": &dto.source,
-                "target": &dto.target,
-                "payload": &dto.payload,
-                "reply_to": &dto.reply_to,
-                "metadata": &dto.metadata,
-            });
+            let envelope = BusEnvelope::Message(dto);
             let mut line = serde_json::to_string(&envelope)?;
             line.push('\n');
             let mut writer = self.writer.lock().await;
