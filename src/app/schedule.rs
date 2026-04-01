@@ -20,8 +20,8 @@ use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::app::unified_inbox;
 use crate::config::{ScheduleAction, ScheduleDef};
-use crate::unified_inbox;
 
 /// Spawn one tokio task per schedule entry and return their handles.
 /// Callers can abort the returned handles to cancel running schedules.

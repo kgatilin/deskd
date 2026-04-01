@@ -7,7 +7,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
 
-use crate::message::{Envelope, Message};
+use crate::app::message::{Envelope, Message};
 
 type Tx = mpsc::UnboundedSender<Message>;
 
@@ -196,7 +196,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<RwLock<BusState>>) -> 
                         target: name.clone(),
                         payload: serde_json::json!({"type": "list_response", "clients": clients}),
                         reply_to: None,
-                        metadata: crate::message::Metadata::default(),
+                        metadata: crate::app::message::Metadata::default(),
                     };
                     let _ = client.tx.send(resp);
                 }
@@ -218,7 +218,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<RwLock<BusState>>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::Metadata;
+    use crate::app::message::Metadata;
     use std::collections::HashSet;
 
     fn make_bus() -> BusState {

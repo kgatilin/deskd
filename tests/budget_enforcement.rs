@@ -77,7 +77,7 @@ async fn test_budget_exceeded_sends_error_and_logs() {
     // Start bus.
     let sock = socket.clone();
     tokio::spawn(async move {
-        deskd::bus::serve(&sock).await.unwrap();
+        deskd::app::bus::serve(&sock).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -152,14 +152,14 @@ async fn test_budget_exceeded_sends_error_and_logs() {
     );
 
     // Worker logs to tasklog (same as real worker).
-    let log_entry = deskd::tasklog::TaskLog {
+    let log_entry = deskd::app::tasklog::TaskLog {
         ts: chrono::Utc::now().to_rfc3339(),
         source: "sender".to_string(),
         turns: 0,
         cost: 0.0,
         duration_ms: 0,
         status: "skip".to_string(),
-        task: deskd::tasklog::truncate_task("Please review this code", 60),
+        task: deskd::app::tasklog::truncate_task("Please review this code", 60),
         error: Some("budget exceeded".to_string()),
         msg_id: "task-001".to_string(),
         github_repo: None,
@@ -167,10 +167,10 @@ async fn test_budget_exceeded_sends_error_and_logs() {
         input_tokens: None,
         output_tokens: None,
     };
-    deskd::tasklog::log_task_to_path(&log_path, &log_entry).unwrap();
+    deskd::app::tasklog::log_task_to_path(&log_path, &log_entry).unwrap();
 
     // Verify task log contains the skip entry.
-    let entries = deskd::tasklog::read_logs_from_path(&log_path, 10, None, None).unwrap();
+    let entries = deskd::app::tasklog::read_logs_from_path(&log_path, 10, None, None).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].status, "skip");
     assert_eq!(entries[0].error.as_deref(), Some("budget exceeded"));
@@ -200,7 +200,7 @@ async fn test_budget_ok_task_not_rejected() {
     let log_path = tmp.join("tasks.jsonl");
 
     // No skip entry written (worker would dispatch to Claude instead).
-    let entries = deskd::tasklog::read_logs_from_path(&log_path, 10, None, None).unwrap();
+    let entries = deskd::app::tasklog::read_logs_from_path(&log_path, 10, None, None).unwrap();
     assert!(entries.is_empty(), "no skip entry when budget is OK");
 
     let _ = std::fs::remove_dir_all(&tmp);

@@ -2,8 +2,9 @@
 
 use anyhow::Result;
 
-use crate::cli::SmAction;
-use crate::{config, statemachine};
+use crate::app::cli::SmAction;
+use crate::app::statemachine;
+use crate::config;
 
 use super::truncate;
 

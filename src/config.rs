@@ -1,11 +1,11 @@
-use crate::context::ContextConfig;
+use crate::app::context::ContextConfig;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 // Re-export path helpers for backward compatibility.
-pub use crate::paths::{agent_bus_socket, log_dir, reminders_dir, state_dir};
+pub use crate::app::paths::{agent_bus_socket, log_dir, reminders_dir, state_dir};
 
 /// A one-shot reminder that fires at a specific time and posts a message to the bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]

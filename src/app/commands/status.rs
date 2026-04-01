@@ -4,7 +4,8 @@ use std::str::FromStr;
 
 use anyhow::Result;
 
-use crate::{agent, config, task};
+use crate::app::{agent, task};
+use crate::config;
 
 use super::{format_relative_time, truncate};
 

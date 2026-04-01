@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result};
 
-use crate::cli::GraphAction;
-use crate::graph;
+use crate::app::cli::GraphAction;
+use crate::app::graph;
 
 pub async fn handle(action: GraphAction) -> Result<()> {
     match action {

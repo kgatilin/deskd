@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result};
 
-use crate::cli::ScheduleSubcommand;
+use crate::app::cli::ScheduleSubcommand;
 use crate::config;
 
 use super::format_relative_time;

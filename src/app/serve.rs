@@ -3,7 +3,8 @@
 use anyhow::Result;
 use tracing::info;
 
-use crate::{adapters, agent, bus, config, schedule, worker, workflow};
+use crate::app::{adapters, agent, bus, schedule, worker, workflow};
+use crate::config;
 
 /// Start per-agent buses and workers for all agents in workspace config.
 /// Each agent has its own isolated bus at {work_dir}/.deskd/bus.sock.

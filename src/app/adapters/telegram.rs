@@ -20,8 +20,8 @@ use tokio::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::app::unified_inbox;
 use crate::config::TelegramRoute;
-use crate::unified_inbox;
 
 /// Maximum characters per Telegram message (API limit).
 const TELEGRAM_MAX_LEN: usize = 4096;
@@ -657,7 +657,7 @@ async fn polling_loop(
 
 /// Format a /status reply by reading the agent state file.
 fn format_status_reply(agent_name: &str) -> String {
-    match crate::agent::load_state(agent_name) {
+    match crate::app::agent::load_state(agent_name) {
         Ok(state) => {
             let uptime = match chrono::DateTime::parse_from_rfc3339(&state.created_at) {
                 Ok(created) => {
