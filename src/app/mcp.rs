@@ -1116,7 +1116,7 @@ async fn call_task_list(args: &Value) -> Result<Value> {
             json!({
                 "id": t.id,
                 "description": t.description,
-                "status": t.status,
+                "status": t.status.to_string(),
                 "assignee": t.assignee,
                 "created_by": t.created_by,
                 "created_at": t.created_at,
@@ -1429,7 +1429,8 @@ async fn call_sm_query(args: &Value) -> Result<Value> {
     if let Some(id) = args.get("id").and_then(|i| i.as_str()) {
         let store = statemachine::StateMachineStore::default_for_home();
         let inst = store.load(id)?;
-        let inst_json = serde_json::to_value(&inst)?;
+        let dto: crate::infra::dto::StoredInstance = (&inst).into();
+        let inst_json = serde_json::to_value(&dto)?;
         return Ok(json!({
             "content": [{"type": "text", "text": serde_json::to_string_pretty(&inst_json)?}],
             "isError": false

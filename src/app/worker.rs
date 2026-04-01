@@ -288,8 +288,8 @@ pub async fn run(
             continue;
         }
 
-        let msg: Message = match serde_json::from_str(&line) {
-            Ok(m) => m,
+        let msg: Message = match serde_json::from_str::<crate::infra::dto::BusMessage>(&line) {
+            Ok(dto) => dto.into(),
             Err(e) => {
                 warn!(agent = %name, error = %e, "invalid message from bus");
                 continue;
@@ -452,7 +452,8 @@ pub async fn run(
                     if bus_line.is_empty() {
                         continue;
                     }
-                    if let Ok(inject_msg) = serde_json::from_str::<Message>(&bus_line) {
+                    if let Ok(dto) = serde_json::from_str::<crate::infra::dto::BusMessage>(&bus_line) {
+                        let inject_msg: Message = dto.into();
                         let inject_task = inject_msg
                             .payload
                             .get("task")
