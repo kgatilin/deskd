@@ -4,9 +4,9 @@ use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::app::message::Message;
+use crate::app::statemachine;
 use crate::config::ModelDef;
-use crate::message::Message;
-use crate::statemachine;
 
 type Writer = std::sync::Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>;
 
@@ -224,7 +224,7 @@ async fn dispatch_instance(
 
     if let Some(criteria) = transition_criteria {
         // Dispatch via task queue (pull-based).
-        let store = crate::task::TaskStore::default_for_home();
+        let store = crate::app::task::TaskStore::default_for_home();
         let task = store.create_for_sm(&task_text, criteria, "workflow-engine", &inst.id)?;
         info!(
             instance = %inst.id,
@@ -530,7 +530,7 @@ mod tests {
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
-                    criteria: Some(crate::task::TaskCriteria {
+                    criteria: Some(crate::app::task::TaskCriteria {
                         model: Some("claude-sonnet-4-6".into()),
                         labels: vec!["planning".into()],
                     }),
@@ -546,7 +546,7 @@ mod tests {
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
-                    criteria: Some(crate::task::TaskCriteria {
+                    criteria: Some(crate::app::task::TaskCriteria {
                         model: Some("claude-sonnet-4-6".into()),
                         labels: vec![],
                     }),
@@ -578,7 +578,7 @@ mod tests {
         let task_dir = std::path::PathBuf::from(format!("/tmp/deskd_task_queue_test_{}", ts));
 
         let sm_store = statemachine::StateMachineStore::new(sm_dir.clone());
-        let task_store = crate::task::TaskStore::new(task_dir.clone());
+        let task_store = crate::app::task::TaskStore::new(task_dir.clone());
         let model = queue_dispatch_model();
 
         // Create SM instance.
@@ -609,7 +609,7 @@ mod tests {
 
         // Verify task was created with correct sm_instance_id.
         assert_eq!(task.sm_instance_id.as_deref(), Some(inst.id.as_str()));
-        assert_eq!(task.status, crate::task::TaskStatus::Pending);
+        assert_eq!(task.status, crate::app::task::TaskStatus::Pending);
         assert!(task.description.contains("Create a plan."));
         assert!(task.description.contains("FEAT-100"));
 

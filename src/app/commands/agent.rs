@@ -3,8 +3,9 @@
 use anyhow::Result;
 use tracing::info;
 
-use crate::cli::AgentAction;
-use crate::{agent, config, tasklog, unified_inbox, worker};
+use crate::app::cli::AgentAction;
+use crate::app::{agent, tasklog, unified_inbox, worker};
+use crate::config;
 
 use super::{format_relative_time, parse_duration_secs, truncate};
 
@@ -93,7 +94,7 @@ pub async fn handle(action: AgentAction) -> Result<()> {
         }
         AgentAction::List { socket } => {
             let agents = agent::list().await?;
-            let live = crate::serve::query_live_agents(&socket)
+            let live = crate::app::serve::query_live_agents(&socket)
                 .await
                 .unwrap_or_default();
 

@@ -101,7 +101,7 @@ async fn test_schedule_fire_delivers_to_worker() {
     // Start bus.
     let sock = socket.clone();
     tokio::spawn(async move {
-        deskd::bus::serve(&sock).await.unwrap();
+        deskd::app::bus::serve(&sock).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -145,7 +145,7 @@ async fn test_schedule_github_poll_delivers_with_metadata() {
 
     let sock = socket.clone();
     tokio::spawn(async move {
-        deskd::bus::serve(&sock).await.unwrap();
+        deskd::app::bus::serve(&sock).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -208,7 +208,7 @@ async fn test_multiple_schedule_fires_all_delivered() {
 
     let sock = socket.clone();
     tokio::spawn(async move {
-        deskd::bus::serve(&sock).await.unwrap();
+        deskd::app::bus::serve(&sock).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -262,7 +262,7 @@ async fn test_shell_schedule_output_delivered() {
 
     let sock = socket.clone();
     tokio::spawn(async move {
-        deskd::bus::serve(&sock).await.unwrap();
+        deskd::app::bus::serve(&sock).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 

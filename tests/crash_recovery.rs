@@ -70,8 +70,8 @@ fn setup_state_dir() -> std::path::PathBuf {
     tmp
 }
 
-fn test_agent_config(name: &str) -> deskd::agent::AgentConfig {
-    deskd::agent::AgentConfig {
+fn test_agent_config(name: &str) -> deskd::app::agent::AgentConfig {
+    deskd::app::agent::AgentConfig {
         name: name.into(),
         model: "claude-sonnet-4-6".into(),
         system_prompt: "Test agent".into(),
@@ -93,25 +93,25 @@ async fn test_state_survives_crash() {
     let _tmp = setup_state_dir();
 
     let cfg = test_agent_config("crash-agent");
-    let state = deskd::agent::create(&cfg).await.unwrap();
+    let state = deskd::app::agent::create(&cfg).await.unwrap();
     assert_eq!(state.session_id, "");
 
     // Simulate worker updating state during task (before crash).
-    let mut working = deskd::agent::load_state("crash-agent").unwrap();
+    let mut working = deskd::app::agent::load_state("crash-agent").unwrap();
     working.session_id = "session-xyz789".into();
     working.status = "working".into();
     working.current_task = "Processing important task".into();
     working.total_turns = 42;
     working.total_cost = 3.14;
     working.pid = 12345;
-    deskd::agent::save_state_pub(&working).unwrap();
+    deskd::app::agent::save_state_pub(&working).unwrap();
 
     // === CRASH HAPPENS HERE (process dies) ===
     // Simulate crash by dropping the process reference.
     // In the real worker, this triggers "process exited" error.
 
     // After crash: state file should still be intact.
-    let recovered = deskd::agent::load_state("crash-agent").unwrap();
+    let recovered = deskd::app::agent::load_state("crash-agent").unwrap();
     assert_eq!(recovered.session_id, "session-xyz789");
     assert_eq!(recovered.total_turns, 42);
     assert_eq!(recovered.total_cost, 3.14);
@@ -123,9 +123,9 @@ async fn test_state_survives_crash() {
     restarted.current_task = String::new();
     // pid would be updated with new process pid
     restarted.pid = 12346;
-    deskd::agent::save_state_pub(&restarted).unwrap();
+    deskd::app::agent::save_state_pub(&restarted).unwrap();
 
-    let final_state = deskd::agent::load_state("crash-agent").unwrap();
+    let final_state = deskd::app::agent::load_state("crash-agent").unwrap();
     assert_eq!(final_state.status, "idle");
     assert_eq!(
         final_state.session_id, "session-xyz789",
@@ -133,7 +133,7 @@ async fn test_state_survives_crash() {
     );
     assert_eq!(final_state.pid, 12346, "pid updated to new process");
 
-    deskd::agent::remove("crash-agent").await.unwrap();
+    deskd::app::agent::remove("crash-agent").await.unwrap();
 }
 
 /// Bus reconnection after crash: agent re-registers and receives new tasks.
@@ -143,7 +143,7 @@ async fn test_bus_reconnection_after_crash() {
 
     let sock = socket.clone();
     tokio::spawn(async move {
-        deskd::bus::serve(&sock).await.unwrap();
+        deskd::app::bus::serve(&sock).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -219,7 +219,7 @@ async fn test_crash_error_delivered_to_sender() {
 
     let sock = socket.clone();
     tokio::spawn(async move {
-        deskd::bus::serve(&sock).await.unwrap();
+        deskd::app::bus::serve(&sock).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -298,7 +298,7 @@ async fn test_tasklog_records_crash_error() {
     std::fs::create_dir_all(&log_dir).unwrap();
 
     // Create a task log entry for a crashed task (what worker does on error).
-    let entry = deskd::tasklog::TaskLog {
+    let entry = deskd::app::tasklog::TaskLog {
         ts: chrono::Utc::now().to_rfc3339(),
         source: "github_poll".into(),
         turns: 3,
@@ -315,10 +315,10 @@ async fn test_tasklog_records_crash_error() {
     };
 
     let log_file = log_dir.join("crash-test-agent.jsonl");
-    deskd::tasklog::log_task_to_path(&log_file, &entry).unwrap();
+    deskd::app::tasklog::log_task_to_path(&log_file, &entry).unwrap();
 
     // Verify the log was written and contains error info.
-    let entries = deskd::tasklog::read_logs_from_path(&log_file, 100, None, None).unwrap();
+    let entries = deskd::app::tasklog::read_logs_from_path(&log_file, 100, None, None).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].status, "error");
     assert_eq!(

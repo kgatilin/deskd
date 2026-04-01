@@ -56,8 +56,8 @@ async fn read_one(
         .and_then(|l| serde_json::from_str(&l).ok())
 }
 
-fn make_config(name: &str) -> deskd::agent::AgentConfig {
-    deskd::agent::AgentConfig {
+fn make_config(name: &str) -> deskd::app::agent::AgentConfig {
+    deskd::app::agent::AgentConfig {
         name: name.into(),
         model: "claude-sonnet-4-6".into(),
         system_prompt: "You are a test agent.".into(),
@@ -92,14 +92,14 @@ async fn test_agent_state_lifecycle() {
 
     // --- CREATE ---
     let cfg = make_config("lifecycle-agent");
-    let state = deskd::agent::create(&cfg).await.unwrap();
+    let state = deskd::app::agent::create(&cfg).await.unwrap();
     assert_eq!(state.config.name, "lifecycle-agent");
     assert_eq!(state.status, "idle");
     assert_eq!(state.total_cost, 0.0);
     assert_eq!(state.total_turns, 0);
 
     // --- LOAD and verify persistence ---
-    let loaded = deskd::agent::load_state("lifecycle-agent").unwrap();
+    let loaded = deskd::app::agent::load_state("lifecycle-agent").unwrap();
     assert_eq!(loaded.config.name, "lifecycle-agent");
     assert_eq!(loaded.config.budget_usd, 25.0);
     assert_eq!(loaded.config.model, "claude-sonnet-4-6");
@@ -111,9 +111,9 @@ async fn test_agent_state_lifecycle() {
     updated.total_turns = 5;
     updated.total_cost = 0.42;
     updated.session_id = "session-abc123".into();
-    deskd::agent::save_state_pub(&updated).unwrap();
+    deskd::app::agent::save_state_pub(&updated).unwrap();
 
-    let reloaded = deskd::agent::load_state("lifecycle-agent").unwrap();
+    let reloaded = deskd::app::agent::load_state("lifecycle-agent").unwrap();
     assert_eq!(reloaded.status, "working");
     assert_eq!(reloaded.current_task, "Process incoming PR");
     assert_eq!(reloaded.total_turns, 5);
@@ -121,7 +121,7 @@ async fn test_agent_state_lifecycle() {
     assert_eq!(reloaded.session_id, "session-abc123");
 
     // --- DUPLICATE CREATE fails ---
-    let dup_result = deskd::agent::create(&cfg).await;
+    let dup_result = deskd::app::agent::create(&cfg).await;
     assert!(dup_result.is_err());
     assert!(
         dup_result
@@ -133,46 +133,50 @@ async fn test_agent_state_lifecycle() {
     // --- LIST ---
     let cfg_b = make_config("lifecycle-agent-b");
     let cfg_c = make_config("lifecycle-agent-c");
-    deskd::agent::create(&cfg_b).await.unwrap();
-    deskd::agent::create(&cfg_c).await.unwrap();
+    deskd::app::agent::create(&cfg_b).await.unwrap();
+    deskd::app::agent::create(&cfg_c).await.unwrap();
 
-    let agents = deskd::agent::list().await.unwrap();
+    let agents = deskd::app::agent::list().await.unwrap();
     let names: Vec<&str> = agents.iter().map(|a| a.config.name.as_str()).collect();
     assert!(names.contains(&"lifecycle-agent"));
     assert!(names.contains(&"lifecycle-agent-b"));
     assert!(names.contains(&"lifecycle-agent-c"));
 
     // --- REMOVE ---
-    deskd::agent::remove("lifecycle-agent").await.unwrap();
-    assert!(deskd::agent::load_state("lifecycle-agent").is_err());
+    deskd::app::agent::remove("lifecycle-agent").await.unwrap();
+    assert!(deskd::app::agent::load_state("lifecycle-agent").is_err());
 
-    deskd::agent::remove("lifecycle-agent-b").await.unwrap();
-    deskd::agent::remove("lifecycle-agent-c").await.unwrap();
+    deskd::app::agent::remove("lifecycle-agent-b")
+        .await
+        .unwrap();
+    deskd::app::agent::remove("lifecycle-agent-c")
+        .await
+        .unwrap();
 
     // --- REMOVE nonexistent fails ---
-    let rm_result = deskd::agent::remove("ghost-agent").await;
+    let rm_result = deskd::app::agent::remove("ghost-agent").await;
     assert!(rm_result.is_err());
 
     // --- Set idle after task ---
     let cfg_d = make_config("idle-agent");
-    deskd::agent::create(&cfg_d).await.unwrap();
-    let mut st = deskd::agent::load_state("idle-agent").unwrap();
+    deskd::app::agent::create(&cfg_d).await.unwrap();
+    let mut st = deskd::app::agent::load_state("idle-agent").unwrap();
     st.status = "working".into();
     st.current_task = "Task in progress".into();
-    deskd::agent::save_state_pub(&st).unwrap();
+    deskd::app::agent::save_state_pub(&st).unwrap();
 
     st.status = "idle".into();
     st.current_task = String::new();
     st.total_turns = 15;
     st.total_cost = 1.23;
-    deskd::agent::save_state_pub(&st).unwrap();
+    deskd::app::agent::save_state_pub(&st).unwrap();
 
-    let final_st = deskd::agent::load_state("idle-agent").unwrap();
+    let final_st = deskd::app::agent::load_state("idle-agent").unwrap();
     assert_eq!(final_st.status, "idle");
     assert_eq!(final_st.current_task, "");
     assert_eq!(final_st.total_turns, 15);
 
-    deskd::agent::remove("idle-agent").await.unwrap();
+    deskd::app::agent::remove("idle-agent").await.unwrap();
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -185,7 +189,7 @@ async fn test_agent_bus_task_round_trip() {
 
     let sock = socket.clone();
     tokio::spawn(async move {
-        deskd::bus::serve(&sock).await.unwrap();
+        deskd::app::bus::serve(&sock).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 

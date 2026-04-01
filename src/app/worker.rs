@@ -5,12 +5,12 @@ use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::acp;
-use crate::agent::{self, TokenUsage};
+use crate::app::acp;
+use crate::app::agent::{self, TokenUsage};
+use crate::app::message::Message;
+use crate::app::tasklog;
+use crate::app::unified_inbox;
 use crate::config::{AgentRuntime, SessionMode};
-use crate::message::Message;
-use crate::tasklog;
-use crate::unified_inbox;
 
 /// Wrapper for either a Claude or ACP agent process.
 enum RuntimeProcess {
@@ -254,7 +254,7 @@ pub async fn run(
             }
             _ = queue_poll.tick() => {
                 // Poll the task queue for pending tasks matching this worker.
-                let store = crate::task::TaskStore::default_for_home();
+                let store = crate::app::task::TaskStore::default_for_home();
                 if let Ok(Some(task)) = store.claim_next(name, &agent_model, &agent_labels) {
                     info!(
                         agent = %name,
@@ -837,7 +837,7 @@ async fn handle_task_success(
 
     // Update task queue if this came from the queue.
     if let Some(ref tq_id) = ctx.task_queue_id {
-        let store = crate::task::TaskStore::default_for_home();
+        let store = crate::app::task::TaskStore::default_for_home();
         let result_text = if response.len() > 500 {
             let mut end = 500;
             while !response.is_char_boundary(end) {
@@ -894,7 +894,7 @@ async fn handle_task_failure(
     }
 
     if let Some(ref tq_id) = ctx.task_queue_id {
-        let store = crate::task::TaskStore::default_for_home();
+        let store = crate::app::task::TaskStore::default_for_home();
         if let Err(e) = store.fail(tq_id, &err_str) {
             warn!(agent = %name, task_id = %tq_id, error = %e, "failed to mark queue task failed");
         }

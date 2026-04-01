@@ -21,9 +21,9 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::app::statemachine;
+use crate::app::unified_inbox;
 use crate::config::UserConfig;
-use crate::statemachine;
-use crate::unified_inbox;
 
 // ─── Embedded bus for sub-agent orchestration ────────────────────────────────
 
@@ -50,7 +50,7 @@ impl InternalBus {
 
         let bus_path = socket_path.clone();
         let bus_handle = tokio::spawn(async move {
-            if let Err(e) = crate::bus::serve(&bus_path).await {
+            if let Err(e) = crate::app::bus::serve(&bus_path).await {
                 warn!(error = %e, "internal bus exited");
             }
         });
@@ -759,9 +759,9 @@ async fn call_add_persistent_agent(
     }
 
     // Set parent field on the created agent state.
-    if let Ok(mut state) = crate::agent::load_state(name) {
+    if let Ok(mut state) = crate::app::agent::load_state(name) {
         state.parent = Some(parent_name.to_string());
-        crate::agent::save_state_pub(&state).ok();
+        crate::app::agent::save_state_pub(&state).ok();
     }
 
     // Fail-fast: verify the internal bus is reachable before spawning.
@@ -979,7 +979,7 @@ async fn call_run_graph(args: &Value) -> Result<Value> {
 
     let yaml = std::fs::read_to_string(&abs_path)
         .with_context(|| format!("failed to read graph file: {}", abs_path.display()))?;
-    let graph_def: crate::graph::GraphDef = serde_yaml::from_str(&yaml)
+    let graph_def: crate::app::graph::GraphDef = serde_yaml::from_str(&yaml)
         .with_context(|| format!("failed to parse graph YAML: {}", abs_path.display()))?;
 
     // Parse optional vars from MCP args.
@@ -992,7 +992,7 @@ async fn call_run_graph(args: &Value) -> Result<Value> {
 
     info!(graph = %graph_def.graph, steps = graph_def.steps.len(), "run_graph via MCP");
 
-    let ctx = crate::graph::execute(&graph_def, &work_dir, None, inputs)
+    let ctx = crate::app::graph::execute(&graph_def, &work_dir, None, inputs)
         .await
         .with_context(|| format!("graph execution failed: {}", graph_def.graph))?;
 
@@ -1080,8 +1080,8 @@ async fn call_task_create(args: &Value, agent_name: &str) -> Result<Value> {
         })
         .unwrap_or_default();
 
-    let store = crate::task::TaskStore::default_for_home();
-    let criteria = crate::task::TaskCriteria { model, labels };
+    let store = crate::app::task::TaskStore::default_for_home();
+    let criteria = crate::app::task::TaskCriteria { model, labels };
     let task = store.create(description, criteria, agent_name)?;
 
     info!(agent = %agent_name, task_id = %task.id, "task_create via MCP");
@@ -1099,15 +1099,15 @@ async fn call_task_list(args: &Value) -> Result<Value> {
         .get("status")
         .and_then(|s| s.as_str())
         .and_then(|s| match s {
-            "pending" => Some(crate::task::TaskStatus::Pending),
-            "active" => Some(crate::task::TaskStatus::Active),
-            "done" => Some(crate::task::TaskStatus::Done),
-            "failed" => Some(crate::task::TaskStatus::Failed),
-            "cancelled" => Some(crate::task::TaskStatus::Cancelled),
+            "pending" => Some(crate::app::task::TaskStatus::Pending),
+            "active" => Some(crate::app::task::TaskStatus::Active),
+            "done" => Some(crate::app::task::TaskStatus::Done),
+            "failed" => Some(crate::app::task::TaskStatus::Failed),
+            "cancelled" => Some(crate::app::task::TaskStatus::Cancelled),
             _ => None,
         });
 
-    let store = crate::task::TaskStore::default_for_home();
+    let store = crate::app::task::TaskStore::default_for_home();
     let tasks = store.list(status_filter)?;
 
     let summary: Vec<Value> = tasks
@@ -1137,7 +1137,7 @@ async fn call_task_cancel(args: &Value) -> Result<Value> {
         .and_then(|i| i.as_str())
         .context("missing id")?;
 
-    let store = crate::task::TaskStore::default_for_home();
+    let store = crate::app::task::TaskStore::default_for_home();
     let task = store.cancel(id)?;
 
     info!(task_id = %task.id, "task_cancel via MCP");
@@ -1155,7 +1155,7 @@ async fn call_list_agents(internal_bus: &Arc<Mutex<Option<InternalBus>>>) -> Res
         Some(ibus) => {
             let mut list = Vec::new();
             for name in &ibus.sub_agents {
-                let (model, turns, cost_usd) = match crate::agent::load_state(name) {
+                let (model, turns, cost_usd) = match crate::app::agent::load_state(name) {
                     Ok(state) => (
                         state.config.model.clone(),
                         state.total_turns,
@@ -1207,8 +1207,8 @@ async fn call_remove_agent(
         .context("missing name")?;
 
     // Verify the target agent exists and is a sub-agent of the caller.
-    let state =
-        crate::agent::load_state(name).with_context(|| format!("agent '{}' not found", name))?;
+    let state = crate::app::agent::load_state(name)
+        .with_context(|| format!("agent '{}' not found", name))?;
 
     match &state.parent {
         Some(parent) if parent == caller => {}
@@ -1266,7 +1266,7 @@ async fn call_remove_agent(
         }
     }
 
-    crate::agent::remove(name).await?;
+    crate::app::agent::remove(name).await?;
 
     info!(agent = %name, caller = %caller, "remove_agent via MCP");
 

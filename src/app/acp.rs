@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
-use crate::agent::{self, AgentConfig, TaskLimits, TokenUsage, TurnResult, build_command};
+use crate::app::agent::{self, AgentConfig, TaskLimits, TokenUsage, TurnResult, build_command};
 use crate::config::SessionMode;
 
 // ─── JSON-RPC 2.0 types ─────────────────────────────────────────────────────

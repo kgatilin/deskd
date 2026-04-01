@@ -131,7 +131,7 @@ fn find_next_state(
     current_state: &str,
     result: &str,
 ) -> Option<String> {
-    let transitions = deskd::statemachine::valid_transitions(model, current_state);
+    let transitions = deskd::app::statemachine::valid_transitions(model, current_state);
     let result_upper = result.trim().to_uppercase();
 
     // Keyword matches first.
@@ -163,7 +163,7 @@ async fn test_completion_triggers_transition_and_dispatch() {
     let tmp = temp_dir();
 
     // Create a temp statemachine store with an instance in "draft" state.
-    let store = deskd::statemachine::StateMachineStore::new(tmp.clone());
+    let store = deskd::app::statemachine::StateMachineStore::new(tmp.clone());
     let model = test_model();
     let inst = store
         .create(
@@ -179,7 +179,7 @@ async fn test_completion_triggers_transition_and_dispatch() {
     // Start bus.
     let sock = socket.clone();
     tokio::spawn(async move {
-        deskd::bus::serve(&sock).await.unwrap();
+        deskd::app::bus::serve(&sock).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -238,7 +238,7 @@ async fn test_completion_triggers_transition_and_dispatch() {
     // Verify state transitioned.
     assert_eq!(inst.state, "review");
     assert_eq!(inst.assignee, "agent:reviewer");
-    assert!(!deskd::statemachine::is_terminal(&model, &inst));
+    assert!(!deskd::app::statemachine::is_terminal(&model, &inst));
 
     // Dispatch task to agent:reviewer (same as workflow engine does).
     let task_msg = serde_json::json!({
@@ -307,7 +307,7 @@ async fn test_completion_triggers_transition_and_dispatch() {
 #[tokio::test]
 async fn test_keyword_transition_lgtm_approves() {
     let tmp = temp_dir();
-    let store = deskd::statemachine::StateMachineStore::new(tmp.clone());
+    let store = deskd::app::statemachine::StateMachineStore::new(tmp.clone());
     let model = test_model();
 
     // Create instance and move to review state.
@@ -328,7 +328,7 @@ async fn test_keyword_transition_lgtm_approves() {
         .move_to(&mut inst, &model, "approved", "auto", Some(result))
         .unwrap();
     assert_eq!(inst.state, "approved");
-    assert!(deskd::statemachine::is_terminal(&model, &inst));
+    assert!(deskd::app::statemachine::is_terminal(&model, &inst));
 
     // Terminal state — workflow engine should NOT dispatch.
     // Verify history records both transitions.
@@ -345,7 +345,7 @@ async fn test_keyword_transition_lgtm_approves() {
 #[tokio::test]
 async fn test_keyword_transition_reject() {
     let tmp = temp_dir();
-    let store = deskd::statemachine::StateMachineStore::new(tmp.clone());
+    let store = deskd::app::statemachine::StateMachineStore::new(tmp.clone());
     let model = test_model();
 
     let mut inst = store
@@ -362,7 +362,7 @@ async fn test_keyword_transition_reject() {
     store
         .move_to(&mut inst, &model, "rejected", "auto", Some(result))
         .unwrap();
-    assert!(deskd::statemachine::is_terminal(&model, &inst));
+    assert!(deskd::app::statemachine::is_terminal(&model, &inst));
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -371,7 +371,7 @@ async fn test_keyword_transition_reject() {
 #[tokio::test]
 async fn test_no_matching_transition_stays_in_state() {
     let tmp = temp_dir();
-    let store = deskd::statemachine::StateMachineStore::new(tmp.clone());
+    let store = deskd::app::statemachine::StateMachineStore::new(tmp.clone());
     let model = test_model();
 
     let mut inst = store

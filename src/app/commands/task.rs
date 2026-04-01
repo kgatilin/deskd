@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 
-use crate::cli::TaskAction;
-use crate::task;
+use crate::app::cli::TaskAction;
+use crate::app::task;
 
 use super::truncate;
 

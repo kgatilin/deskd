@@ -1,7 +1,8 @@
 use clap::Parser;
 
-use deskd::cli::{Cli, Commands};
-use deskd::{commands, config, mcp, serve};
+use deskd::app::cli::{Cli, Commands};
+use deskd::app::{commands, mcp, serve};
+use deskd::config;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -73,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use deskd::commands::{parse_duration_secs, remind};
+    use deskd::app::commands::{parse_duration_secs, remind};
     use deskd::config;
 
     #[test]
@@ -153,9 +154,12 @@ schedules:
         assert_eq!(user_cfg.schedules[0].target, "agent:dev");
         assert_eq!(user_cfg.schedules[1].cron, "0 0 9 * * *");
 
-        use deskd::cli::ScheduleSubcommand;
-        deskd::commands::schedule::handle(ScheduleSubcommand::List, cfg_path.to_str().unwrap())
-            .unwrap();
+        use deskd::app::cli::ScheduleSubcommand;
+        deskd::app::commands::schedule::handle(
+            ScheduleSubcommand::List,
+            cfg_path.to_str().unwrap(),
+        )
+        .unwrap();
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -175,9 +179,9 @@ schedules:
 
         let path_str = cfg_path.to_str().unwrap();
 
-        use deskd::cli::ScheduleSubcommand;
+        use deskd::app::cli::ScheduleSubcommand;
 
-        deskd::commands::schedule::handle(
+        deskd::app::commands::schedule::handle(
             ScheduleSubcommand::Add {
                 cron: "0 0 9 * * *".to_string(),
                 action: "raw".to_string(),
@@ -193,7 +197,7 @@ schedules:
         assert_eq!(cfg.schedules[0].cron, "0 0 9 * * *");
         assert_eq!(cfg.schedules[0].target, "agent:dev");
 
-        deskd::commands::schedule::handle(
+        deskd::app::commands::schedule::handle(
             ScheduleSubcommand::Add {
                 cron: "0 */5 * * * *".to_string(),
                 action: "github_poll".to_string(),
@@ -207,14 +211,15 @@ schedules:
         let cfg = config::UserConfig::load(path_str).unwrap();
         assert_eq!(cfg.schedules.len(), 2);
 
-        deskd::commands::schedule::handle(ScheduleSubcommand::Rm { index: 0 }, path_str).unwrap();
+        deskd::app::commands::schedule::handle(ScheduleSubcommand::Rm { index: 0 }, path_str)
+            .unwrap();
 
         let cfg = config::UserConfig::load(path_str).unwrap();
         assert_eq!(cfg.schedules.len(), 1);
         assert_eq!(cfg.schedules[0].cron, "0 */5 * * * *");
 
         assert!(
-            deskd::commands::schedule::handle(ScheduleSubcommand::Rm { index: 5 }, path_str)
+            deskd::app::commands::schedule::handle(ScheduleSubcommand::Rm { index: 5 }, path_str)
                 .is_err()
         );
 
