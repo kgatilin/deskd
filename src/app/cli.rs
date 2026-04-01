@@ -229,6 +229,20 @@ pub enum AgentAction {
         #[arg(long, default_value = "false")]
         follow: bool,
     },
+    /// Show parsed stream-json output (tool calls, responses, errors).
+    Stream {
+        /// Agent name.
+        name: String,
+        /// Show last N events (default 50).
+        #[arg(long, default_value = "50")]
+        tail: usize,
+        /// Keep watching for new output.
+        #[arg(long, default_value = "false")]
+        follow: bool,
+        /// Show raw JSONL instead of parsed output.
+        #[arg(long, default_value = "false")]
+        raw: bool,
+    },
     /// Remove an agent (state file + log).
     Rm { name: String },
     /// Spawn an ephemeral sub-agent, run a task, print result, clean up.
