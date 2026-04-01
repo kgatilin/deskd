@@ -524,3 +524,85 @@ async fn test_sm_move_notifies_workflow_engine() {
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// dispatch_pending skips instances that already have a result (#202).
+///
+/// Creates two instances in "review" state with assignees:
+///   - one with result already set (completed work)
+///   - one with no result (pending work)
+/// Starts workflow engine → only the instance without result should be dispatched.
+#[tokio::test]
+async fn test_dispatch_pending_skips_completed_instances() {
+    let socket = temp_socket();
+    let tmp = temp_dir();
+
+    // Set HOME so workflow::run's default_for_home() finds our test instances.
+    unsafe { std::env::set_var("HOME", &tmp) };
+
+    // Store uses $HOME/.deskd/instances — same path workflow engine will use.
+    let store = deskd::app::statemachine::StateMachineStore::default_for_home();
+    let model = test_model();
+
+    // Instance 1: has result (should NOT be dispatched).
+    let mut completed = store
+        .create(&model, "Already done", "Work was already completed", "test")
+        .unwrap();
+    store
+        .move_to(&mut completed, &model, "review", "auto", None)
+        .unwrap();
+    completed.result = Some("This task is done.".to_string());
+    store.save(&completed).unwrap();
+
+    // Instance 2: no result (should be dispatched).
+    let mut pending = store
+        .create(&model, "Still pending", "Work not started yet", "test")
+        .unwrap();
+    store
+        .move_to(&mut pending, &model, "review", "auto", None)
+        .unwrap();
+    assert!(pending.result.is_none());
+
+    // Start bus.
+    let sock = socket.clone();
+    tokio::spawn(async move {
+        deskd::app::bus::serve(&sock).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Connect reviewer to capture dispatches.
+    let (mut reviewer_rx, _reviewer_tx) =
+        connect_and_register(&socket, "reviewer", &["agent:reviewer"]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Start workflow engine — dispatch_pending runs on startup.
+    let sock_for_engine = socket.clone();
+    let models: Vec<deskd::config::ModelDef> = vec![model.clone()];
+    tokio::spawn(async move {
+        let _ = deskd::app::workflow::run(&sock_for_engine, models).await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Should receive exactly one dispatch (for the pending instance).
+    let received = read_one(&mut reviewer_rx, 2000).await;
+    assert!(
+        received.is_some(),
+        "reviewer should receive dispatch for pending instance"
+    );
+    let msg = received.unwrap();
+    let task_text = msg["payload"]["task"].as_str().unwrap_or("");
+    assert!(
+        task_text.contains("Still pending"),
+        "dispatched task should be for the pending instance, got: {}",
+        task_text
+    );
+
+    // Should NOT receive a second dispatch (completed instance was skipped).
+    let second = read_one(&mut reviewer_rx, 500).await;
+    assert!(
+        second.is_none(),
+        "should not dispatch completed instance (has result)"
+    );
+
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
