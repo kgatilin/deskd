@@ -1048,6 +1048,56 @@ impl AgentProcess {
             args.push(state.config.system_prompt.clone());
         }
 
+        // Context materialization: load and execute context nodes, inject as system prompt.
+        if let Some(ref ctx_cfg) = state.config.context
+            && ctx_cfg.enabled
+        {
+            let ctx_domain: crate::domain::context::ContextConfig = ctx_cfg.clone().into();
+            let main_path = ctx_cfg
+                .main_path
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| crate::app::context::default_main_path(&state.config.work_dir));
+            if main_path.exists() {
+                match crate::app::context::MainBranch::load(&main_path) {
+                    Ok(mut branch) => {
+                        match branch.materialize().await {
+                            Ok(messages) if !messages.is_empty() => {
+                                let combined: String = messages
+                                    .iter()
+                                    .map(|m| m.content.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n\n");
+                                args.push("--append-system-prompt".to_string());
+                                args.push(combined);
+                                info!(
+                                    agent = %name,
+                                    nodes = messages.len(),
+                                    budget = ctx_domain.main_budget_tokens.unwrap_or(10000),
+                                    "injected materialized context"
+                                );
+                                // Save updated branch (caches live node results).
+                                if let Err(e) = branch.save(&main_path) {
+                                    warn!(agent = %name, error = %e, "failed to save context cache");
+                                }
+                            }
+                            Ok(_) => {
+                                debug!(agent = %name, "context materialized but no messages produced");
+                            }
+                            Err(e) => {
+                                warn!(agent = %name, error = %e, "context materialization failed");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(agent = %name, path = %main_path.display(), error = %e, "failed to load context branch");
+                    }
+                }
+            } else {
+                debug!(agent = %name, path = %main_path.display(), "context main path does not exist, skipping");
+            }
+        }
+
         // Auto-inject required flags for stream-json operation (#151).
         inject_required_flags(&mut args, &state.config.command);
 
