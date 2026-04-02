@@ -14,9 +14,16 @@ pub fn handle(action: TaskAction) -> Result<()> {
             description,
             model,
             labels,
+            metadata,
         } => {
             let criteria = task::TaskCriteria { model, labels };
-            let t = store.create(&description, criteria, "cli")?;
+            let t = if let Some(ref meta_str) = metadata {
+                let meta: serde_json::Value = serde_json::from_str(meta_str)
+                    .map_err(|e| anyhow::anyhow!("invalid --metadata JSON: {}", e))?;
+                store.create_with_metadata(&description, criteria, "cli", meta)?
+            } else {
+                store.create(&description, criteria, "cli")?
+            };
             println!("Created task {} (pending)", t.id);
         }
         TaskAction::List { status } => {

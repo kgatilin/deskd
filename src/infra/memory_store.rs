@@ -60,9 +60,24 @@ impl TaskRepository for InMemoryTaskStore {
             sm_instance_id: None,
             cost_usd: None,
             turns: None,
+            metadata: serde_json::Value::Null,
         };
         let dto: StoredTask = (&task).into();
         self.tasks.lock().unwrap().insert(id, dto);
+        Ok(task)
+    }
+
+    fn create_with_metadata(
+        &self,
+        description: &str,
+        criteria: TaskCriteria,
+        created_by: &str,
+        metadata: serde_json::Value,
+    ) -> Result<Task> {
+        let mut task = self.create(description, criteria, created_by)?;
+        task.metadata = metadata;
+        let dto: StoredTask = (&task).into();
+        self.tasks.lock().unwrap().insert(task.id.clone(), dto);
         Ok(task)
     }
 

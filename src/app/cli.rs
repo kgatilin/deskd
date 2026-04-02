@@ -278,6 +278,9 @@ pub enum SmAction {
         title: String,
         #[arg(long)]
         body: Option<String>,
+        /// Structured metadata as JSON string (e.g. '{"branch": "feat/x"}').
+        #[arg(long)]
+        metadata: Option<String>,
     },
     /// Move an instance to a new state.
     Move {
@@ -333,6 +336,9 @@ pub enum TaskAction {
         /// Required labels (comma-separated).
         #[arg(long, value_delimiter = ',')]
         labels: Vec<String>,
+        /// Structured metadata as JSON string (e.g. '{"worktree": "/path"}').
+        #[arg(long)]
+        metadata: Option<String>,
     },
     /// List tasks in the queue.
     List {

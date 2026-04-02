@@ -12,6 +12,13 @@ use crate::domain::task::{QueueSummary, Task, TaskCriteria, TaskStatus};
 pub trait TaskRepository: Send + Sync {
     fn load(&self, id: &str) -> Result<Task>;
     fn create(&self, description: &str, criteria: TaskCriteria, created_by: &str) -> Result<Task>;
+    fn create_with_metadata(
+        &self,
+        description: &str,
+        criteria: TaskCriteria,
+        created_by: &str,
+        metadata: serde_json::Value,
+    ) -> Result<Task>;
     fn create_for_sm(
         &self,
         description: &str,
