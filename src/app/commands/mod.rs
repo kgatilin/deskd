@@ -1,6 +1,7 @@
 //! Command handlers — one module per subcommand group.
 
 pub mod agent;
+pub mod bus;
 pub mod graph;
 pub mod remind;
 pub mod restart;

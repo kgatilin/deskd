@@ -93,6 +93,11 @@ pub enum Commands {
         #[arg(long, global = true)]
         config: Option<String>,
     },
+    /// Show bus diagnostics and connected clients.
+    Bus {
+        #[command(subcommand)]
+        action: BusAction,
+    },
     /// Manage the pull-based task queue.
     Task {
         #[command(subcommand)]
@@ -365,5 +370,15 @@ pub enum ScheduleSubcommand {
     Rm {
         /// Schedule index (0-based).
         index: usize,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BusAction {
+    /// Show bus state: connected clients and their subscriptions.
+    Status {
+        /// Bus socket path.
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: String,
     },
 }

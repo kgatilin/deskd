@@ -1,0 +1,142 @@
+//! `deskd bus` subcommand handlers.
+
+use anyhow::Result;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+
+use crate::app::cli::BusAction;
+
+pub async fn handle(action: BusAction) -> Result<()> {
+    match action {
+        BusAction::Status { socket } => {
+            if !std::path::Path::new(&socket).exists() {
+                println!("Bus is not running (socket not found: {})", socket);
+                return Ok(());
+            }
+
+            let mut stream = UnixStream::connect(&socket)
+                .await
+                .map_err(|e| anyhow::anyhow!("Cannot connect to bus at {}: {}", socket, e))?;
+
+            // Register as temporary client.
+            let reg = serde_json::json!({
+                "type": "register",
+                "name": "deskd-bus-status",
+                "subscriptions": []
+            });
+            let mut line = serde_json::to_string(&reg)?;
+            line.push('\n');
+            stream.write_all(line.as_bytes()).await?;
+
+            // Request client list.
+            let list_req = serde_json::json!({"type": "list"});
+            let mut req_line = serde_json::to_string(&list_req)?;
+            req_line.push('\n');
+            stream.write_all(req_line.as_bytes()).await?;
+
+            // Read response with timeout.
+            let (reader, _) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+
+            let timeout = tokio::time::Duration::from_secs(3);
+            let result = tokio::time::timeout(timeout, async {
+                while let Some(l) = lines.next_line().await? {
+                    let v: serde_json::Value = serde_json::from_str(&l)?;
+
+                    // Check for list_response in payload (comes as a bus message).
+                    let payload = if v.get("type").and_then(|t| t.as_str()) == Some("list_response")
+                    {
+                        v
+                    } else if let Some(p) = v.get("payload") {
+                        if p.get("type").and_then(|t| t.as_str()) == Some("list_response") {
+                            p.clone()
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    };
+
+                    return Ok::<_, anyhow::Error>(Some(payload));
+                }
+                Ok(None)
+            })
+            .await;
+
+            let payload = match result {
+                Ok(Ok(Some(p))) => p,
+                Ok(Ok(None)) => {
+                    println!("Bus is running but returned no client list.");
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    anyhow::bail!("Error reading bus response: {}", e);
+                }
+                Err(_) => {
+                    println!("Bus is running but did not respond in time.");
+                    return Ok(());
+                }
+            };
+
+            println!("Bus:    running");
+            println!("Socket: {}", socket);
+            println!();
+
+            // Use detailed client info if available, fall back to names.
+            if let Some(detail) = payload.get("clients_detail").and_then(|d| d.as_array()) {
+                let client_count = detail.len();
+                // Exclude our own status query client.
+                let clients: Vec<_> = detail
+                    .iter()
+                    .filter(|c| c.get("name").and_then(|n| n.as_str()) != Some("deskd-bus-status"))
+                    .collect();
+
+                println!("Clients: {} connected", clients.len());
+                if clients.is_empty() {
+                    return Ok(());
+                }
+                println!();
+                println!("{:<25} SUBSCRIPTIONS", "NAME");
+                for c in &clients {
+                    let name = c.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                    let subs: Vec<&str> = c
+                        .get("subscriptions")
+                        .and_then(|s| s.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+                    let subs_str = if subs.is_empty() {
+                        "-".to_string()
+                    } else {
+                        subs.join(", ")
+                    };
+                    println!("{:<25} {}", name, subs_str);
+                }
+
+                // Show count excluding ourselves.
+                if client_count > clients.len() + 1 {
+                    println!(
+                        "\n({} internal clients hidden)",
+                        client_count - clients.len() - 1
+                    );
+                }
+            } else if let Some(clients) = payload.get("clients").and_then(|c| c.as_array()) {
+                let names: Vec<&str> = clients
+                    .iter()
+                    .filter_map(|n| n.as_str())
+                    .filter(|n| *n != "deskd-bus-status")
+                    .collect();
+                println!("Clients: {} connected", names.len());
+                if !names.is_empty() {
+                    println!();
+                    println!("NAME");
+                    for name in &names {
+                        println!("{}", name);
+                    }
+                }
+            } else {
+                println!("Clients: unknown (unexpected response format)");
+            }
+        }
+    }
+    Ok(())
+}
