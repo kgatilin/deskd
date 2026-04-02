@@ -122,6 +122,8 @@ pub struct StoredTask {
     pub cost_usd: Option<f64>,
     #[serde(default)]
     pub turns: Option<u32>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 /// Storage format for task matching criteria.
@@ -164,6 +166,7 @@ impl From<StoredTask> for Task {
             sm_instance_id: dto.sm_instance_id,
             cost_usd: dto.cost_usd,
             turns: dto.turns,
+            metadata: dto.metadata,
         }
     }
 }
@@ -194,6 +197,7 @@ impl From<&Task> for StoredTask {
             sm_instance_id: task.sm_instance_id.clone(),
             cost_usd: task.cost_usd,
             turns: task.turns,
+            metadata: task.metadata.clone(),
         }
     }
 }
@@ -781,6 +785,7 @@ mod tests {
             sm_instance_id: None,
             cost_usd: None,
             turns: None,
+            metadata: serde_json::Value::Null,
         };
         let stored: StoredTask = (&task).into();
         assert_eq!(stored.status, "active");

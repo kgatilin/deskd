@@ -69,13 +69,23 @@ pub async fn handle(
                 );
             }
         }
-        SmAction::Create { model, title, body } => {
+        SmAction::Create {
+            model,
+            title,
+            body,
+            metadata,
+        } => {
             let m = models
                 .iter()
                 .find(|m| m.name == model)
                 .ok_or_else(|| anyhow::anyhow!("Model '{}' not found", model))?;
             let creator = std::env::var("DESKD_AGENT_NAME").unwrap_or_else(|_| "cli".to_string());
-            let inst = store.create(m, &title, body.as_deref().unwrap_or(""), &creator)?;
+            let mut inst = store.create(m, &title, body.as_deref().unwrap_or(""), &creator)?;
+            if let Some(ref meta_str) = metadata {
+                inst.metadata = serde_json::from_str(meta_str)
+                    .map_err(|e| anyhow::anyhow!("invalid --metadata JSON: {}", e))?;
+                store.save(&inst)?;
+            }
             println!(
                 "Created {} (model={}, state={})",
                 inst.id, inst.model, inst.state
@@ -122,6 +132,11 @@ pub async fn handle(
             }
             if let Some(ref e) = inst.error {
                 println!("Error:     {}", e);
+            }
+            if !inst.metadata.is_null()
+                && let Ok(pretty) = serde_json::to_string(&inst.metadata)
+            {
+                println!("Metadata:  {}", pretty);
             }
             println!("Created:   {} by {}", inst.created_at, inst.created_by);
             println!("Updated:   {}", inst.updated_at);

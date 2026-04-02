@@ -464,6 +464,10 @@ fn handle_tools_list(
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Required labels. Only workers with ALL listed labels will pick up the task."
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "Structured metadata (e.g. {\"worktree\": \"/path\", \"branch\": \"feat/x\"})"
                 }
             },
             "required": ["description"]
@@ -529,7 +533,8 @@ fn handle_tools_list(
                 "properties": {
                     "model": {"type": "string", "description": "Model name (e.g. 'feature', 'bugfix')"},
                     "title": {"type": "string", "description": "Instance title"},
-                    "body": {"type": "string", "description": "Instance body/description"}
+                    "body": {"type": "string", "description": "Instance body/description"},
+                    "metadata": {"type": "object", "description": "Structured metadata (e.g. {\"worktree\": \"/path\", \"branch\": \"feat/x\"})"}
                 },
                 "required": ["model", "title"]
             }
@@ -1080,9 +1085,18 @@ async fn call_task_create(args: &Value, agent_name: &str) -> Result<Value> {
         })
         .unwrap_or_default();
 
+    let metadata = args
+        .get("metadata")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
     let store = crate::app::task::TaskStore::default_for_home();
     let criteria = crate::app::task::TaskCriteria { model, labels };
-    let task = store.create(description, criteria, agent_name)?;
+    let task = if metadata.is_null() {
+        store.create(description, criteria, agent_name)?
+    } else {
+        store.create_with_metadata(description, criteria, agent_name, metadata)?
+    };
 
     info!(agent = %agent_name, task_id = %task.id, "task_create via MCP");
 
@@ -1303,8 +1317,17 @@ async fn call_sm_create(
         .ok_or_else(|| anyhow::anyhow!("model '{}' not found", model_name))?
         .into();
 
+    let metadata = args
+        .get("metadata")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
     let store = statemachine::StateMachineStore::default_for_home();
-    let inst = store.create(&model, title, body, agent_name)?;
+    let mut inst = store.create(&model, title, body, agent_name)?;
+    if !metadata.is_null() {
+        inst.metadata = metadata;
+        store.save(&inst)?;
+    }
     info!(agent = %agent_name, instance = %inst.id, model = %model_name, "sm_create via MCP");
 
     // If the initial state has an assignee, dispatch the first task via the bus.

@@ -333,10 +333,16 @@ fn build_task_text(prompt: &str, inst: &statemachine::Instance) -> String {
         parts.push(format!("---\n## Previous step result\n\n{}", result));
     }
 
-    parts.push(format!(
+    let mut meta_lines = format!(
         "---\n## Metadata\ninstance_id: {}\nmodel: {}\nstate: {}",
         inst.id, inst.model, inst.state
-    ));
+    );
+    if !inst.metadata.is_null()
+        && let Ok(pretty) = serde_json::to_string_pretty(&inst.metadata)
+    {
+        meta_lines.push_str(&format!("\nmetadata: {}", pretty));
+    }
+    parts.push(meta_lines);
 
     parts.join("\n\n")
 }

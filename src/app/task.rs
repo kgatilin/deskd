@@ -61,7 +61,24 @@ impl TaskStore {
         criteria: TaskCriteria,
         created_by: &str,
     ) -> Result<Task> {
-        self.create_inner(description, criteria, created_by, None)
+        self.create_inner(
+            description,
+            criteria,
+            created_by,
+            None,
+            serde_json::Value::Null,
+        )
+    }
+
+    /// Create a new task with structured metadata.
+    pub fn create_with_metadata(
+        &self,
+        description: &str,
+        criteria: TaskCriteria,
+        created_by: &str,
+        metadata: serde_json::Value,
+    ) -> Result<Task> {
+        self.create_inner(description, criteria, created_by, None, metadata)
     }
 
     /// Create a new task linked to a state machine instance.
@@ -77,6 +94,7 @@ impl TaskStore {
             criteria,
             created_by,
             Some(sm_instance_id.to_string()),
+            serde_json::Value::Null,
         )
     }
 
@@ -86,6 +104,7 @@ impl TaskStore {
         criteria: TaskCriteria,
         created_by: &str,
         sm_instance_id: Option<String>,
+        metadata: serde_json::Value,
     ) -> Result<Task> {
         let id = format!("task-{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let now = Utc::now().to_rfc3339();
@@ -104,6 +123,7 @@ impl TaskStore {
             sm_instance_id,
             cost_usd: None,
             turns: None,
+            metadata,
         };
 
         self.save(&task)?;
@@ -280,6 +300,15 @@ impl crate::ports::store::TaskRepository for TaskStore {
     }
     fn create(&self, description: &str, criteria: TaskCriteria, created_by: &str) -> Result<Task> {
         self.create(description, criteria, created_by)
+    }
+    fn create_with_metadata(
+        &self,
+        description: &str,
+        criteria: TaskCriteria,
+        created_by: &str,
+        metadata: serde_json::Value,
+    ) -> Result<Task> {
+        self.create_with_metadata(description, criteria, created_by, metadata)
     }
     fn create_for_sm(
         &self,

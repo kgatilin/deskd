@@ -56,6 +56,8 @@ pub struct Task {
     pub cost_usd: Option<f64>,
     /// Number of turns used (set on completion).
     pub turns: Option<u32>,
+    /// Structured metadata (JSON object, e.g. worktree path, branch, repo URL).
+    pub metadata: serde_json::Value,
 }
 
 /// Summary of the queue for status display.
