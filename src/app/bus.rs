@@ -33,6 +33,19 @@ impl BusState {
         self.clients.keys().cloned().collect()
     }
 
+    /// Return client details: name + subscriptions.
+    fn list_clients_detail(&self) -> Vec<serde_json::Value> {
+        self.clients
+            .values()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "subscriptions": c.subscriptions.iter().collect::<Vec<_>>(),
+                })
+            })
+            .collect()
+    }
+
     fn route(&self, msg: &Message) {
         let target = &msg.target;
 
@@ -195,12 +208,17 @@ async fn handle_connection(stream: UnixStream, state: Arc<RwLock<BusState>>) -> 
             crate::domain::message::Envelope::List => {
                 let bus = state.read().await;
                 let clients = bus.list_clients();
+                let clients_detail = bus.list_clients_detail();
                 if let Some(client) = bus.clients.get(&name) {
                     let resp = Message {
                         id: "list-response".to_string(),
                         source: "bus".to_string(),
                         target: name.clone(),
-                        payload: serde_json::json!({"type": "list_response", "clients": clients}),
+                        payload: serde_json::json!({
+                            "type": "list_response",
+                            "clients": clients,
+                            "clients_detail": clients_detail,
+                        }),
                         reply_to: None,
                         metadata: crate::app::message::Metadata::default(),
                     };

@@ -53,6 +53,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Agent { action } => {
             commands::agent::handle(action).await?;
         }
+        Commands::Bus { action } => {
+            commands::bus::handle(action).await?;
+        }
         Commands::Graph { action } => {
             commands::graph::handle(action).await?;
         }
