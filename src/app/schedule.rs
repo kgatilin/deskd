@@ -910,6 +910,7 @@ async fn post_payload_to_stream(
     let mut msg_line = serde_json::to_string(&msg)?;
     msg_line.push('\n');
     stream.write_all(msg_line.as_bytes()).await?;
+    stream.flush().await?;
 
     Ok(())
 }

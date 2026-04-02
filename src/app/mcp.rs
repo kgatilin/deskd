@@ -677,6 +677,7 @@ async fn call_send_message(
     let mut msg_line = serde_json::to_string(&msg)?;
     msg_line.push('\n');
     stream.write_all(msg_line.as_bytes()).await?;
+    stream.flush().await?;
 
     info!(agent = %agent_name, target = %target, bus = %effective_socket, "send_message via MCP");
 
@@ -1365,6 +1366,7 @@ async fn call_sm_create(
         let mut msg_line = serde_json::to_string(&msg)?;
         msg_line.push('\n');
         stream.write_all(msg_line.as_bytes()).await?;
+        stream.flush().await?;
         info!(instance = %inst.id, assignee = %inst.assignee, "dispatched initial task");
     }
 
