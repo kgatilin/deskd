@@ -89,7 +89,7 @@ pub async fn handle(
                 .ok_or_else(|| anyhow::anyhow!("Model '{}' not found in config", inst.model))?;
             let trigger =
                 std::env::var("DESKD_AGENT_NAME").unwrap_or_else(|_| "manual".to_string());
-            store.move_to(&mut inst, m, &state, &trigger, note.as_deref())?;
+            store.move_to(&mut inst, m, &state, &trigger, note.as_deref(), None, None)?;
             println!("{} -> {} ({})", id, inst.state, inst.model);
 
             // Notify workflow engine if the new state has an assignee.
@@ -190,7 +190,15 @@ pub async fn handle(
                     )
                 })?;
             let target = cancel_target.to.clone();
-            store.move_to(&mut inst, m, &target, "cancel", Some("Cancelled via CLI"))?;
+            store.move_to(
+                &mut inst,
+                m,
+                &target,
+                "cancel",
+                Some("Cancelled via CLI"),
+                None,
+                None,
+            )?;
             println!("{} cancelled -> {}", id, inst.state);
         }
     }
