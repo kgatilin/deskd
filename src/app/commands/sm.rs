@@ -125,13 +125,27 @@ pub async fn handle(
             }
             println!("Created:   {} by {}", inst.created_at, inst.created_by);
             println!("Updated:   {}", inst.updated_at);
+            if inst.total_cost > 0.0 || inst.total_turns > 0 {
+                println!(
+                    "Total:     ${:.4} / {} turns",
+                    inst.total_cost, inst.total_turns
+                );
+            }
             if !inst.history.is_empty() {
                 println!();
-                println!("{:<15} {:<15} {:<20} TIMESTAMP", "FROM", "TO", "TRIGGER");
+                println!(
+                    "{:<15} {:<15} {:<20} {:<10} {:<8} TIMESTAMP",
+                    "FROM", "TO", "TRIGGER", "COST", "TURNS"
+                );
                 for h in &inst.history {
+                    let cost = h
+                        .cost_usd
+                        .map(|c| format!("${:.4}", c))
+                        .unwrap_or_else(|| "-".into());
+                    let turns = h.turns.map(|t| t.to_string()).unwrap_or_else(|| "-".into());
                     println!(
-                        "{:<15} {:<15} {:<20} {}",
-                        h.from, h.to, h.trigger, h.timestamp,
+                        "{:<15} {:<15} {:<20} {:<10} {:<8} {}",
+                        h.from, h.to, h.trigger, cost, turns, h.timestamp,
                     );
                 }
             }
