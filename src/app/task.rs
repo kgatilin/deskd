@@ -294,10 +294,19 @@ impl TaskStore {
     }
 }
 
-impl crate::ports::store::TaskRepository for TaskStore {
+impl crate::ports::store::TaskReader for TaskStore {
     fn load(&self, id: &str) -> Result<Task> {
         self.load(id)
     }
+    fn list(&self, status_filter: Option<TaskStatus>) -> Result<Vec<Task>> {
+        self.list(status_filter)
+    }
+    fn queue_summary(&self) -> QueueSummary {
+        self.queue_summary()
+    }
+}
+
+impl crate::ports::store::TaskWriter for TaskStore {
     fn create(&self, description: &str, criteria: TaskCriteria, created_by: &str) -> Result<Task> {
         self.create(description, criteria, created_by)
     }
@@ -318,9 +327,6 @@ impl crate::ports::store::TaskRepository for TaskStore {
         sm_instance_id: &str,
     ) -> Result<Task> {
         self.create_for_sm(description, criteria, created_by, sm_instance_id)
-    }
-    fn list(&self, status_filter: Option<TaskStatus>) -> Result<Vec<Task>> {
-        self.list(status_filter)
     }
     fn cancel(&self, id: &str) -> Result<Task> {
         self.cancel(id)
@@ -344,9 +350,6 @@ impl crate::ports::store::TaskRepository for TaskStore {
     }
     fn fail(&self, id: &str, error_msg: &str) -> Result<Task> {
         self.fail(id, error_msg)
-    }
-    fn queue_summary(&self) -> QueueSummary {
-        self.queue_summary()
     }
 }
 

@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use crate::domain::statemachine::{Instance, ModelDef, Transition};
 use crate::domain::task::{QueueSummary, Task, TaskCriteria, TaskStatus, matches_criteria};
 use crate::infra::dto::{StoredInstance, StoredTask};
-use crate::ports::store::{StateMachineRepository, TaskRepository};
+use crate::ports::store::{StateMachineRepository, TaskReader, TaskWriter};
 
 // ─── InMemoryTaskStore ───────────────────────────────────────────────────────
 
@@ -33,7 +33,7 @@ impl Default for InMemoryTaskStore {
     }
 }
 
-impl TaskRepository for InMemoryTaskStore {
+impl TaskReader for InMemoryTaskStore {
     fn load(&self, id: &str) -> Result<Task> {
         let tasks = self.tasks.lock().unwrap();
         tasks
@@ -43,6 +43,41 @@ impl TaskRepository for InMemoryTaskStore {
             .ok_or_else(|| anyhow::anyhow!("Task '{}' not found", id))
     }
 
+    fn list(&self, status_filter: Option<TaskStatus>) -> Result<Vec<Task>> {
+        let tasks = self.tasks.lock().unwrap();
+        let mut result: Vec<Task> = tasks
+            .values()
+            .cloned()
+            .map(Into::into)
+            .filter(|t: &Task| status_filter.is_none() || Some(t.status) == status_filter)
+            .collect();
+        result.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(result)
+    }
+
+    fn queue_summary(&self) -> QueueSummary {
+        let tasks = self.tasks.lock().unwrap();
+        let mut s = QueueSummary {
+            pending: 0,
+            active: 0,
+            done: 0,
+            failed: 0,
+        };
+        for dto in tasks.values() {
+            let task: Task = dto.clone().into();
+            match task.status {
+                TaskStatus::Pending => s.pending += 1,
+                TaskStatus::Active => s.active += 1,
+                TaskStatus::Done => s.done += 1,
+                TaskStatus::Failed => s.failed += 1,
+                TaskStatus::Cancelled => {}
+            }
+        }
+        s
+    }
+}
+
+impl TaskWriter for InMemoryTaskStore {
     fn create(&self, description: &str, criteria: TaskCriteria, created_by: &str) -> Result<Task> {
         let id = format!("task-{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let now = chrono::Utc::now().to_rfc3339();
@@ -93,18 +128,6 @@ impl TaskRepository for InMemoryTaskStore {
         let dto: StoredTask = (&task).into();
         self.tasks.lock().unwrap().insert(task.id.clone(), dto);
         Ok(task)
-    }
-
-    fn list(&self, status_filter: Option<TaskStatus>) -> Result<Vec<Task>> {
-        let tasks = self.tasks.lock().unwrap();
-        let mut result: Vec<Task> = tasks
-            .values()
-            .cloned()
-            .map(Into::into)
-            .filter(|t: &Task| status_filter.is_none() || Some(t.status) == status_filter)
-            .collect();
-        result.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-        Ok(result)
     }
 
     fn cancel(&self, id: &str) -> Result<Task> {
@@ -192,27 +215,6 @@ impl TaskRepository for InMemoryTaskStore {
         task.updated_at = chrono::Utc::now().to_rfc3339();
         tasks.insert(id.to_string(), (&task).into());
         Ok(task)
-    }
-
-    fn queue_summary(&self) -> QueueSummary {
-        let tasks = self.tasks.lock().unwrap();
-        let mut s = QueueSummary {
-            pending: 0,
-            active: 0,
-            done: 0,
-            failed: 0,
-        };
-        for dto in tasks.values() {
-            let task: Task = dto.clone().into();
-            match task.status {
-                TaskStatus::Pending => s.pending += 1,
-                TaskStatus::Active => s.active += 1,
-                TaskStatus::Done => s.done += 1,
-                TaskStatus::Failed => s.failed += 1,
-                TaskStatus::Cancelled => {}
-            }
-        }
-        s
     }
 }
 
