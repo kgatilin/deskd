@@ -17,9 +17,15 @@ pub trait ContextRepository: Send + Sync {
     fn save(&self, branch: &MainBranch, path: &Path) -> Result<()>;
 }
 
-/// Persistence operations for the task queue.
-pub trait TaskRepository: Send + Sync {
+/// Read-only persistence operations for the task queue.
+pub trait TaskReader: Send + Sync {
     fn load(&self, id: &str) -> Result<Task>;
+    fn list(&self, status_filter: Option<TaskStatus>) -> Result<Vec<Task>>;
+    fn queue_summary(&self) -> QueueSummary;
+}
+
+/// Write/mutate persistence operations for the task queue.
+pub trait TaskWriter: Send + Sync {
     fn create(&self, description: &str, criteria: TaskCriteria, created_by: &str) -> Result<Task>;
     fn create_with_metadata(
         &self,
@@ -35,7 +41,6 @@ pub trait TaskRepository: Send + Sync {
         created_by: &str,
         sm_instance_id: &str,
     ) -> Result<Task>;
-    fn list(&self, status_filter: Option<TaskStatus>) -> Result<Vec<Task>>;
     fn cancel(&self, id: &str) -> Result<Task>;
     fn claim_next(
         &self,
@@ -51,8 +56,17 @@ pub trait TaskRepository: Send + Sync {
         turns: Option<u32>,
     ) -> Result<Task>;
     fn fail(&self, id: &str, error_msg: &str) -> Result<Task>;
-    fn queue_summary(&self) -> QueueSummary;
 }
+
+/// Combined task persistence trait for code that needs both read and write access.
+///
+/// Supertrait of [`TaskReader`] + [`TaskWriter`]; implementors only need to satisfy
+/// the two constituent traits — the blanket impl below covers the rest.
+pub trait TaskRepository: TaskReader + TaskWriter {}
+
+/// Blanket impl: any type that is both a `TaskReader` and a `TaskWriter` automatically
+/// satisfies `TaskRepository`.
+impl<T: TaskReader + TaskWriter> TaskRepository for T {}
 
 /// Persistence operations for state machine instances.
 pub trait StateMachineRepository: Send + Sync {
