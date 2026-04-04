@@ -1,54 +1,115 @@
-rules:
-  fan_out:
-    # src::app is a container module (19 submodules re-exported) — raised from 10
-    threshold: 20
-    level: telemetry
-  fan_in:
-    # src::domain (28) and src::app are central hubs — raised from 27
-    threshold: 30
-    level: telemetry
-  cycles:
-    enabled: true
-    level: taboo
-  isp:
-    threshold: 5
-    level: personal
-  dip:
-    enabled: true
-    level: personal
-
-# Clean architecture layers — reflects actual module structure as of v0.7.61.
+# archlint configuration for deskd
+# See: https://github.com/mshogin/archlint
 #
-#   src/domain/   — pure types, no I/O, no serde
-#   src/ports/    — trait definitions (bus, store, executor)
-#   src/infra/    — trait impls, I/O, serde DTOs
-#   src/app/      — orchestration, use cases, CLI, adapters
-#   src/config.rs — workspace/user config parsing (YAML)
-#   src/main.rs   — thin entry point, DI wiring
+# Schema: archlint-rs (Rust engine)
+# All rules use the flat schema: rules.<rule>.{enabled, level, threshold, exclude}
+# Levels: taboo (CI blocker, exit 1) | telemetry (track, exit 0) | personal (info, exit 0)
+#
+# Current health: 80/100 — 4 violations (dip x4, all telemetry-level)
+# Remaining violations tracked in issues #193, #195, #196.
+
+# Domain Model
+# =============
+# deskd is an agent orchestration runtime. Core domain concepts:
+#
+# Domain Layer (pure logic, no I/O, no serde):
+#   src/domain/   — message, context, task, statemachine, agent types
+#
+# Ports Layer (trait definitions):
+#   src/ports/    — bus, store, executor traits
+#
+# Infrastructure Layer (I/O, external systems):
+#   src/infra/    — unix_bus, memory_bus, memory_store, dto
+#
+# Application Layer (orchestration):
+#   src/app/      — worker, mcp, graph, workflow, statemachine, schedule, adapters
+#   src/config.rs — YAML config parsing
+#
+# Entry Points / CLI:
+#   src/main.rs, src/lib.rs, src/bin/session2graph
+
+# ---- Layer enforcement -------------------------------------------------------
+# Desired dependency directions:
+#   cli -> app, infra, ports, domain
+#   app -> domain, ports, infra
+#   infra -> domain, ports
+#   ports -> domain
+#   domain -> (nothing)
 
 layers:
   - name: domain
     paths:
       - "src/domain"
+
   - name: ports
     paths:
       - "src/ports"
+
   - name: infra
     paths:
       - "src/infra"
+
   - name: app
     paths:
       - "src/app"
-      - "src/config"        # YAML parsing + re-exports from app/paths — app-layer concern
-      - "src/bin"
-  - name: main
+      - "src/config"
+
+  - name: cli
     paths:
       - "src/main"
       - "src/lib"
+      - "src/bin/session2graph"
 
 allowed_dependencies:
   domain: []
-  ports: [domain]
-  infra: [domain, ports]
-  app: [domain, ports, infra]
-  main: [domain, ports, infra, app]
+  ports: ["domain"]
+  infra: ["domain", "ports"]
+  app: ["domain", "ports", "infra"]
+  cli: ["domain", "ports", "infra", "app"]
+
+# ---- Rules -------------------------------------------------------------------
+
+rules:
+  # Fan-out: how many internal modules does a component depend on.
+  fan_out:
+    enabled: true
+    level: telemetry
+    threshold: 7
+    exclude:
+      - "src::main"
+      - "src::lib"
+
+  # Fan-in: how many components depend on a given module.
+  fan_in:
+    enabled: true
+    level: telemetry
+    threshold: 12
+    exclude: []
+
+  # Cycles: circular dependencies between modules.
+  # Currently clean — enforce as taboo to prevent regressions.
+  cycles:
+    enabled: true
+    level: taboo
+    threshold: 0
+
+  # ISP: traits with too many methods (interface segregation principle).
+  # Issues #179 (TaskRepository, 9 methods) and #180 (StateMachineRepository, 6 methods).
+  isp:
+    enabled: true
+    level: telemetry
+    threshold: 7
+
+  # DIP: modules with structs but no trait definitions.
+  # Active work: #193 (Executor trait), #195 (MCP handlers), #196 (data-only exceptions).
+  dip:
+    enabled: true
+    level: telemetry
+    exclude:
+      - "src::domain::message"
+      - "src::domain::context"
+      - "src::domain::task"
+      - "src::domain::statemachine"
+      - "src::config"
+      - "src::infra::dto"
+      - "src::bin::session2graph"
