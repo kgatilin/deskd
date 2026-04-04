@@ -100,6 +100,24 @@ rules:
     level: telemetry
     threshold: 7
 
+  # SRP: modules with too many functions/methods.
+  # Threshold 10 is too aggressive for our codebase — many modules legitimately
+  # have 15-50 functions. Track at telemetry with a higher threshold.
+  srp:
+    enabled: true
+    level: telemetry
+    threshold: 40
+
+  # Shotgun surgery: high afferent coupling (many dependents).
+  # domain and app are container modules — naturally high Ca.
+  shotgun_surgery:
+    enabled: true
+    level: telemetry
+    threshold: 15
+    exclude:
+      - "src::domain"
+      - "src::app"
+
   # DIP: modules with structs but no trait definitions.
   # Active work: #193 (Executor trait), #195 (MCP handlers), #196 (data-only exceptions).
   dip:
