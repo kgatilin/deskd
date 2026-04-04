@@ -96,6 +96,7 @@ impl TaskWriter for InMemoryTaskStore {
             cost_usd: None,
             turns: None,
             metadata: serde_json::Value::Null,
+            timed_out_at: None,
         };
         let dto: StoredTask = (&task).into();
         self.tasks.lock().unwrap().insert(id, dto);
@@ -212,6 +213,26 @@ impl TaskWriter for InMemoryTaskStore {
         }
         task.status = TaskStatus::Failed;
         task.error = Some(error_msg.to_string());
+        task.updated_at = chrono::Utc::now().to_rfc3339();
+        tasks.insert(id.to_string(), (&task).into());
+        Ok(task)
+    }
+
+    fn reset_to_pending(&self, id: &str) -> Result<Task> {
+        let mut tasks = self.tasks.lock().unwrap();
+        let dto = tasks
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Task '{}' not found", id))?;
+        let mut task: Task = dto.clone().into();
+        if task.status != TaskStatus::Active {
+            bail!(
+                "Cannot reset task '{}': status is '{}' (must be active)",
+                id,
+                task.status
+            );
+        }
+        task.status = TaskStatus::Pending;
+        task.assignee = None;
         task.updated_at = chrono::Utc::now().to_rfc3339();
         tasks.insert(id.to_string(), (&task).into());
         Ok(task)

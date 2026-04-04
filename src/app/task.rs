@@ -124,6 +124,7 @@ impl TaskStore {
             cost_usd: None,
             turns: None,
             metadata,
+            timed_out_at: None,
         };
 
         self.save(&task)?;
@@ -272,6 +273,47 @@ impl TaskStore {
         Ok(task)
     }
 
+    /// Reset an active task back to pending (crash recovery: task was claimed but
+    /// deskd crashed before the agent could complete it).
+    pub fn reset_to_pending(&self, id: &str) -> Result<Task> {
+        let mut task = self.load(id)?;
+        if task.status != TaskStatus::Active {
+            bail!(
+                "Cannot reset task '{}': status is '{}' (must be active)",
+                id,
+                task.status
+            );
+        }
+        task.status = TaskStatus::Pending;
+        task.assignee = None;
+        task.updated_at = Utc::now().to_rfc3339();
+        self.save(&task)?;
+        Ok(task)
+    }
+
+    /// Mark an active or pending task as failed due to a timeout.
+    ///
+    /// Unlike `fail`, this method accepts tasks in either `Active` or `Pending`
+    /// state (a pending task may time out before an agent even claims it).
+    /// Sets `timed_out_at` in addition to the standard `Failed` fields.
+    pub fn timeout_fail(&self, id: &str, error_msg: &str) -> Result<Task> {
+        let mut task = self.load(id)?;
+        if task.status != TaskStatus::Active && task.status != TaskStatus::Pending {
+            bail!(
+                "Cannot timeout task '{}': status is '{}' (must be active or pending)",
+                id,
+                task.status
+            );
+        }
+        let now = Utc::now().to_rfc3339();
+        task.status = TaskStatus::Failed;
+        task.error = Some(error_msg.to_string());
+        task.timed_out_at = Some(now.clone());
+        task.updated_at = now;
+        self.save(&task)?;
+        Ok(task)
+    }
+
     /// Summary of the queue for status display.
     pub fn queue_summary(&self) -> QueueSummary {
         let tasks = self.list(None).unwrap_or_default();
@@ -350,6 +392,9 @@ impl crate::ports::store::TaskWriter for TaskStore {
     }
     fn fail(&self, id: &str, error_msg: &str) -> Result<Task> {
         self.fail(id, error_msg)
+    }
+    fn reset_to_pending(&self, id: &str) -> Result<Task> {
+        self.reset_to_pending(id)
     }
 }
 
@@ -496,5 +541,86 @@ mod tests {
         let s = store.queue_summary();
         assert_eq!(s.pending, 2);
         assert_eq!(s.active, 0);
+    }
+
+    #[test]
+    fn test_reset_to_pending() {
+        let store = temp_store();
+        let task = store
+            .create("Reset me", TaskCriteria::default(), "kira")
+            .unwrap();
+
+        // Claim the task to make it active.
+        let claimed = store.claim_next("agent-1", "any", &[]).unwrap().unwrap();
+        assert_eq!(claimed.status, TaskStatus::Active);
+        assert_eq!(claimed.assignee.as_deref(), Some("agent-1"));
+
+        // Reset back to pending (simulates crash recovery).
+        let reset = store.reset_to_pending(&task.id).unwrap();
+        assert_eq!(reset.status, TaskStatus::Pending);
+        assert_eq!(reset.assignee, None);
+
+        // Verify the task can be claimed again.
+        let reclaimed = store.claim_next("agent-2", "any", &[]).unwrap().unwrap();
+        assert_eq!(reclaimed.status, TaskStatus::Active);
+        assert_eq!(reclaimed.assignee.as_deref(), Some("agent-2"));
+    }
+
+    #[test]
+    fn test_reset_to_pending_rejects_non_active() {
+        let store = temp_store();
+        let task = store
+            .create("Not active", TaskCriteria::default(), "kira")
+            .unwrap();
+
+        // Resetting a pending task should fail.
+        let result = store.reset_to_pending(&task.id);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must be active"));
+    }
+
+    #[test]
+    fn test_timeout_fail_active_task() {
+        let store = temp_store();
+        let task = store
+            .create("Slow task", TaskCriteria::default(), "kira")
+            .unwrap();
+
+        // Claim so it's active.
+        let claimed = store.claim_next("agent-1", "any", &[]).unwrap().unwrap();
+        assert_eq!(claimed.status, TaskStatus::Active);
+
+        // Timeout-fail it.
+        let timed = store.timeout_fail(&task.id, "timed out after 60s").unwrap();
+        assert_eq!(timed.status, TaskStatus::Failed);
+        assert!(timed.timed_out_at.is_some());
+        assert_eq!(timed.error.as_deref(), Some("timed out after 60s"));
+    }
+
+    #[test]
+    fn test_timeout_fail_pending_task() {
+        let store = temp_store();
+        let task = store
+            .create("Unclaimed task", TaskCriteria::default(), "kira")
+            .unwrap();
+
+        // Pending tasks can also be timed out.
+        let timed = store.timeout_fail(&task.id, "never claimed").unwrap();
+        assert_eq!(timed.status, TaskStatus::Failed);
+        assert!(timed.timed_out_at.is_some());
+    }
+
+    #[test]
+    fn test_timeout_fail_rejects_done_task() {
+        let store = temp_store();
+        let task = store
+            .create("Done task", TaskCriteria::default(), "kira")
+            .unwrap();
+
+        let claimed = store.claim_next("agent-1", "any", &[]).unwrap().unwrap();
+        store.complete(&claimed.id, "all good", None, None).unwrap();
+
+        let result = store.timeout_fail(&task.id, "too late");
+        assert!(result.is_err());
     }
 }

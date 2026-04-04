@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
@@ -10,6 +11,100 @@ use crate::app::worker;
 use crate::domain::statemachine::ModelDef;
 
 type Writer = std::sync::Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>;
+
+/// Send a single message to a bus target.
+///
+/// Connects to the bus, registers as `<source>-mcp`, sends the message, and
+/// disconnects. This is the canonical one-shot send helper used by MCP
+/// handlers that need to emit bus messages without maintaining a persistent
+/// connection.
+pub async fn send_bus_message(
+    bus_socket: &str,
+    source: &str,
+    target: &str,
+    payload: Value,
+    metadata: Value,
+) -> Result<()> {
+    let mut stream = UnixStream::connect(bus_socket)
+        .await
+        .with_context(|| format!("failed to connect to bus at {}", bus_socket))?;
+
+    let reg = serde_json::json!({
+        "type": "register",
+        "name": format!("{}-mcp", source),
+        "subscriptions": []
+    });
+    let mut line = serde_json::to_string(&reg)?;
+    line.push('\n');
+    stream.write_all(line.as_bytes()).await?;
+
+    let msg = serde_json::json!({
+        "type": "message",
+        "id": Uuid::new_v4().to_string(),
+        "source": source,
+        "target": target,
+        "payload": payload,
+        "metadata": metadata,
+    });
+    let mut msg_line = serde_json::to_string(&msg)?;
+    msg_line.push('\n');
+    stream.write_all(msg_line.as_bytes()).await?;
+    stream.flush().await?;
+
+    Ok(())
+}
+
+/// Dispatch the initial task for a newly created SM instance.
+///
+/// If the instance has no assignee (empty string), this is a no-op.
+/// Otherwise, sends a task message to the assignee with instance context.
+pub async fn dispatch_sm_task(
+    bus_socket: &str,
+    inst: &crate::domain::statemachine::Instance,
+    source: &str,
+) -> Result<()> {
+    if inst.assignee.is_empty() {
+        return Ok(());
+    }
+
+    let task_text = format!(
+        "---\n## Task: {}\n\n{}\n\n---\n## Metadata\ninstance_id: {}\nmodel: {}\nstate: {}",
+        inst.title, inst.body, inst.id, inst.model, inst.state
+    );
+
+    let mut stream = UnixStream::connect(bus_socket)
+        .await
+        .with_context(|| format!("failed to connect to bus at {}", bus_socket))?;
+
+    let reg = serde_json::json!({
+        "type": "register",
+        "name": format!("{}-mcp-sm", source),
+        "subscriptions": []
+    });
+    let mut line = serde_json::to_string(&reg)?;
+    line.push('\n');
+    stream.write_all(line.as_bytes()).await?;
+
+    let msg = serde_json::json!({
+        "type": "message",
+        "id": Uuid::new_v4().to_string(),
+        "source": "workflow-engine",
+        "target": &inst.assignee,
+        "payload": {
+            "task": task_text,
+            "sm_instance_id": inst.id,
+        },
+        "reply_to": format!("sm:{}", inst.id),
+        "metadata": {"priority": 5u8},
+    });
+    let mut msg_line = serde_json::to_string(&msg)?;
+    msg_line.push('\n');
+    stream.write_all(msg_line.as_bytes()).await?;
+    stream.flush().await?;
+
+    info!(instance = %inst.id, assignee = %inst.assignee, "dispatched initial task");
+    Ok(())
+}
 
 /// Notify the workflow engine that an SM instance was moved.
 ///
@@ -349,6 +444,10 @@ fn build_task_text(prompt: &str, inst: &statemachine::Instance) -> String {
 }
 
 /// On startup, find non-terminal instances and dispatch them.
+///
+/// Crash recovery: if an instance has a result but hasn't transitioned yet
+/// (deskd crashed after agent returned result but before SM transition),
+/// apply the transition now instead of re-dispatching.
 async fn dispatch_pending(
     writer: &Writer,
     models: &[ModelDef],
@@ -359,30 +458,105 @@ async fn dispatch_pending(
         Err(_) => return,
     };
 
-    for inst in &instances {
+    // Collect SM instance IDs that already have an active task-queue entry,
+    // so we don't re-dispatch if a task is already in flight.
+    let active_sm_ids: std::collections::HashSet<String> = {
+        let task_store = crate::app::task::TaskStore::default_for_home();
+        task_store
+            .list(Some(crate::app::task::TaskStatus::Active))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|t| t.sm_instance_id)
+            .collect()
+    };
+
+    for inst in instances {
         let model = match models.iter().find(|m| m.name == inst.model) {
             Some(m) => m,
             None => continue,
         };
 
         // Skip terminal instances.
-        if statemachine::is_terminal(model, inst) {
+        if statemachine::is_terminal(model, &inst) {
             continue;
         }
 
-        // Skip instances that already have a result — work was completed
-        // but the instance hasn't transitioned to a terminal state yet.
-        if inst.result.as_ref().is_some_and(|r| !r.is_empty()) {
+        // Crash recovery: result present but SM not yet transitioned.
+        // This happens when deskd crashes after the agent returns a result
+        // but before handle_completion runs the state transition.
+        if let Some(ref result) = inst.result
+            && !result.is_empty()
+        {
+            info!(
+                instance = %inst.id,
+                state = %inst.state,
+                "recovery: result present but not transitioned, applying transition"
+            );
+            let mut inst_mut = inst.clone();
+            if let Err(e) =
+                handle_completion_sync(writer, models, store, &mut inst_mut, result).await
+            {
+                warn!(instance = %inst.id, error = %e, "recovery: failed to apply transition from existing result");
+            }
+            continue;
+        }
+
+        // Idempotency: skip dispatch if a task-queue task is already active
+        // for this SM instance (re-dispatch would cause duplicate work).
+        if active_sm_ids.contains(&inst.id) {
+            info!(
+                instance = %inst.id,
+                "idempotency: active task already exists for instance, skipping dispatch"
+            );
             continue;
         }
 
         // Dispatch if has assignee (pending work).
         if !inst.assignee.is_empty()
-            && let Err(e) = dispatch_instance(writer, model, inst).await
+            && let Err(e) = dispatch_instance(writer, model, &inst).await
         {
             warn!(instance = %inst.id, error = %e, "failed to dispatch pending instance");
         }
     }
+}
+
+/// Apply the transition for an instance that already has a result stored
+/// (used during crash recovery in dispatch_pending).
+async fn handle_completion_sync(
+    writer: &Writer,
+    models: &[ModelDef],
+    store: &statemachine::StateMachineStore,
+    inst: &mut statemachine::Instance,
+    result: &str,
+) -> anyhow::Result<()> {
+    let model = models
+        .iter()
+        .find(|m| m.name == inst.model)
+        .ok_or_else(|| anyhow::anyhow!("model '{}' not found", inst.model))?;
+
+    let current_state = inst.state.clone();
+    let target_state = find_next_state(model, &current_state, result);
+
+    if let Some(target) = target_state {
+        store.move_to(inst, model, &target, "recovery", Some(result), None, None)?;
+        info!(
+            instance = %inst.id,
+            from = %current_state,
+            to = %target,
+            "recovery: transition applied from stored result"
+        );
+        if !statemachine::is_terminal(model, inst) {
+            dispatch_instance(writer, model, inst).await?;
+        }
+    } else {
+        info!(
+            instance = %inst.id,
+            state = %current_state,
+            "recovery: no matching transition for stored result, awaiting manual move"
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -755,5 +929,81 @@ mod tests {
         let model = test_model();
         let transition = model.transitions.iter().find(|t| t.to == "review").unwrap();
         assert!(transition.criteria.is_none());
+    }
+
+    // ─── Crash recovery tests ────────────────────────────────────────────────
+
+    /// handle_completion_sync applies the correct transition from a stored result.
+    #[tokio::test]
+    async fn test_handle_completion_sync_applies_transition() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sm_dir = std::path::PathBuf::from(format!("/tmp/deskd_recovery_test_{}", ts));
+        let store = statemachine::StateMachineStore::new(sm_dir.clone());
+        let models = vec![test_model()];
+
+        // Create instance in "draft" state with a result already stored (simulating the crash gap).
+        let mut inst = store
+            .create(&models[0], "Recovery Test", "body", "kira")
+            .unwrap();
+        inst.result = Some("anything".into());
+        inst.updated_at = chrono::Utc::now().to_rfc3339();
+        store.save(&inst).unwrap();
+        assert_eq!(inst.state, "draft");
+
+        // Connect a minimal writer (we won't be writing to it in this test but need the type).
+        // Use a socketpair to satisfy the Writer type without a real bus.
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        let (_reader, writer_half) = a.into_split();
+        let writer: Writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer_half));
+
+        handle_completion_sync(&writer, &models, &store, &mut inst, "anything")
+            .await
+            .unwrap();
+
+        // "draft" + any result -> auto trigger -> "review"
+        let reloaded = store.load(&inst.id).unwrap();
+        assert_eq!(reloaded.state, "review");
+        assert_eq!(reloaded.history.last().unwrap().trigger, "recovery");
+
+        let _ = std::fs::remove_dir_all(&sm_dir);
+    }
+
+    /// handle_completion_sync does nothing when no matching transition exists.
+    #[tokio::test]
+    async fn test_handle_completion_sync_no_matching_transition() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sm_dir = std::path::PathBuf::from(format!("/tmp/deskd_recovery_no_trans_test_{}", ts));
+        let store = statemachine::StateMachineStore::new(sm_dir.clone());
+        let models = vec![test_model()];
+
+        // Put instance in "review" with a non-matching result (neither LGTM nor REJECT).
+        let mut inst = store
+            .create(&models[0], "No Transition Test", "body", "kira")
+            .unwrap();
+        store
+            .move_to(&mut inst, &models[0], "review", "manual", None, None, None)
+            .unwrap();
+        inst.result = Some("not sure yet".into());
+        store.save(&inst).unwrap();
+
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        let (_reader, writer_half) = a.into_split();
+        let writer: Writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer_half));
+
+        handle_completion_sync(&writer, &models, &store, &mut inst, "not sure yet")
+            .await
+            .unwrap();
+
+        // State should remain "review" — no valid transition for "not sure yet".
+        let reloaded = store.load(&inst.id).unwrap();
+        assert_eq!(reloaded.state, "review");
+
+        let _ = std::fs::remove_dir_all(&sm_dir);
     }
 }

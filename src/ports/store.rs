@@ -56,6 +56,8 @@ pub trait TaskWriter: Send + Sync {
         turns: Option<u32>,
     ) -> Result<Task>;
     fn fail(&self, id: &str, error_msg: &str) -> Result<Task>;
+    /// Reset an active task back to pending (crash recovery).
+    fn reset_to_pending(&self, id: &str) -> Result<Task>;
 }
 
 /// Combined task persistence trait for code that needs both read and write access.

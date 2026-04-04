@@ -6,85 +6,46 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::app::acp;
-use crate::app::agent::{self, TokenUsage};
+use crate::app::agent::{self};
 use crate::app::message::Message;
 use crate::app::tasklog;
 use crate::app::unified_inbox;
 use crate::domain::agent::AgentRuntime;
 use crate::infra::dto::ConfigSessionMode;
+use crate::ports::executor::{Executor, TaskLimits, TokenUsage, TurnResult};
 
-/// Wrapper for either a Claude or ACP agent process.
-enum RuntimeProcess {
-    Claude(agent::AgentProcess),
-    Acp(Box<acp::AcpProcess>),
+/// Spawn the appropriate executor process for the given runtime.
+async fn start_executor(
+    name: &str,
+    bus_socket: &str,
+    runtime: &AgentRuntime,
+) -> Result<Box<dyn Executor>> {
+    match runtime {
+        AgentRuntime::Claude => {
+            let p = agent::AgentProcess::start(name, bus_socket).await?;
+            Ok(Box::new(p))
+        }
+        AgentRuntime::Acp => {
+            let p = acp::AcpProcess::start(name, bus_socket).await?;
+            Ok(Box::new(p))
+        }
+    }
 }
 
-impl RuntimeProcess {
-    async fn start(name: &str, bus_socket: &str, runtime: &AgentRuntime) -> Result<Self> {
-        match runtime {
-            AgentRuntime::Claude => {
-                let p = agent::AgentProcess::start(name, bus_socket).await?;
-                Ok(Self::Claude(p))
-            }
-            AgentRuntime::Acp => {
-                let p = acp::AcpProcess::start(name, bus_socket).await?;
-                Ok(Self::Acp(Box::new(p)))
-            }
+/// Spawn a fresh executor process (ignoring any stored session).
+async fn start_fresh_executor(
+    name: &str,
+    bus_socket: &str,
+    runtime: &AgentRuntime,
+) -> Result<Box<dyn Executor>> {
+    match runtime {
+        AgentRuntime::Claude => {
+            let p = agent::AgentProcess::start_fresh(name, bus_socket).await?;
+            Ok(Box::new(p))
         }
-    }
-
-    async fn start_fresh(name: &str, bus_socket: &str, runtime: &AgentRuntime) -> Result<Self> {
-        match runtime {
-            AgentRuntime::Claude => {
-                let p = agent::AgentProcess::start_fresh(name, bus_socket).await?;
-                Ok(Self::Claude(p))
-            }
-            AgentRuntime::Acp => {
-                let p = acp::AcpProcess::start_fresh(name, bus_socket).await?;
-                Ok(Self::Acp(Box::new(p)))
-            }
-        }
-    }
-
-    async fn send_task(
-        &self,
-        message: &str,
-        progress_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
-        image: Option<(&str, &str)>,
-        limits: &agent::TaskLimits,
-    ) -> Result<agent::TurnResult> {
-        match self {
-            Self::Claude(p) => p.send_task(message, progress_tx, image, limits).await,
-            Self::Acp(p) => {
-                // ACP doesn't support image content — include note if image was provided.
-                let effective_message = if image.is_some() {
-                    format!(
-                        "[Note: image attachment not supported via ACP]\n{}",
-                        message
-                    )
-                } else {
-                    message.to_string()
-                };
-                p.send_task(&effective_message, progress_tx, limits).await
-            }
-        }
-    }
-
-    fn inject_message(&self, message: &str) -> Result<()> {
-        match self {
-            Self::Claude(p) => p.inject_message(message),
-            Self::Acp(_) => {
-                // ACP doesn't support mid-task message injection.
-                warn!("ACP runtime does not support mid-task message injection");
-                Ok(())
-            }
-        }
-    }
-
-    async fn stop(&self) {
-        match self {
-            Self::Claude(p) => p.stop().await,
-            Self::Acp(p) => p.stop().await,
+        AgentRuntime::Acp => {
+            let p = acp::AcpProcess::start_fresh(name, bus_socket).await?;
+            Ok(Box::new(p))
         }
     }
 }
@@ -223,10 +184,10 @@ pub async fn run(
     // Start persistent agent process (reused across tasks).
     let effective_bus = bus_socket.as_deref().unwrap_or(socket_path).to_string();
     let agent_runtime: AgentRuntime = initial_state.config.runtime.clone().into();
-    let mut process = RuntimeProcess::start(name, &effective_bus, &agent_runtime).await?;
+    let mut process = start_executor(name, &effective_bus, &agent_runtime).await?;
 
     // Build task limits from agent config — enforced in real-time during tasks.
-    let limits = agent::TaskLimits {
+    let limits = TaskLimits {
         max_turns: if initial_state.config.max_turns > 0 {
             Some(initial_state.config.max_turns)
         } else {
@@ -236,6 +197,15 @@ pub async fn run(
     };
 
     info!(agent = %name, runtime = ?agent_runtime, "agent process ready, waiting for tasks");
+
+    // Startup recovery: scan for orphaned task-queue entries left over from a crash.
+    //
+    // Two classes of orphans:
+    // 1. Active tasks with a result set — agent returned a result but deskd crashed
+    //    before the task was marked Done. Re-complete them so downstream SM can advance.
+    // 2. Active tasks without a result assigned to *this* agent — deskd crashed mid-task.
+    //    Reset them to Pending so they can be re-claimed.
+    recover_orphaned_tasks(name);
 
     // Task queue polling interval (30 seconds).
     let mut queue_poll = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -367,7 +337,7 @@ pub async fn run(
         if needs_fresh {
             info!(agent = %name, fresh = msg.metadata.fresh, "fresh session requested, restarting process");
             process.stop().await;
-            process = RuntimeProcess::start_fresh(name, &effective_bus, &agent_runtime).await?;
+            process = start_fresh_executor(name, &effective_bus, &agent_runtime).await?;
         }
 
         let task = &ctx.task_formatted;
@@ -529,7 +499,7 @@ pub async fn run(
                     handle_task_failure(name, &msg, &ctx, e, task_duration_ms, &writer).await;
                 if needs_restart {
                     warn!(agent = %name, "agent process crashed, restarting with fresh session");
-                    match RuntimeProcess::start_fresh(name, &effective_bus, &agent_runtime).await {
+                    match start_fresh_executor(name, &effective_bus, &agent_runtime).await {
                         Ok(new_proc) => {
                             process = new_proc;
                             info!(agent = %name, "agent process restarted (fresh session)");
@@ -782,7 +752,7 @@ async fn handle_task_success(
     name: &str,
     msg: &Message,
     ctx: &TaskContext,
-    turn: &agent::TurnResult,
+    turn: &TurnResult,
     full_response: String,
     task_duration_ms: u64,
     task_duration_secs: u64,
@@ -1110,6 +1080,64 @@ fn truncate(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Scan the task queue for orphaned entries left over from a previous crash.
+///
+/// Orphan classes handled:
+/// - **Active + result set**: the agent completed its work and stored a result, but deskd
+///   crashed before the task could be marked Done.  We call `complete()` now so that the
+///   workflow engine can advance the linked SM instance on its next startup scan.
+/// - **Active + no result + assigned to this agent**: deskd crashed mid-execution. We
+///   reset the task back to Pending so it will be re-claimed and retried.
+fn recover_orphaned_tasks(agent_name: &str) {
+    let store = crate::app::task::TaskStore::default_for_home();
+    let active_tasks = match store.list(Some(crate::app::task::TaskStatus::Active)) {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            warn!(agent = %agent_name, error = %e, "recovery: failed to list active tasks");
+            return;
+        }
+    };
+
+    for task in active_tasks {
+        let assigned_to_me = task.assignee.as_deref() == Some(agent_name);
+
+        if let Some(ref result) = task.result
+            && !result.is_empty()
+        {
+            // Active task already has a result — complete it now.
+            info!(
+                agent = %agent_name,
+                task_id = %task.id,
+                "recovery: active task has result, marking done"
+            );
+            if let Err(e) = store.complete(&task.id, result, task.cost_usd, task.turns) {
+                warn!(
+                    agent = %agent_name,
+                    task_id = %task.id,
+                    error = %e,
+                    "recovery: failed to mark orphaned task done"
+                );
+            }
+        } else if assigned_to_me {
+            // Active task assigned to us but no result — crashed mid-execution.
+            // Reset to Pending so it can be retried.
+            info!(
+                agent = %agent_name,
+                task_id = %task.id,
+                "recovery: active task without result assigned to this agent, resetting to pending"
+            );
+            if let Err(e) = store.reset_to_pending(&task.id) {
+                warn!(
+                    agent = %agent_name,
+                    task_id = %task.id,
+                    error = %e,
+                    "recovery: failed to reset orphaned task to pending"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
