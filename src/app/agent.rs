@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{self, ContainerConfig, UserConfig};
 use crate::infra::dto::{ConfigAgentRuntime, ConfigContextConfig, ConfigSessionMode};
@@ -898,6 +898,61 @@ fn truncate_stderr(s: &str) -> &str {
     }
 }
 
+/// Check whether a freshly spawned process stays alive for at least 5 seconds.
+///
+/// Returns `Ok(event_rx)` if the process is still running after the window.
+/// Returns `Err(...)` with a descriptive message if the process exits immediately —
+/// indicating a bad image, bad mounts, auth failure, or similar startup error.
+async fn check_fresh_startup(
+    name: &str,
+    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<StdoutEvent>,
+) -> Result<tokio::sync::mpsc::UnboundedReceiver<StdoutEvent>> {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match event_rx.try_recv() {
+                Ok(StdoutEvent::ProcessExited {
+                    exit_code,
+                    stderr_tail,
+                    ..
+                }) => return Some((exit_code, stderr_tail)),
+                Ok(_) => {
+                    // Got a real event — process is alive.
+                    return None;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(_) => {
+                    // Channel closed unexpectedly.
+                    return Some((None, String::new()));
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or(None); // timeout reached = process is alive
+
+    if let Some((exit_code, stderr_tail)) = result {
+        let code_str = exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        error!(
+            agent = %name,
+            exit_code = %code_str,
+            stderr = %truncate_stderr(&stderr_tail),
+            "container/process exited immediately after fresh start — check image, mounts, and auth"
+        );
+        bail!(
+            "process for agent '{}' exited immediately (exit_code={}). stderr: {}",
+            name,
+            code_str,
+            truncate_stderr(&stderr_tail)
+        );
+    }
+
+    Ok(event_rx)
+}
+
 /// A long-lived Claude process that accepts multiple tasks via stdin.
 ///
 /// Usage:
@@ -938,29 +993,37 @@ impl AgentProcess {
             // Check if the process exits immediately (stale session).
             // Give it up to 5 seconds — a healthy process stays alive.
             let mut event_rx_guard = event_rx;
-            let exited_immediately =
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    // Peek: if we get ProcessExited quickly, session was stale.
-                    loop {
-                        match event_rx_guard.try_recv() {
-                            Ok(StdoutEvent::ProcessExited { .. }) => return true,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                            }
-                            _ => {
-                                // Got a real event (TextBlock, Result) — process is alive.
-                                return false;
-                            }
+            let stale_exit = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                // Peek: if we get ProcessExited quickly, session was stale.
+                loop {
+                    match event_rx_guard.try_recv() {
+                        Ok(StdoutEvent::ProcessExited {
+                            exit_code,
+                            stderr_tail,
+                            ..
+                        }) => return Some((exit_code, stderr_tail)),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                        _ => {
+                            // Got a real event (TextBlock, Result) — process is alive.
+                            return None;
                         }
                     }
-                })
-                .await
-                .unwrap_or(false); // timeout = process is alive
+                }
+            })
+            .await
+            .unwrap_or(None); // timeout = process is alive
 
-            if exited_immediately {
+            if let Some((exit_code, stderr_tail)) = stale_exit {
+                let code_str = exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".to_string());
                 warn!(
                     agent = %name,
                     session_id = %state.session_id,
+                    exit_code = %code_str,
+                    stderr = %truncate_stderr(&stderr_tail),
                     "process exited immediately with --resume (stale session), retrying fresh"
                 );
 
@@ -970,9 +1033,17 @@ impl AgentProcess {
                     save_state_pub(&s).ok();
                 }
 
-                // Retry with fresh session.
+                // Retry with fresh session — verify the retry also stays alive.
                 let (stdin_tx2, event_rx2, child2) =
                     Self::spawn_process(name, bus_socket, true).await?;
+                let event_rx2 = check_fresh_startup(name, event_rx2).await.map_err(|e| {
+                    error!(
+                        agent = %name,
+                        error = %e,
+                        "stale-session retry also failed — container cannot start"
+                    );
+                    e
+                })?;
                 return Ok(Self {
                     stdin_tx: stdin_tx2,
                     event_rx: tokio::sync::Mutex::new(event_rx2),
@@ -994,6 +1065,9 @@ impl AgentProcess {
             });
         }
 
+        // Fresh start (no --resume): verify the process stays alive before reporting ready.
+        let event_rx = check_fresh_startup(name, event_rx).await?;
+
         Ok(Self {
             stdin_tx,
             event_rx: tokio::sync::Mutex::new(event_rx),
@@ -1007,6 +1081,9 @@ impl AgentProcess {
     /// Spawn a persistent Claude process with a fresh session (no --resume).
     pub async fn start_fresh(name: &str, bus_socket: &str) -> Result<Self> {
         let (stdin_tx, event_rx, child) = Self::spawn_process(name, bus_socket, true).await?;
+
+        // Verify the process stays alive before reporting it ready.
+        let event_rx = check_fresh_startup(name, event_rx).await?;
 
         Ok(Self {
             stdin_tx,
@@ -1144,6 +1221,23 @@ impl AgentProcess {
 
         let mut cmd = build_command(&state.config, &args, &extra_env);
         cmd.stdin(Stdio::piped());
+
+        // Log the full command at DEBUG so failures can be reproduced manually.
+        {
+            let std_cmd = cmd.as_std();
+            let program = std_cmd.get_program().to_string_lossy();
+            let cmd_args: Vec<String> = std_cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            debug!(
+                agent = %name,
+                command = %program,
+                args = ?cmd_args,
+                "spawning persistent process"
+            );
+        }
+
         let mut child = cmd
             .spawn()
             .context("Failed to spawn persistent claude process")?;
