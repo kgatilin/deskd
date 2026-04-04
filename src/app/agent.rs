@@ -2136,4 +2136,3 @@ created_at: "2024-01-01T00:00:00Z"
         assert!(args.contains(&"DESKD_BUS_SOCKET=/tmp/bus.sock".to_string()));
     }
 }
-// TEST COMMENT
