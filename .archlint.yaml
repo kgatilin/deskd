@@ -5,8 +5,8 @@
 # All rules use the flat schema: rules.<rule>.{enabled, level, threshold, exclude}
 # Levels: taboo (CI blocker, exit 1) | telemetry (track, exit 0) | personal (info, exit 0)
 #
-# Current health: 80/100 — 4 violations (dip x4, all telemetry-level)
-# Remaining violations tracked in issues #193, #195, #196.
+# Current health: 80/100 — remaining violations tracked in issues #193, #195.
+# DIP exceptions for data-only modules configured in #196.
 
 # Domain Model
 # =============
@@ -119,15 +119,32 @@ rules:
       - "src::app"
 
   # DIP: modules with structs but no trait definitions.
-  # Active work: #193 (Executor trait), #195 (MCP handlers), #196 (data-only exceptions).
+  # Active work: #193 (Executor trait), #195 (MCP handlers).
+  # Exceptions for data-only modules configured per #196 — see justifications below.
   dip:
     enabled: true
     level: telemetry
     exclude:
-      - "src::domain::message"
-      - "src::domain::context"
-      - "src::domain::task"
-      - "src::domain::statemachine"
-      - "src::config"
-      - "src::infra::dto"
-      - "src::bin::session2graph"
+      # Domain value objects — pure data carriers, no behaviour.
+      # Traits that abstract over these types live in ports/bus.rs and ports/store.rs
+      # (MessageBus, TaskRepository, StateMachineRepository). The linter cannot infer
+      # cross-module trait association, so these are correctly excepted.
+      - "src::domain::message"      # 3 structs — value objects for bus protocol
+      - "src::domain::context"      # domain context value object
+      - "src::domain::task"         # 3 structs — task/result value objects; repo trait in ports/store.rs
+      - "src::domain::statemachine" # 4 structs — SM value objects; trait in ports/store.rs
+
+      # Config parsing layer — a DTO, not a service. It is never abstracted behind
+      # a trait because it is only ever read once at startup. Adding traits here
+      # would be YAGNI and obscure the module's intent.
+      - "src::config"               # 14 structs — YAML config parsing DTOs
+
+      # Serde anti-corruption layer (ACL). infra/dto.rs exists specifically to hold
+      # wire-format structs so that serde derives never leak into the domain. Traits
+      # would be meaningless here — this boundary is structural, not behavioural.
+      - "src::infra::dto"           # 15 structs — serde ACL, wire ↔ domain mapping
+
+      # Standalone binary — not part of the hexagonal architecture. session2graph
+      # reads session logs and emits DOT graphs; it has no injected dependencies
+      # and therefore no need for DIP.
+      - "src::bin::session2graph"   # 13 structs — standalone CLI, outside hex arch
