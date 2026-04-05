@@ -113,7 +113,7 @@ rules:
   shotgun_surgery:
     enabled: true
     level: telemetry
-    threshold: 15
+    threshold: 12    # tightened from 15; max actual fan-in is 11 (infra::dto), catches regressions
     exclude:
       - "src::domain"
       - "src::app"
