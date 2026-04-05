@@ -813,65 +813,8 @@ pub async fn remove(name: &str) -> Result<()> {
 
 // ─── Persistent agent process ─────────────────────────────────────────────────
 
-/// External limits enforced during a task. All control lives outside Claude.
-#[derive(Debug, Clone, Default)]
-pub struct TaskLimits {
-    /// Max assistant turns (tool-use loops) before killing the process.
-    pub max_turns: Option<u32>,
-    /// Max cumulative cost (USD) for this agent before killing.
-    pub budget_usd: Option<f64>,
-}
-
-/// Accumulated token usage across all messages in a task.
-#[derive(Debug, Clone, Default)]
-pub struct TokenUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_creation_input_tokens: u64,
-    pub cache_read_input_tokens: u64,
-}
-
-impl TokenUsage {
-    /// Merge another `TokenUsage` into this one (struct-to-struct).
-    pub fn merge(&mut self, other: &TokenUsage) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
-        self.cache_read_input_tokens += other.cache_read_input_tokens;
-    }
-
-    /// Accumulate usage from a parsed JSON value.
-    /// Expects the `usage` object from a Claude assistant message.
-    pub fn accumulate(&mut self, usage: &serde_json::Value) {
-        if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-            self.input_tokens += v;
-        }
-        if let Some(v) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
-            self.output_tokens += v;
-        }
-        if let Some(v) = usage
-            .get("cache_creation_input_tokens")
-            .and_then(|v| v.as_u64())
-        {
-            self.cache_creation_input_tokens += v;
-        }
-        if let Some(v) = usage
-            .get("cache_read_input_tokens")
-            .and_then(|v| v.as_u64())
-        {
-            self.cache_read_input_tokens += v;
-        }
-    }
-}
-
-/// Result of a single Claude turn (task).
-pub struct TurnResult {
-    pub response_text: String,
-    pub session_id: String,
-    pub cost_usd: f64,
-    pub num_turns: u32,
-    pub token_usage: TokenUsage,
-}
+// Re-export executor port types — canonical definitions live in ports::executor.
+pub use crate::ports::executor::{Executor, TaskLimits, TokenUsage, TurnResult};
 
 /// Events emitted by the stdout reader task.
 enum StdoutEvent {
@@ -1703,6 +1646,26 @@ impl AgentProcess {
             let _ = child.wait().await;
         }
         info!(agent = %self.name, "persistent process stopped");
+    }
+}
+
+impl Executor for AgentProcess {
+    fn send_task<'a>(
+        &'a self,
+        message: &'a str,
+        progress_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<String>>,
+        image: Option<(&'a str, &'a str)>,
+        limits: &'a TaskLimits,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TurnResult>> + Send + 'a>> {
+        Box::pin(self.send_task(message, progress_tx, image, limits))
+    }
+
+    fn inject_message(&self, message: &str) -> Result<()> {
+        self.inject_message(message)
+    }
+
+    fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(self.stop())
     }
 }
 

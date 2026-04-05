@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
-use crate::app::agent::{self, AgentConfig, TaskLimits, TokenUsage, TurnResult, build_command};
+use crate::app::agent::{
+    self, AgentConfig, Executor, TaskLimits, TokenUsage, TurnResult, build_command,
+};
 use crate::infra::dto::ConfigSessionMode;
 
 // ─── JSON-RPC 2.0 types ─────────────────────────────────────────────────────
@@ -664,6 +666,39 @@ impl AcpProcess {
             let _ = child.wait().await;
         }
         info!(agent = %self.name, "ACP process stopped");
+    }
+}
+
+impl Executor for AcpProcess {
+    fn send_task<'a>(
+        &'a self,
+        message: &'a str,
+        progress_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<String>>,
+        image: Option<(&'a str, &'a str)>,
+        limits: &'a TaskLimits,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TurnResult>> + Send + 'a>> {
+        Box::pin(async move {
+            // ACP doesn't support image content — include note if image was provided.
+            let effective_message = if image.is_some() {
+                format!(
+                    "[Note: image attachment not supported via ACP]\n{}",
+                    message
+                )
+            } else {
+                message.to_string()
+            };
+            self.send_task(&effective_message, progress_tx, limits)
+                .await
+        })
+    }
+
+    fn inject_message(&self, _message: &str) -> Result<()> {
+        warn!("ACP runtime does not support mid-task message injection");
+        Ok(())
+    }
+
+    fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(self.stop())
     }
 }
 

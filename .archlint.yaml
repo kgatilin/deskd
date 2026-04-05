@@ -5,8 +5,8 @@
 # All rules use the flat schema: rules.<rule>.{enabled, level, threshold, exclude}
 # Levels: taboo (CI blocker, exit 1) | telemetry (track, exit 0) | personal (info, exit 0)
 #
-# Current health: 80/100 — remaining violations tracked in issues #193, #195.
-# DIP exceptions for data-only modules configured in #196.
+# Current health: 90/100 — DIP resolved (#193, #195, #196).
+# Remaining telemetry: fan-out, SRP on large modules.
 
 # Domain Model
 # =============
@@ -119,8 +119,8 @@ rules:
       - "src::app"
 
   # DIP: modules with structs but no trait definitions.
-  # Active work: #193 (Executor trait), #195 (MCP handlers).
-  # Exceptions for data-only modules configured per #196 — see justifications below.
+  # Resolved: #193 (Executor trait), #195 (MCP extraction), #196 (data-only exceptions).
+  # All remaining DIP exceptions are justified below.
   dip:
     enabled: true
     level: telemetry
@@ -143,6 +143,16 @@ rules:
       # wire-format structs so that serde derives never leak into the domain. Traits
       # would be meaningless here — this boundary is structural, not behavioural.
       - "src::infra::dto"           # 15 structs — serde ACL, wire ↔ domain mapping
+
+      # Agent process module — AgentProcess now implements ports::executor::Executor.
+      # Remaining structs (AgentConfig, AgentState) are config/state DTOs, not services.
+      # The DIP violation is resolved via the Executor trait; the DTOs are correctly
+      # excepted for the same reason as config and dto modules above.
+      - "src::app::agent"           # 3 structs — AgentProcess (impl Executor), AgentConfig, AgentState
+
+      # ACP (Agent Client Protocol) module — AcpProcess implements Executor.
+      # Remaining structs are JSON-RPC protocol types (wire format, not domain).
+      - "src::app::acp"             # AcpProcess (impl Executor) + JSON-RPC DTOs
 
       # Standalone binary — not part of the hexagonal architecture. session2graph
       # reads session logs and emits DOT graphs; it has no injected dependencies
