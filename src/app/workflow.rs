@@ -286,10 +286,16 @@ async fn dispatch_instance(
     if let Some(criteria) = transition_criteria {
         // Dispatch via task queue (pull-based).
         let store = crate::app::task::TaskStore::default_for_home();
-        let task = store.create_for_sm(&task_text, criteria, "workflow-engine", &inst.id)?;
+        let max_retries = transition_def.map(|t| t.max_retries).unwrap_or(0);
+        let mut task = store.create_for_sm(&task_text, criteria, "workflow-engine", &inst.id)?;
+        if max_retries > 0 {
+            task.max_retries = max_retries;
+            store.save_pub(&task)?;
+        }
         info!(
             instance = %inst.id,
             task_id = %task.id,
+            max_retries = max_retries,
             "task created in queue for SM dispatch"
         );
         return Ok(());
@@ -415,6 +421,7 @@ mod tests {
                     timeout: None,
                     timeout_goto: None,
                     criteria: None,
+                    max_retries: 0,
                 },
                 TransitionDef {
                     from: "review".into(),
@@ -428,6 +435,7 @@ mod tests {
                     timeout: None,
                     timeout_goto: None,
                     criteria: None,
+                    max_retries: 0,
                 },
                 TransitionDef {
                     from: "review".into(),
@@ -441,6 +449,7 @@ mod tests {
                     timeout: None,
                     timeout_goto: None,
                     criteria: None,
+                    max_retries: 0,
                 },
             ],
         }
@@ -509,6 +518,7 @@ mod tests {
                     timeout: None,
                     timeout_goto: None,
                     criteria: None,
+                    max_retries: 0,
                 },
                 TransitionDef {
                     from: "a".into(),
@@ -522,6 +532,7 @@ mod tests {
                     timeout: None,
                     timeout_goto: None,
                     criteria: None,
+                    max_retries: 0,
                 },
             ],
         };
@@ -611,6 +622,7 @@ mod tests {
                         model: Some("claude-sonnet-4-6".into()),
                         labels: vec!["planning".into()],
                     }),
+                    max_retries: 0,
                 },
                 TransitionDef {
                     from: "planning".into(),
@@ -627,6 +639,7 @@ mod tests {
                         model: Some("claude-sonnet-4-6".into()),
                         labels: vec![],
                     }),
+                    max_retries: 0,
                 },
                 TransitionDef {
                     from: "implementing".into(),
@@ -640,6 +653,7 @@ mod tests {
                     timeout: None,
                     timeout_goto: None,
                     criteria: None,
+                    max_retries: 0,
                 },
             ],
         }
