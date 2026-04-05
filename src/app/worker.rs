@@ -6,7 +6,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::app::acp;
-use crate::app::agent::{self, TokenUsage};
+use crate::app::agent::{self, Executor, TokenUsage};
 use crate::app::message::Message;
 use crate::app::tasklog;
 use crate::app::unified_inbox;
@@ -14,6 +14,10 @@ use crate::domain::agent::AgentRuntime;
 use crate::infra::dto::ConfigSessionMode;
 
 /// Wrapper for either a Claude or ACP agent process.
+///
+/// Both variants implement `ports::executor::Executor`. This enum provides
+/// static dispatch over the two supported runtimes. Adding a new executor
+/// backend (Gemini, Ollama) requires only a new variant + `Executor` impl.
 enum RuntimeProcess {
     Claude(agent::AgentProcess),
     Acp(Box<acp::AcpProcess>),
@@ -45,7 +49,10 @@ impl RuntimeProcess {
             }
         }
     }
+}
 
+/// Delegate all Executor trait methods through the enum variants.
+impl Executor for RuntimeProcess {
     async fn send_task(
         &self,
         message: &str,
@@ -56,16 +63,7 @@ impl RuntimeProcess {
         match self {
             Self::Claude(p) => p.send_task(message, progress_tx, image, limits).await,
             Self::Acp(p) => {
-                // ACP doesn't support image content — include note if image was provided.
-                let effective_message = if image.is_some() {
-                    format!(
-                        "[Note: image attachment not supported via ACP]\n{}",
-                        message
-                    )
-                } else {
-                    message.to_string()
-                };
-                p.send_task(&effective_message, progress_tx, limits).await
+                Executor::send_task(p.as_ref(), message, progress_tx, image, limits).await
             }
         }
     }
@@ -73,18 +71,14 @@ impl RuntimeProcess {
     fn inject_message(&self, message: &str) -> Result<()> {
         match self {
             Self::Claude(p) => p.inject_message(message),
-            Self::Acp(_) => {
-                // ACP doesn't support mid-task message injection.
-                warn!("ACP runtime does not support mid-task message injection");
-                Ok(())
-            }
+            Self::Acp(p) => Executor::inject_message(p.as_ref(), message),
         }
     }
 
     async fn stop(&self) {
         match self {
             Self::Claude(p) => p.stop().await,
-            Self::Acp(p) => p.stop().await,
+            Self::Acp(p) => Executor::stop(p.as_ref()).await,
         }
     }
 }

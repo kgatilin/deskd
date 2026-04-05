@@ -74,19 +74,21 @@ pub trait Executor: Send {
     /// Send a task to the executor and wait for completion.
     ///
     /// `progress_tx` receives streaming text chunks for real-time progress.
+    /// `image` is an optional (base64_data, media_type) pair for image attachments.
     fn send_task(
         &self,
         message: &str,
         progress_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+        image: Option<(&str, &str)>,
         limits: &TaskLimits,
     ) -> impl std::future::Future<Output = Result<TurnResult>> + Send;
 
-    /// Check if the underlying process is alive.
-    fn is_alive(&self) -> impl std::future::Future<Output = bool> + Send;
+    /// Inject a message into an in-progress task (mid-task message).
+    /// Returns Ok(()) if supported, or a warning if not.
+    fn inject_message(&self, _message: &str) -> Result<()> {
+        Ok(())
+    }
 
     /// Gracefully stop the executor.
     fn stop(&self) -> impl std::future::Future<Output = ()> + Send;
-
-    /// Forcefully kill the executor.
-    fn kill(&self) -> impl std::future::Future<Output = ()> + Send;
 }
