@@ -237,6 +237,9 @@ pub async fn run(
 
     info!(agent = %name, runtime = ?agent_runtime, "agent process ready, waiting for tasks");
 
+    // Startup recovery: handle orphaned active tasks assigned to this agent.
+    recover_orphaned_tasks(name);
+
     // Task queue polling interval (30 seconds).
     let mut queue_poll = tokio::time::interval(std::time::Duration::from_secs(30));
     queue_poll.tick().await; // skip first immediate tick
@@ -773,6 +776,53 @@ fn log_skip(name: &str, msg: &Message, ctx: &TaskContext, status: &str, error: O
     };
     if let Err(e) = tasklog::log_task(name, &log_entry) {
         warn!(agent = %name, error = %e, "failed to write task log");
+    }
+}
+
+/// On startup, find active tasks assigned to this agent and handle them.
+///
+/// If deskd crashed while this agent was processing a task, the task is stuck in
+/// Active status with no one working on it. Tasks with results are completed;
+/// tasks without results are marked as Failed for visibility.
+fn recover_orphaned_tasks(agent_name: &str) {
+    let store = crate::app::task::TaskStore::default_for_home();
+    let active_tasks = match store.list(Some(crate::domain::task::TaskStatus::Active)) {
+        Ok(tasks) => tasks,
+        Err(_) => return,
+    };
+
+    for task in active_tasks {
+        if task.assignee.as_deref() != Some(agent_name) {
+            continue;
+        }
+
+        // If the task already has a result, complete it.
+        if task.result.as_ref().is_some_and(|r| !r.is_empty()) {
+            info!(
+                agent = %agent_name,
+                task_id = %task.id,
+                "recovering orphaned task with result: completing"
+            );
+            if let Err(e) =
+                store.complete(&task.id, task.result.as_deref().unwrap_or(""), None, None)
+            {
+                warn!(agent = %agent_name, task_id = %task.id, error = %e, "failed to complete orphaned task");
+            }
+            continue;
+        }
+
+        // No result — mark as Failed. Manual retry or dead-letter will handle it.
+        info!(
+            agent = %agent_name,
+            task_id = %task.id,
+            "marking orphaned active task as Failed (no result, agent crashed)"
+        );
+        if let Err(e) = store.fail(
+            &task.id,
+            &format!("agent {} crashed — task requires manual retry", agent_name),
+        ) {
+            warn!(agent = %agent_name, task_id = %task.id, error = %e, "failed to mark orphaned task as failed");
+        }
     }
 }
 

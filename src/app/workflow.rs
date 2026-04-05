@@ -349,6 +349,10 @@ fn build_task_text(prompt: &str, inst: &statemachine::Instance) -> String {
 }
 
 /// On startup, find non-terminal instances and dispatch them.
+///
+/// Crash recovery: if an instance has a result but hasn't transitioned
+/// (crash between result storage and transition), apply the transition
+/// from the stored result instead of re-dispatching.
 async fn dispatch_pending(
     writer: &Writer,
     models: &[ModelDef],
@@ -358,6 +362,16 @@ async fn dispatch_pending(
         Ok(list) => list,
         Err(_) => return,
     };
+
+    // Build a set of SM instance IDs that already have an active task,
+    // so we don't create duplicate dispatches.
+    let task_store = crate::app::task::TaskStore::default_for_home();
+    let active_sm_ids: std::collections::HashSet<String> = task_store
+        .list(Some(crate::domain::task::TaskStatus::Active))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|t| t.sm_instance_id)
+        .collect();
 
     for inst in &instances {
         let model = match models.iter().find(|m| m.name == inst.model) {
@@ -370,9 +384,33 @@ async fn dispatch_pending(
             continue;
         }
 
-        // Skip instances that already have a result — work was completed
-        // but the instance hasn't transitioned to a terminal state yet.
+        // Crash recovery: result present but not transitioned.
+        // Apply the transition from the stored result.
         if inst.result.as_ref().is_some_and(|r| !r.is_empty()) {
+            let result = inst.result.as_deref().unwrap_or("");
+            info!(
+                instance = %inst.id,
+                state = %inst.state,
+                "recovering: result present but not transitioned, applying transition"
+            );
+            if let Err(e) = handle_completion(
+                writer,
+                models,
+                store,
+                &inst.id,
+                result,
+                inst.error.as_deref(),
+            )
+            .await
+            {
+                warn!(instance = %inst.id, error = %e, "failed to recover orphaned result");
+            }
+            continue;
+        }
+
+        // Skip if there's already an active task for this instance (idempotency).
+        if active_sm_ids.contains(&inst.id) {
+            debug!(instance = %inst.id, "skipping dispatch: active task already exists");
             continue;
         }
 
