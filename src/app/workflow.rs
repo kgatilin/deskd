@@ -248,8 +248,7 @@ async fn dispatch_instance(
     // Check if this is a human step.
     let transition_def = model.transitions.iter().find(|t| t.to == inst.state);
     let is_human = transition_def
-        .and_then(|t| t.step_type.as_deref())
-        .map(|s| s == "human")
+        .map(|t| t.step_type == crate::domain::statemachine::StepType::Human)
         == Some(true);
 
     if is_human {
@@ -432,7 +431,7 @@ async fn dispatch_pending(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::statemachine::TransitionDef;
+    use crate::domain::statemachine::{StepType, TransitionDef};
 
     fn test_model() -> ModelDef {
         ModelDef {
@@ -454,7 +453,7 @@ mod tests {
                     on: None,
                     assignee: Some("agent:reviewer".into()),
                     prompt: Some("Review this.".into()),
-                    step_type: None,
+                    step_type: StepType::default(),
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
@@ -468,7 +467,7 @@ mod tests {
                     on: Some("LGTM".into()),
                     assignee: None,
                     prompt: None,
-                    step_type: None,
+                    step_type: StepType::default(),
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
@@ -482,7 +481,7 @@ mod tests {
                     on: Some("REJECT".into()),
                     assignee: None,
                     prompt: None,
-                    step_type: None,
+                    step_type: StepType::default(),
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
@@ -551,7 +550,7 @@ mod tests {
                     on: None,
                     assignee: None,
                     prompt: None,
-                    step_type: None,
+                    step_type: StepType::default(),
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
@@ -565,7 +564,7 @@ mod tests {
                     on: Some("DONE".into()),
                     assignee: None,
                     prompt: None,
-                    step_type: None,
+                    step_type: StepType::default(),
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
@@ -652,7 +651,7 @@ mod tests {
                     on: None,
                     assignee: Some("agent:planner".into()),
                     prompt: Some("Create a plan.".into()),
-                    step_type: None,
+                    step_type: StepType::default(),
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
@@ -669,7 +668,7 @@ mod tests {
                     on: None,
                     assignee: Some("agent:dev".into()),
                     prompt: Some("Implement the plan.".into()),
-                    step_type: None,
+                    step_type: StepType::default(),
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
@@ -686,7 +685,7 @@ mod tests {
                     on: None,
                     assignee: None,
                     prompt: None,
-                    step_type: None,
+                    step_type: StepType::default(),
                     notify: None,
                     timeout: None,
                     timeout_goto: None,

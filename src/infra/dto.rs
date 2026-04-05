@@ -476,6 +476,14 @@ impl From<&ModelDef> for ConfigModelDef {
 
 impl From<ConfigTransitionDef> for TransitionDef {
     fn from(dto: ConfigTransitionDef) -> Self {
+        use crate::domain::statemachine::StepType;
+        let step_type = match dto.step_type.as_deref() {
+            Some(s) => StepType::parse(s).unwrap_or_else(|e| {
+                tracing::warn!("{e}, defaulting to Agent");
+                StepType::Agent
+            }),
+            None => StepType::default(),
+        };
         Self {
             from: dto.from,
             to: dto.to,
@@ -483,7 +491,7 @@ impl From<ConfigTransitionDef> for TransitionDef {
             on: dto.on,
             assignee: dto.assignee,
             prompt: dto.prompt,
-            step_type: dto.step_type,
+            step_type,
             notify: dto.notify,
             timeout: dto.timeout,
             timeout_goto: dto.timeout_goto,
@@ -495,6 +503,12 @@ impl From<ConfigTransitionDef> for TransitionDef {
 
 impl From<&TransitionDef> for ConfigTransitionDef {
     fn from(t: &TransitionDef) -> Self {
+        use crate::domain::statemachine::StepType;
+        let step_type = if t.step_type == StepType::Agent {
+            None // omit default value
+        } else {
+            Some(t.step_type.as_str().to_string())
+        };
         Self {
             from: t.from.clone(),
             to: t.to.clone(),
@@ -502,7 +516,7 @@ impl From<&TransitionDef> for ConfigTransitionDef {
             on: t.on.clone(),
             assignee: t.assignee.clone(),
             prompt: t.prompt.clone(),
-            step_type: t.step_type.clone(),
+            step_type,
             notify: t.notify.clone(),
             timeout: t.timeout.clone(),
             timeout_goto: t.timeout_goto.clone(),

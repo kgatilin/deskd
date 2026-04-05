@@ -274,7 +274,7 @@ impl crate::ports::store::StateMachineWriter for StateMachineStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::statemachine::{ModelDef, TransitionDef};
+    use crate::domain::statemachine::{ModelDef, StepType, TransitionDef};
 
     fn temp_store() -> StateMachineStore {
         let dir = std::env::temp_dir().join(format!("deskd-test-{}", uuid::Uuid::new_v4()));
@@ -301,7 +301,7 @@ mod tests {
                     on: None,
                     assignee: Some("agent:reviewer".into()),
                     prompt: None,
-                    step_type: None,
+                    step_type: StepType::default(),
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
@@ -315,7 +315,7 @@ mod tests {
                     on: Some("approve".into()),
                     assignee: None,
                     prompt: None,
-                    step_type: None,
+                    step_type: StepType::default(),
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
@@ -329,7 +329,7 @@ mod tests {
                     on: Some("reject".into()),
                     assignee: None,
                     prompt: None,
-                    step_type: None,
+                    step_type: StepType::default(),
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
@@ -343,7 +343,7 @@ mod tests {
                     on: None,
                     assignee: None,
                     prompt: None,
-                    step_type: None,
+                    step_type: StepType::default(),
                     notify: None,
                     timeout: None,
                     timeout_goto: None,

@@ -416,7 +416,7 @@ impl StateMachineWriter for InMemoryStateMachineStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::statemachine::{ModelDef, TransitionDef};
+    use crate::domain::statemachine::{ModelDef, StepType, TransitionDef};
     use crate::domain::task::TaskCriteria;
 
     #[test]
@@ -463,7 +463,7 @@ mod tests {
                     on: None,
                     assignee: None,
                     prompt: None,
-                    step_type: None,
+                    step_type: StepType::default(),
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
@@ -477,7 +477,7 @@ mod tests {
                     on: None,
                     assignee: None,
                     prompt: None,
-                    step_type: None,
+                    step_type: StepType::default(),
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
