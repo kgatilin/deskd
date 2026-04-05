@@ -13,72 +13,42 @@ use crate::app::unified_inbox;
 use crate::domain::agent::AgentRuntime;
 use crate::infra::dto::ConfigSessionMode;
 
-/// Wrapper for either a Claude or ACP agent process.
+/// Create an executor for the given runtime type.
 ///
-/// Both variants implement `ports::executor::Executor`. This enum provides
-/// static dispatch over the two supported runtimes. Adding a new executor
-/// backend (Gemini, Ollama) requires only a new variant + `Executor` impl.
-enum RuntimeProcess {
-    Claude(agent::AgentProcess),
-    Acp(Box<acp::AcpProcess>),
-}
-
-impl RuntimeProcess {
-    async fn start(name: &str, bus_socket: &str, runtime: &AgentRuntime) -> Result<Self> {
-        match runtime {
-            AgentRuntime::Claude => {
-                let p = agent::AgentProcess::start(name, bus_socket).await?;
-                Ok(Self::Claude(p))
-            }
-            AgentRuntime::Acp => {
-                let p = acp::AcpProcess::start(name, bus_socket).await?;
-                Ok(Self::Acp(Box::new(p)))
-            }
+/// Returns `Box<dyn Executor>` — the worker has no knowledge of the concrete
+/// backend type. Adding a new executor (Gemini, Ollama) requires only a new
+/// `Executor` impl and a match arm here.
+async fn start_executor(
+    name: &str,
+    bus_socket: &str,
+    runtime: &AgentRuntime,
+) -> Result<Box<dyn Executor>> {
+    match runtime {
+        AgentRuntime::Claude => {
+            let p = agent::AgentProcess::start(name, bus_socket).await?;
+            Ok(Box::new(p))
         }
-    }
-
-    async fn start_fresh(name: &str, bus_socket: &str, runtime: &AgentRuntime) -> Result<Self> {
-        match runtime {
-            AgentRuntime::Claude => {
-                let p = agent::AgentProcess::start_fresh(name, bus_socket).await?;
-                Ok(Self::Claude(p))
-            }
-            AgentRuntime::Acp => {
-                let p = acp::AcpProcess::start_fresh(name, bus_socket).await?;
-                Ok(Self::Acp(Box::new(p)))
-            }
+        AgentRuntime::Acp => {
+            let p = acp::AcpProcess::start(name, bus_socket).await?;
+            Ok(Box::new(p))
         }
     }
 }
 
-/// Delegate all Executor trait methods through the enum variants.
-impl Executor for RuntimeProcess {
-    async fn send_task(
-        &self,
-        message: &str,
-        progress_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
-        image: Option<(&str, &str)>,
-        limits: &agent::TaskLimits,
-    ) -> Result<agent::TurnResult> {
-        match self {
-            Self::Claude(p) => p.send_task(message, progress_tx, image, limits).await,
-            Self::Acp(p) => {
-                Executor::send_task(p.as_ref(), message, progress_tx, image, limits).await
-            }
+/// Create a fresh-session executor (no --resume).
+async fn start_executor_fresh(
+    name: &str,
+    bus_socket: &str,
+    runtime: &AgentRuntime,
+) -> Result<Box<dyn Executor>> {
+    match runtime {
+        AgentRuntime::Claude => {
+            let p = agent::AgentProcess::start_fresh(name, bus_socket).await?;
+            Ok(Box::new(p))
         }
-    }
-
-    fn inject_message(&self, message: &str) -> Result<()> {
-        match self {
-            Self::Claude(p) => p.inject_message(message),
-            Self::Acp(p) => Executor::inject_message(p.as_ref(), message),
-        }
-    }
-
-    async fn stop(&self) {
-        match self {
-            Self::Claude(p) => p.stop().await,
-            Self::Acp(p) => Executor::stop(p.as_ref()).await,
+        AgentRuntime::Acp => {
+            let p = acp::AcpProcess::start_fresh(name, bus_socket).await?;
+            Ok(Box::new(p))
         }
     }
 }
@@ -217,7 +187,7 @@ pub async fn run(
     // Start persistent agent process (reused across tasks).
     let effective_bus = bus_socket.as_deref().unwrap_or(socket_path).to_string();
     let agent_runtime: AgentRuntime = initial_state.config.runtime.clone().into();
-    let mut process = RuntimeProcess::start(name, &effective_bus, &agent_runtime).await?;
+    let mut process = start_executor(name, &effective_bus, &agent_runtime).await?;
 
     // Build task limits from agent config — enforced in real-time during tasks.
     let limits = agent::TaskLimits {
@@ -364,7 +334,7 @@ pub async fn run(
         if needs_fresh {
             info!(agent = %name, fresh = msg.metadata.fresh, "fresh session requested, restarting process");
             process.stop().await;
-            process = RuntimeProcess::start_fresh(name, &effective_bus, &agent_runtime).await?;
+            process = start_executor_fresh(name, &effective_bus, &agent_runtime).await?;
         }
 
         let task = &ctx.task_formatted;
@@ -526,7 +496,7 @@ pub async fn run(
                     handle_task_failure(name, &msg, &ctx, e, task_duration_ms, &writer).await;
                 if needs_restart {
                     warn!(agent = %name, "agent process crashed, restarting with fresh session");
-                    match RuntimeProcess::start_fresh(name, &effective_bus, &agent_runtime).await {
+                    match start_executor_fresh(name, &effective_bus, &agent_runtime).await {
                         Ok(new_proc) => {
                             process = new_proc;
                             info!(agent = %name, "agent process restarted (fresh session)");

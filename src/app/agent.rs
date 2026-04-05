@@ -1650,22 +1650,22 @@ impl AgentProcess {
 }
 
 impl Executor for AgentProcess {
-    async fn send_task(
-        &self,
-        message: &str,
-        progress_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
-        image: Option<(&str, &str)>,
-        limits: &TaskLimits,
-    ) -> Result<TurnResult> {
-        self.send_task(message, progress_tx, image, limits).await
+    fn send_task<'a>(
+        &'a self,
+        message: &'a str,
+        progress_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<String>>,
+        image: Option<(&'a str, &'a str)>,
+        limits: &'a TaskLimits,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TurnResult>> + Send + 'a>> {
+        Box::pin(self.send_task(message, progress_tx, image, limits))
     }
 
     fn inject_message(&self, message: &str) -> Result<()> {
         self.inject_message(message)
     }
 
-    async fn stop(&self) {
-        self.stop().await
+    fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(self.stop())
     }
 }
 

@@ -670,24 +670,26 @@ impl AcpProcess {
 }
 
 impl Executor for AcpProcess {
-    async fn send_task(
-        &self,
-        message: &str,
-        progress_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
-        image: Option<(&str, &str)>,
-        limits: &TaskLimits,
-    ) -> Result<TurnResult> {
-        // ACP doesn't support image content — include note if image was provided.
-        let effective_message = if image.is_some() {
-            format!(
-                "[Note: image attachment not supported via ACP]\n{}",
-                message
-            )
-        } else {
-            message.to_string()
-        };
-        self.send_task(&effective_message, progress_tx, limits)
-            .await
+    fn send_task<'a>(
+        &'a self,
+        message: &'a str,
+        progress_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<String>>,
+        image: Option<(&'a str, &'a str)>,
+        limits: &'a TaskLimits,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TurnResult>> + Send + 'a>> {
+        Box::pin(async move {
+            // ACP doesn't support image content — include note if image was provided.
+            let effective_message = if image.is_some() {
+                format!(
+                    "[Note: image attachment not supported via ACP]\n{}",
+                    message
+                )
+            } else {
+                message.to_string()
+            };
+            self.send_task(&effective_message, progress_tx, limits)
+                .await
+        })
     }
 
     fn inject_message(&self, _message: &str) -> Result<()> {
@@ -695,8 +697,8 @@ impl Executor for AcpProcess {
         Ok(())
     }
 
-    async fn stop(&self) {
-        self.stop().await
+    fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(self.stop())
     }
 }
 

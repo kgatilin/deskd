@@ -5,6 +5,8 @@
 //! and returns a result. It does not own context or state.
 
 use anyhow::Result;
+use std::future::Future;
+use std::pin::Pin;
 
 /// Accumulated token usage across all messages in a task.
 #[derive(Debug, Clone, Default)]
@@ -70,18 +72,21 @@ pub struct TurnResult {
 /// Implementations manage a long-lived subprocess (Claude CLI, ACP server, etc.)
 /// and accept tasks via `send_task`. The executor handles streaming, progress
 /// reporting, and session management internally.
+///
+/// Object-safe: all async methods return `Pin<Box<dyn Future>>` so the worker
+/// can hold `Box<dyn Executor>` without knowing the concrete backend type.
 pub trait Executor: Send {
     /// Send a task to the executor and wait for completion.
     ///
     /// `progress_tx` receives streaming text chunks for real-time progress.
     /// `image` is an optional (base64_data, media_type) pair for image attachments.
-    fn send_task(
-        &self,
-        message: &str,
-        progress_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
-        image: Option<(&str, &str)>,
-        limits: &TaskLimits,
-    ) -> impl std::future::Future<Output = Result<TurnResult>> + Send;
+    fn send_task<'a>(
+        &'a self,
+        message: &'a str,
+        progress_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<String>>,
+        image: Option<(&'a str, &'a str)>,
+        limits: &'a TaskLimits,
+    ) -> Pin<Box<dyn Future<Output = Result<TurnResult>> + Send + 'a>>;
 
     /// Inject a message into an in-progress task (mid-task message).
     /// Returns Ok(()) if supported, or a warning if not.
@@ -90,5 +95,5 @@ pub trait Executor: Send {
     }
 
     /// Gracefully stop the executor.
-    fn stop(&self) -> impl std::future::Future<Output = ()> + Send;
+    fn stop(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
