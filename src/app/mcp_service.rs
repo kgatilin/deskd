@@ -309,7 +309,8 @@ pub async fn sm_create(
         .find(|m| m.name == model_name)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("model '{}' not found", model_name))?
-        .into();
+        .try_into()
+        .map_err(|e: String| anyhow::anyhow!("{e}"))?;
 
     let store = statemachine::StateMachineStore::default_for_home();
     let mut inst = store.create(&model, title, body, agent_name)?;
@@ -405,7 +406,8 @@ pub async fn sm_move(
         .find(|m| m.name == inst.model)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("model '{}' not found in config", inst.model))?
-        .into();
+        .try_into()
+        .map_err(|e: String| anyhow::anyhow!("{e}"))?;
 
     let from = inst.state.clone();
     store.move_to(&mut inst, &model, state, agent_name, note, None, None)?;

@@ -448,16 +448,20 @@ pub struct ConfigTaskCriteria {
     pub labels: Vec<String>,
 }
 
-impl From<ConfigModelDef> for ModelDef {
-    fn from(dto: ConfigModelDef) -> Self {
-        Self {
+impl TryFrom<ConfigModelDef> for ModelDef {
+    type Error = String;
+
+    fn try_from(dto: ConfigModelDef) -> Result<Self, Self::Error> {
+        let transitions: Result<Vec<_>, _> =
+            dto.transitions.into_iter().map(TryInto::try_into).collect();
+        Ok(Self {
             name: dto.name,
             description: dto.description,
             states: dto.states,
             initial: dto.initial,
             terminal: dto.terminal,
-            transitions: dto.transitions.into_iter().map(Into::into).collect(),
-        }
+            transitions: transitions?,
+        })
     }
 }
 
@@ -474,27 +478,40 @@ impl From<&ModelDef> for ConfigModelDef {
     }
 }
 
-impl From<ConfigTransitionDef> for TransitionDef {
-    fn from(dto: ConfigTransitionDef) -> Self {
-        Self {
+impl TryFrom<ConfigTransitionDef> for TransitionDef {
+    type Error = String;
+
+    fn try_from(dto: ConfigTransitionDef) -> Result<Self, Self::Error> {
+        use crate::domain::statemachine::StepType;
+        let step_type = match dto.step_type.as_deref() {
+            Some(s) => StepType::parse(s)?,
+            None => StepType::default(),
+        };
+        Ok(Self {
             from: dto.from,
             to: dto.to,
             trigger: dto.trigger,
             on: dto.on,
             assignee: dto.assignee,
             prompt: dto.prompt,
-            step_type: dto.step_type,
+            step_type,
             notify: dto.notify,
             timeout: dto.timeout,
             timeout_goto: dto.timeout_goto,
             criteria: dto.criteria.map(Into::into),
             max_retries: dto.max_retries,
-        }
+        })
     }
 }
 
 impl From<&TransitionDef> for ConfigTransitionDef {
     fn from(t: &TransitionDef) -> Self {
+        use crate::domain::statemachine::StepType;
+        let step_type = if t.step_type == StepType::Agent {
+            None // omit default value
+        } else {
+            Some(t.step_type.as_str().to_string())
+        };
         Self {
             from: t.from.clone(),
             to: t.to.clone(),
@@ -502,7 +519,7 @@ impl From<&TransitionDef> for ConfigTransitionDef {
             on: t.on.clone(),
             assignee: t.assignee.clone(),
             prompt: t.prompt.clone(),
-            step_type: t.step_type.clone(),
+            step_type,
             notify: t.notify.clone(),
             timeout: t.timeout.clone(),
             timeout_goto: t.timeout_goto.clone(),
@@ -857,5 +874,71 @@ mod tests {
         assert_eq!(restored.state, "open");
         assert_eq!(restored.history.len(), 1);
         assert_eq!(restored.history[0].from, "new");
+    }
+
+    #[test]
+    fn test_invalid_step_type_errors_at_parse() {
+        let dto = ConfigTransitionDef {
+            from: "a".into(),
+            to: "b".into(),
+            trigger: None,
+            on: None,
+            assignee: None,
+            prompt: None,
+            step_type: Some("chekc".into()),
+            notify: None,
+            timeout: None,
+            timeout_goto: None,
+            criteria: None,
+            max_retries: 0,
+        };
+        let result: Result<TransitionDef, String> = dto.try_into();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown step_type"));
+    }
+
+    #[test]
+    fn test_valid_step_type_parses() {
+        for (input, expected) in [
+            ("check", crate::domain::statemachine::StepType::Check),
+            ("human", crate::domain::statemachine::StepType::Human),
+        ] {
+            let dto = ConfigTransitionDef {
+                from: "a".into(),
+                to: "b".into(),
+                trigger: None,
+                on: None,
+                assignee: None,
+                prompt: None,
+                step_type: Some(input.into()),
+                notify: None,
+                timeout: None,
+                timeout_goto: None,
+                criteria: None,
+                max_retries: 0,
+            };
+            let td: TransitionDef = dto.try_into().unwrap();
+            assert_eq!(td.step_type, expected);
+        }
+    }
+
+    #[test]
+    fn test_omitted_step_type_defaults_to_agent() {
+        let dto = ConfigTransitionDef {
+            from: "a".into(),
+            to: "b".into(),
+            trigger: None,
+            on: None,
+            assignee: None,
+            prompt: None,
+            step_type: None,
+            notify: None,
+            timeout: None,
+            timeout_goto: None,
+            criteria: None,
+            max_retries: 0,
+        };
+        let td: TransitionDef = dto.try_into().unwrap();
+        assert_eq!(td.step_type, crate::domain::statemachine::StepType::Agent);
     }
 }

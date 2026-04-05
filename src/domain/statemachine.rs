@@ -14,6 +14,48 @@ pub struct ModelDef {
     pub transitions: Vec<TransitionDef>,
 }
 
+/// The type of execution for a state machine transition step.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StepType {
+    /// Full agent execution (default).
+    #[default]
+    Agent,
+    /// Deterministic shell command — exit 0 = pass, non-zero = fail.
+    Check,
+    /// Lightweight LLM review with structured output.
+    Validate,
+    /// Wait for human input (manual transition via `sm move`).
+    Human,
+}
+
+impl StepType {
+    /// Parse from a string, returning an error for unknown values.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "agent" => Ok(Self::Agent),
+            "check" => Ok(Self::Check),
+            "validate" => Ok(Self::Validate),
+            "human" => Ok(Self::Human),
+            other => Err(format!("unknown step_type: {other:?}")),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Check => "check",
+            Self::Validate => "validate",
+            Self::Human => "human",
+        }
+    }
+}
+
+impl std::fmt::Display for StepType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A transition between states in a model.
 #[derive(Debug, Clone)]
 pub struct TransitionDef {
@@ -23,7 +65,7 @@ pub struct TransitionDef {
     pub on: Option<String>,
     pub assignee: Option<String>,
     pub prompt: Option<String>,
-    pub step_type: Option<String>,
+    pub step_type: StepType,
     pub notify: Option<String>,
     pub timeout: Option<String>,
     pub timeout_goto: Option<String>,
@@ -68,4 +110,37 @@ pub struct Transition {
     pub cost_usd: Option<f64>,
     /// Number of turns for the step.
     pub turns: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_step_type_parse_valid() {
+        assert_eq!(StepType::parse("agent").unwrap(), StepType::Agent);
+        assert_eq!(StepType::parse("check").unwrap(), StepType::Check);
+        assert_eq!(StepType::parse("validate").unwrap(), StepType::Validate);
+        assert_eq!(StepType::parse("human").unwrap(), StepType::Human);
+    }
+
+    #[test]
+    fn test_step_type_parse_invalid() {
+        assert!(StepType::parse("chekc").is_err());
+        assert!(StepType::parse("").is_err());
+        assert!(StepType::parse("Agent").is_err());
+    }
+
+    #[test]
+    fn test_step_type_default_is_agent() {
+        assert_eq!(StepType::default(), StepType::Agent);
+    }
+
+    #[test]
+    fn test_step_type_display() {
+        assert_eq!(StepType::Agent.to_string(), "agent");
+        assert_eq!(StepType::Check.to_string(), "check");
+        assert_eq!(StepType::Validate.to_string(), "validate");
+        assert_eq!(StepType::Human.to_string(), "human");
+    }
 }
