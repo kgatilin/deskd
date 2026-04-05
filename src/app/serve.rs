@@ -176,8 +176,16 @@ pub async fn serve(config_path: String) -> Result<()> {
             && !ucfg.models.is_empty()
         {
             let bus = bus_socket.clone();
-            let models: Vec<crate::domain::statemachine::ModelDef> =
-                ucfg.models.iter().cloned().map(Into::into).collect();
+            let models: Vec<crate::domain::statemachine::ModelDef> = ucfg
+                .models
+                .iter()
+                .cloned()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, String>>()
+                .unwrap_or_else(|e| {
+                    tracing::error!(agent = %def.name, "invalid model definition: {e}");
+                    vec![]
+                });
             let agent_name = def.name.clone();
 
             // Start timeout sweep loop alongside the workflow engine.

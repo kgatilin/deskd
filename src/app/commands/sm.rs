@@ -15,8 +15,13 @@ pub async fn handle(
     config_path: &str,
 ) -> Result<()> {
     let store = statemachine::StateMachineStore::default_for_home();
-    let models: Vec<statemachine::ModelDef> =
-        user_cfg.models.iter().cloned().map(Into::into).collect();
+    let models: Vec<statemachine::ModelDef> = user_cfg
+        .models
+        .iter()
+        .cloned()
+        .map(TryInto::try_into)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("invalid model definition: {e}"))?;
     match action {
         SmAction::Models => {
             if models.is_empty() {
