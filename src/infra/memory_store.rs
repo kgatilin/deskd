@@ -388,6 +388,7 @@ impl StateMachineWriter for InMemoryStateMachineStore {
             note: note.map(|s| s.to_string()),
             cost_usd,
             turns,
+            task_id: None,
         };
 
         if let Some(c) = cost_usd {

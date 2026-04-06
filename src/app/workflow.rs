@@ -346,15 +346,16 @@ fn build_work_item(model: &ModelDef, inst: &statemachine::Instance) -> WorkItem 
 /// Routes based on step_type and criteria:
 /// - Human → notification to notify target
 /// - Check → shell command execution
-/// - Validate → lightweight LLM review (TODO #249)
-/// - Agent + criteria → task queue (pull-based)
-/// - Agent + no criteria → direct bus message (push-based)
+/// - Validate → lightweight LLM review
+/// - Agent → always creates a task, then queue (pull) or bus (push)
+///
+/// Returns the task ID if a task was created (Agent steps always create one).
 async fn dispatch_work_item(
     writer: &Writer,
     model: &ModelDef,
     inst: &statemachine::Instance,
     work_item: &WorkItem,
-) -> Result<()> {
+) -> Result<Option<String>> {
     match work_item.step_type {
         StepType::Human => {
             if let Some(ref notify_target) = work_item.notify {
@@ -386,84 +387,96 @@ async fn dispatch_work_item(
                 )
                 .await;
             }
-            Ok(())
+            Ok(None)
         }
         StepType::Check => {
             let transition_def = model.transitions.iter().find(|t| t.to == inst.state);
-            dispatch_check_step(writer, model, inst, transition_def).await
+            dispatch_check_step(writer, model, inst, transition_def).await?;
+            Ok(None)
         }
-        StepType::Validate => dispatch_validate_step(writer, model, inst, work_item).await,
-        StepType::Agent => dispatch_agent(writer, inst, work_item).await,
+        StepType::Validate => {
+            dispatch_validate_step(writer, model, inst, work_item).await?;
+            Ok(None)
+        }
+        StepType::Agent => {
+            let task_id = dispatch_agent(writer, inst, work_item).await?;
+            Ok(Some(task_id))
+        }
     }
 }
 
-/// Dispatch an agent step — either via task queue (criteria) or direct bus message.
+/// Dispatch an agent step — always creates a task for tracking, then either
+/// dispatches via task queue (pull-based, when criteria is set) or via direct
+/// bus message (push-based, when no criteria).
+///
+/// Returns the task ID of the created task.
 async fn dispatch_agent(
     writer: &Writer,
     inst: &statemachine::Instance,
     work_item: &WorkItem,
-) -> Result<()> {
-    if let Some(ref criteria) = work_item.criteria {
-        // Dispatch via task queue (pull-based).
-        let store = crate::app::task::TaskStore::default_for_home();
-        let mut task = store.create_for_sm(
-            &work_item.task_text,
-            criteria.clone(),
-            "workflow-engine",
-            &work_item.instance_id,
-        )?;
-        if work_item.max_retries > 0 {
-            task.max_retries = work_item.max_retries;
-            store.save_pub(&task)?;
-        }
+) -> Result<String> {
+    let store = crate::app::task::TaskStore::default_for_home();
+    let criteria = work_item.criteria.clone().unwrap_or_default();
+    let mut task = store.create_for_sm(
+        &work_item.task_text,
+        criteria,
+        "workflow-engine",
+        &work_item.instance_id,
+    )?;
+    if work_item.max_retries > 0 {
+        task.max_retries = work_item.max_retries;
+        store.save_pub(&task)?;
+    }
+    let task_id = task.id.clone();
+
+    if work_item.criteria.is_some() {
+        // Dispatch via task queue (pull-based) — worker will claim from queue.
         info!(
             instance = %work_item.instance_id,
-            task_id = %task.id,
+            task_id = %task_id,
             max_retries = work_item.max_retries,
-            "task created in queue for SM dispatch"
+            "task created in queue for SM dispatch (pull)"
         );
-        emit_event(
-            writer,
-            &DomainEvent::TaskDispatched {
-                task_id: task.id.clone(),
-                instance_id: Some(work_item.instance_id.clone()),
-                assignee: work_item.assignee.clone(),
+    } else {
+        // Direct bus message dispatch — task exists for tracking but work
+        // is pushed directly to the assignee.
+        let msg = serde_json::json!({
+            "type": "message",
+            "id": Uuid::new_v4().to_string(),
+            "source": "workflow-engine",
+            "target": &inst.assignee,
+            "payload": {
+                "task": work_item.task_text,
+                "sm_instance_id": work_item.instance_id,
+                "task_queue_id": task_id,
             },
-        )
-        .await;
-        return Ok(());
+            "reply_to": format!("sm:{}", work_item.instance_id),
+            "metadata": {"priority": 5u8},
+        });
+
+        let mut line = serde_json::to_string(&msg)?;
+        line.push('\n');
+        let mut w = writer.lock().await;
+        w.write_all(line.as_bytes()).await?;
+
+        info!(
+            instance = %work_item.instance_id,
+            task_id = %task_id,
+            assignee = %inst.assignee,
+            "task created and dispatched via bus (push)"
+        );
     }
 
-    // Direct bus message dispatch (no criteria).
-    let msg = serde_json::json!({
-        "type": "message",
-        "id": Uuid::new_v4().to_string(),
-        "source": "workflow-engine",
-        "target": &inst.assignee,
-        "payload": {
-            "task": work_item.task_text,
-            "sm_instance_id": work_item.instance_id,
-        },
-        "reply_to": format!("sm:{}", work_item.instance_id),
-        "metadata": {"priority": 5u8},
-    });
-
-    let mut line = serde_json::to_string(&msg)?;
-    line.push('\n');
-    let mut w = writer.lock().await;
-    w.write_all(line.as_bytes()).await?;
-
-    info!(instance = %work_item.instance_id, assignee = %inst.assignee, "task dispatched via bus");
     emit_event(
         writer,
         &DomainEvent::TaskDispatched {
-            task_id: String::new(), // direct bus dispatch has no task ID
+            task_id: task_id.clone(),
             instance_id: Some(work_item.instance_id.clone()),
-            assignee: inst.assignee.clone(),
+            assignee: work_item.assignee.clone(),
         },
     )
     .await;
-    Ok(())
+    Ok(task_id)
 }
 
 /// Dispatch a task to the instance's current assignee.
@@ -485,7 +498,20 @@ async fn dispatch_instance(
         step_type = %work_item.step_type,
         "work item created"
     );
-    dispatch_work_item(writer, model, inst, &work_item).await
+    let task_id = dispatch_work_item(writer, model, inst, &work_item).await?;
+
+    // Link the task_id to the last transition in the instance history.
+    if let Some(task_id) = task_id {
+        let store = statemachine::StateMachineStore::default_for_home();
+        if let Ok(mut updated_inst) = store.load(&inst.id)
+            && let Some(last) = updated_inst.history.last_mut()
+        {
+            last.task_id = Some(task_id);
+            let _ = store.save(&updated_inst);
+        }
+    }
+
+    Ok(())
 }
 
 /// Build the full task text with prompt and context.
@@ -1273,6 +1299,7 @@ mod tests {
                 note: None,
                 cost_usd: None,
                 turns: None,
+                task_id: None,
             }],
             metadata: serde_json::Value::Null,
             total_cost: 0.0,

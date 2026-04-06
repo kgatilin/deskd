@@ -174,18 +174,19 @@ pub async fn handle(
             if !inst.history.is_empty() {
                 println!();
                 println!(
-                    "{:<15} {:<15} {:<20} {:<10} {:<8} TIMESTAMP",
-                    "FROM", "TO", "TRIGGER", "COST", "TURNS"
+                    "{:<15} {:<15} {:<20} {:<16} {:<10} {:<8} TIMESTAMP",
+                    "FROM", "TO", "TRIGGER", "TASK_ID", "COST", "TURNS"
                 );
                 for h in &inst.history {
+                    let task_id = h.task_id.as_deref().unwrap_or("-");
                     let cost = h
                         .cost_usd
                         .map(|c| format!("${:.4}", c))
                         .unwrap_or_else(|| "-".into());
                     let turns = h.turns.map(|t| t.to_string()).unwrap_or_else(|| "-".into());
                     println!(
-                        "{:<15} {:<15} {:<20} {:<10} {:<8} {}",
-                        h.from, h.to, h.trigger, cost, turns, h.timestamp,
+                        "{:<15} {:<15} {:<20} {:<16} {:<10} {:<8} {}",
+                        h.from, h.to, h.trigger, task_id, cost, turns, h.timestamp,
                     );
                 }
             }

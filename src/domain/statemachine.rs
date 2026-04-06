@@ -112,6 +112,8 @@ pub struct Transition {
     pub cost_usd: Option<f64>,
     /// Number of turns for the step.
     pub turns: Option<u32>,
+    /// Task ID created for this transition's dispatched step.
+    pub task_id: Option<String>,
 }
 
 #[cfg(test)]

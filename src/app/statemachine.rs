@@ -162,6 +162,7 @@ impl StateMachineStore {
             note: note.map(|s| s.to_string()),
             cost_usd,
             turns,
+            task_id: None,
         };
 
         if let Some(c) = cost_usd {
@@ -208,6 +209,7 @@ impl StateMachineStore {
             note: note.map(|s| s.to_string()),
             cost_usd: None,
             turns: None,
+            task_id: None,
         };
         inst.history.push(transition);
         inst.state = target_state.to_string();

@@ -261,6 +261,8 @@ pub struct StoredTransition {
     pub cost_usd: Option<f64>,
     #[serde(default)]
     pub turns: Option<u32>,
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 use crate::domain::statemachine::{Instance, Transition};
@@ -319,6 +321,7 @@ impl From<StoredTransition> for Transition {
             note: dto.note,
             cost_usd: dto.cost_usd,
             turns: dto.turns,
+            task_id: dto.task_id,
         }
     }
 }
@@ -333,6 +336,7 @@ impl From<&Transition> for StoredTransition {
             note: t.note.clone(),
             cost_usd: t.cost_usd,
             turns: t.turns,
+            task_id: t.task_id.clone(),
         }
     }
 }
@@ -867,6 +871,7 @@ mod tests {
                 note: None,
                 cost_usd: None,
                 turns: None,
+                task_id: None,
             }],
             metadata: serde_json::json!({}),
             total_cost: 0.0,
