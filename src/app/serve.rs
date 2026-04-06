@@ -5,6 +5,7 @@ use tracing::info;
 
 use crate::app::{adapters, agent, bus, schedule, worker, workflow};
 use crate::config;
+use crate::infra::paths;
 
 /// Start per-agent buses and workers for all agents in workspace config.
 /// Each agent has its own isolated bus at {work_dir}/.deskd/bus.sock.
@@ -52,9 +53,9 @@ pub async fn serve(config_path: String) -> Result<()> {
         let name = state.config.name.clone();
         let bus_socket = def.bus_socket();
 
-        // Ensure {work_dir}/.deskd/ exists.
+        // Ensure {work_dir}/.deskd/ exists and is owned by the agent's unix user.
         let bus_dir = std::path::Path::new(&def.work_dir).join(".deskd");
-        std::fs::create_dir_all(&bus_dir)?;
+        paths::ensure_dir_owned(&bus_dir, def.unix_user.as_deref())?;
 
         // Start the agent's isolated bus.
         {
