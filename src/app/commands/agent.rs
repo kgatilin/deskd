@@ -139,38 +139,36 @@ pub async fn handle(action: AgentAction) -> Result<()> {
                 println!("No agents registered");
             } else {
                 println!(
-                    "{:<15} {:<10} {:<8} {:<10} {:<12} MODEL",
+                    "{:<15} {:<12} {:<8} {:<10} {:<12} MODEL",
                     "NAME", "STATUS", "TURNS", "COST", "USER"
                 );
-                for a in agents {
-                    let status = if live.contains(&a.config.name) {
-                        if a.parent.is_some() {
-                            "live[sub]".to_string()
-                        } else {
-                            "live".to_string()
+                for a in &agents {
+                    let domain = agent::to_domain_agent(a, &live);
+                    let status_str = match &domain.status {
+                        crate::domain::agent::AgentStatus::Ready => {
+                            if a.parent.is_some() {
+                                "ready[sub]"
+                            } else {
+                                "ready"
+                            }
                         }
-                    } else if a.pid > 0
-                        && std::path::Path::new(&format!("/proc/{}", a.pid)).exists()
-                    {
-                        // PID is alive but not yet registered on the bus.
-                        if a.parent.is_some() {
-                            "run[sub]".to_string()
-                        } else {
-                            "running".to_string()
+                        crate::domain::agent::AgentStatus::Busy { .. } => {
+                            if a.parent.is_some() {
+                                "busy[sub]"
+                            } else {
+                                "busy"
+                            }
                         }
-                    } else if a.parent.is_some() {
-                        "idle[sub]".to_string()
-                    } else {
-                        "idle".to_string()
+                        crate::domain::agent::AgentStatus::Unhealthy { .. } => "unhealthy",
                     };
                     println!(
-                        "{:<15} {:<10} {:<8} ${:<9.2} {:<12} {}",
-                        a.config.name,
-                        status,
+                        "{:<15} {:<12} {:<8} ${:<9.2} {:<12} {}",
+                        domain.name,
+                        status_str,
                         a.total_turns,
                         a.total_cost,
                         a.config.unix_user.as_deref().unwrap_or("-"),
-                        a.config.model,
+                        domain.capabilities.model,
                     );
                 }
             }
