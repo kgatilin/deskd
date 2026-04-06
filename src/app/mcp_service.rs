@@ -499,21 +499,33 @@ pub fn sm_query(
 
 /// Build a JSON summary for a sub-agent, given its name and worker handle status.
 pub fn build_agent_summary(name: &str, is_finished: bool) -> Value {
-    let (model, turns, cost_usd) = match crate::app::agent::load_state(name) {
-        Ok(state) => (
-            state.config.model.clone(),
-            state.total_turns,
-            state.total_cost,
-        ),
-        Err(_) => ("unknown".to_string(), 0, 0.0),
+    let (model, turns, cost_usd, agent_status) = match crate::app::agent::load_state(name) {
+        Ok(state) => {
+            let live = if is_finished {
+                std::collections::HashSet::new()
+            } else {
+                let mut s = std::collections::HashSet::new();
+                s.insert(name.to_string());
+                s
+            };
+            let domain = crate::app::agent::to_domain_agent(&state, &live);
+            (
+                state.config.model.clone(),
+                state.total_turns,
+                state.total_cost,
+                domain.status.to_string(),
+            )
+        }
+        Err(_) => {
+            let status = if is_finished { "finished" } else { "unknown" };
+            ("unknown".to_string(), 0, 0.0, status.to_string())
+        }
     };
-
-    let status = if is_finished { "finished" } else { "running" };
 
     json!({
         "name": name,
         "model": model,
-        "status": status,
+        "status": agent_status,
         "turns": turns,
         "cost_usd": cost_usd,
     })

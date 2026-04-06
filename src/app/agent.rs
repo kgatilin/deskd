@@ -782,6 +782,57 @@ pub async fn list() -> Result<Vec<AgentState>> {
     Ok(agents)
 }
 
+/// Build a domain `Agent` from an `AgentState`, checking process health.
+///
+/// `live_agents` is the set of agent names currently registered on a bus.
+/// If the agent's PID is gone and it's not in `live_agents`, it's marked Unhealthy.
+pub fn to_domain_agent(
+    state: &AgentState,
+    live_agents: &std::collections::HashSet<String>,
+) -> crate::domain::agent::Agent {
+    use crate::domain::agent::{Agent, AgentCapabilities, AgentRuntime, AgentStatus, SessionMode};
+
+    let runtime = match state.config.runtime {
+        ConfigAgentRuntime::Claude => AgentRuntime::Claude,
+        ConfigAgentRuntime::Acp => AgentRuntime::Acp,
+    };
+
+    let session_mode = match state.config.session {
+        ConfigSessionMode::Persistent => SessionMode::Persistent,
+        ConfigSessionMode::Ephemeral => SessionMode::Ephemeral,
+    };
+
+    let status = if state.status == "working" {
+        AgentStatus::Busy {
+            task_id: state.current_task.clone(),
+        }
+    } else if live_agents.contains(&state.config.name) {
+        AgentStatus::Ready
+    } else if state.pid > 0 && std::path::Path::new(&format!("/proc/{}", state.pid)).exists() {
+        // Process alive but not yet registered on bus — treat as Ready.
+        AgentStatus::Ready
+    } else if state.pid > 0 {
+        AgentStatus::Unhealthy {
+            since: chrono::Utc::now().to_rfc3339(),
+            reason: format!("process {} not found", state.pid),
+        }
+    } else {
+        // pid == 0 means agent was never started or was cleaned up.
+        AgentStatus::Ready
+    };
+
+    Agent {
+        name: state.config.name.clone(),
+        runtime,
+        session_mode,
+        capabilities: AgentCapabilities {
+            model: state.config.model.clone(),
+            labels: Vec::new(),
+        },
+        status,
+    }
+}
+
 /// Remove an agent (state file + log).
 pub async fn remove(name: &str) -> Result<()> {
     let path = state_path(name);
