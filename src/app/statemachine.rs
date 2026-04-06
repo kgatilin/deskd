@@ -109,6 +109,7 @@ impl StateMachineStore {
             metadata: serde_json::Value::Null,
             total_cost: 0.0,
             total_turns: 0,
+            task_ids: Vec::new(),
         };
         self.save(&inst)?;
         info!(id = %inst.id, model = %inst.model, state = %inst.state, "instance created");
@@ -513,6 +514,7 @@ mod tests {
             metadata: serde_json::Value::Null,
             total_cost: 0.0,
             total_turns: 0,
+            task_ids: Vec::new(),
         };
         assert!(!is_terminal(&model, &inst_open));
 

@@ -500,13 +500,14 @@ async fn dispatch_instance(
     );
     let task_id = dispatch_work_item(writer, model, inst, &work_item).await?;
 
-    // Link the task_id to the last transition in the instance history.
+    // Link the task_id to the instance aggregate and the last transition.
     if let Some(task_id) = task_id {
         let store = statemachine::StateMachineStore::default_for_home();
-        if let Ok(mut updated_inst) = store.load(&inst.id)
-            && let Some(last) = updated_inst.history.last_mut()
-        {
-            last.task_id = Some(task_id);
+        if let Ok(mut updated_inst) = store.load(&inst.id) {
+            updated_inst.record_task(&task_id);
+            if let Some(last) = updated_inst.history.last_mut() {
+                last.task_id = Some(task_id);
+            }
             let _ = store.save(&updated_inst);
         }
     }
@@ -1013,6 +1014,7 @@ mod tests {
             metadata: serde_json::Value::Null,
             total_cost: 0.0,
             total_turns: 0,
+            task_ids: Vec::new(),
         };
         let text = build_task_text("Review this code.", &inst);
         assert!(text.contains("Review this code."));
@@ -1039,6 +1041,7 @@ mod tests {
             metadata: serde_json::Value::Null,
             total_cost: 0.0,
             total_turns: 0,
+            task_ids: Vec::new(),
         };
         let text = build_task_text("", &inst);
         assert!(text.contains("Previous output here"));
@@ -1304,6 +1307,7 @@ mod tests {
             metadata: serde_json::Value::Null,
             total_cost: 0.0,
             total_turns: 0,
+            task_ids: Vec::new(),
         }
     }
 
