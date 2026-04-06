@@ -98,6 +98,22 @@ pub struct Instance {
     pub total_cost: f64,
     /// Cumulative turns across all transitions.
     pub total_turns: u32,
+    /// Task IDs owned by this instance (current and historical).
+    pub task_ids: Vec<String>,
+}
+
+impl Instance {
+    /// Record a task as owned by this instance.
+    pub fn record_task(&mut self, task_id: &str) {
+        if !self.task_ids.contains(&task_id.to_string()) {
+            self.task_ids.push(task_id.to_string());
+        }
+    }
+
+    /// Get the current (most recently dispatched) task ID, if any.
+    pub fn current_task_id(&self) -> Option<&str> {
+        self.history.last().and_then(|h| h.task_id.as_deref())
+    }
 }
 
 /// A recorded transition in the instance history.
@@ -146,5 +162,61 @@ mod tests {
         assert_eq!(StepType::Check.to_string(), "check");
         assert_eq!(StepType::Validate.to_string(), "validate");
         assert_eq!(StepType::Human.to_string(), "human");
+    }
+
+    fn make_test_instance() -> Instance {
+        Instance {
+            id: "sm-test".into(),
+            model: "test".into(),
+            title: "Test".into(),
+            body: String::new(),
+            state: "open".into(),
+            assignee: "dev".into(),
+            result: None,
+            error: None,
+            created_by: "test".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            history: vec![Transition {
+                from: "new".into(),
+                to: "open".into(),
+                trigger: "auto".into(),
+                timestamp: String::new(),
+                note: None,
+                cost_usd: None,
+                turns: None,
+                task_id: Some("task-abc".into()),
+            }],
+            metadata: serde_json::Value::Null,
+            total_cost: 0.0,
+            total_turns: 0,
+            task_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_record_task() {
+        let mut inst = make_test_instance();
+        assert!(inst.task_ids.is_empty());
+
+        inst.record_task("task-001");
+        assert_eq!(inst.task_ids, vec!["task-001"]);
+
+        // Duplicate is not added.
+        inst.record_task("task-001");
+        assert_eq!(inst.task_ids.len(), 1);
+
+        inst.record_task("task-002");
+        assert_eq!(inst.task_ids, vec!["task-001", "task-002"]);
+    }
+
+    #[test]
+    fn test_current_task_id() {
+        let inst = make_test_instance();
+        assert_eq!(inst.current_task_id(), Some("task-abc"));
+
+        let mut inst2 = inst;
+        inst2.history.clear();
+        assert_eq!(inst2.current_task_id(), None);
     }
 }

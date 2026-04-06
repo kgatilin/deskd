@@ -340,6 +340,7 @@ impl StateMachineWriter for InMemoryStateMachineStore {
             metadata: serde_json::Value::Null,
             total_cost: 0.0,
             total_turns: 0,
+            task_ids: Vec::new(),
         };
         let dto: StoredInstance = (&inst).into();
         self.instances.lock().unwrap().insert(id, dto);

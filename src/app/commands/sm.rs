@@ -171,6 +171,13 @@ pub async fn handle(
                     inst.total_cost, inst.total_turns
                 );
             }
+            if !inst.task_ids.is_empty() {
+                println!(
+                    "Tasks:     {} ({})",
+                    inst.task_ids.len(),
+                    inst.task_ids.join(", ")
+                );
+            }
             if !inst.history.is_empty() {
                 println!();
                 println!(

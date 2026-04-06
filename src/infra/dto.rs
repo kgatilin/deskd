@@ -246,6 +246,9 @@ pub struct StoredInstance {
     pub total_cost: f64,
     #[serde(default)]
     pub total_turns: u32,
+    /// Task IDs owned by this instance.
+    #[serde(default)]
+    pub task_ids: Vec<String>,
 }
 
 /// Storage format for a recorded state transition.
@@ -285,6 +288,7 @@ impl From<StoredInstance> for Instance {
             metadata: dto.metadata,
             total_cost: dto.total_cost,
             total_turns: dto.total_turns,
+            task_ids: dto.task_ids,
         }
     }
 }
@@ -307,6 +311,7 @@ impl From<&Instance> for StoredInstance {
             metadata: inst.metadata.clone(),
             total_cost: inst.total_cost,
             total_turns: inst.total_turns,
+            task_ids: inst.task_ids.clone(),
         }
     }
 }
@@ -876,6 +881,7 @@ mod tests {
             metadata: serde_json::json!({}),
             total_cost: 0.0,
             total_turns: 0,
+            task_ids: vec!["task-abc123".into()],
         };
         let stored: StoredInstance = (&inst).into();
         let restored: Instance = stored.into();
