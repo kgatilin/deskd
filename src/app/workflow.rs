@@ -375,6 +375,16 @@ async fn dispatch_work_item(
                 let mut w = writer.lock().await;
                 w.write_all(line.as_bytes()).await?;
                 info!(instance = %work_item.instance_id, target = %notify_target, "human notification sent");
+                // Emit event so observers know a notification was sent.
+                emit_event(
+                    writer,
+                    &DomainEvent::TaskDispatched {
+                        task_id: String::new(),
+                        instance_id: Some(work_item.instance_id.clone()),
+                        assignee: notify_target.clone(),
+                    },
+                )
+                .await;
             }
             Ok(())
         }
