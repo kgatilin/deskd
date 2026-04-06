@@ -5,15 +5,16 @@
 # All rules use the flat schema: rules.<rule>.{enabled, level, threshold, exclude}
 # Levels: taboo (CI blocker, exit 1) | telemetry (track, exit 0) | personal (info, exit 0)
 #
-# Current health: 90/100 — DIP resolved (#193, #195, #196).
-# Remaining telemetry: fan-out, SRP on large modules.
+# Current health: 92/100 — layer violations enforced as taboo, DIP resolved.
+# Remaining telemetry: fan-out, SRP on large executor modules (agent.rs, acp.rs).
 
 # Domain Model
 # =============
 # deskd is an agent orchestration runtime. Core domain concepts:
 #
 # Domain Layer (pure logic, no I/O, no serde):
-#   src/domain/   — message, context, task, statemachine, agent types
+#   src/domain/   — message, context, task, statemachine, agent (Agent/AgentStatus/AgentCapabilities),
+#                   events (DomainEvent), workitem (WorkItem)
 #
 # Ports Layer (trait definitions):
 #   src/ports/    — bus, store, executor traits
@@ -93,6 +94,14 @@ rules:
     level: taboo
     threshold: 0
 
+  # Layer violations: forbidden cross-layer dependencies.
+  # Zero violations found — domain->nothing, ports->domain, infra->domain+ports, app->all.
+  # Enforce as taboo to prevent regressions.
+  layer_violations:
+    enabled: true
+    level: taboo
+    threshold: 0
+
   # ISP: traits with too many methods (interface segregation principle).
   # Issues #179 (TaskRepository, 9 methods) and #180 (StateMachineRepository, 6 methods).
   isp:
@@ -106,7 +115,7 @@ rules:
   srp:
     enabled: true
     level: telemetry
-    threshold: 40
+    threshold: 45    # raised from 40: app/agent.rs (63 fns) and app/acp.rs (54 fns) are core executor modules
 
   # Shotgun surgery: high afferent coupling (many dependents).
   # domain and app are container modules — naturally high Ca.
@@ -130,9 +139,12 @@ rules:
       # (MessageBus, TaskRepository, StateMachineRepository). The linter cannot infer
       # cross-module trait association, so these are correctly excepted.
       - "src::domain::message"      # 3 structs — value objects for bus protocol
-      - "src::domain::context"      # domain context value object
+      - "src::domain::context"      # 5 structs + 1 enum — domain context value objects
       - "src::domain::task"         # 3 structs — task/result value objects; repo trait in ports/store.rs
       - "src::domain::statemachine" # 4 structs — SM value objects; trait in ports/store.rs
+      - "src::domain::agent"        # Agent, AgentCapabilities, AgentStatus, SessionMode, AgentRuntime — pure value objects
+      - "src::domain::events"       # DomainEvent enum — pure data, no behaviour
+      - "src::domain::workitem"     # WorkItem struct — intermediate representation, pure value object
 
       # Config parsing layer — a DTO, not a service. It is never abstracted behind
       # a trait because it is only ever read once at startup. Adding traits here
