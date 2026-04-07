@@ -139,8 +139,9 @@ rules:
       # (MessageBus, TaskRepository, StateMachineRepository). The linter cannot infer
       # cross-module trait association, so these are correctly excepted.
       - "src::domain::message"      # 3 structs — value objects for bus protocol
-      - "src::domain::context"      # 5 structs + 1 enum — domain context value objects
-      - "src::domain::task"         # 3 structs — task/result value objects; repo trait in ports/store.rs
+      # domain::context and domain::task removed from excludes (#279) — they contain
+      # business logic (compaction policy, retry backoff, criteria matching) that should
+      # eventually be behind port traits. DIP violations are tracked as telemetry.
       - "src::domain::statemachine" # 4 structs — SM value objects; trait in ports/store.rs
       - "src::domain::agent"        # Agent, AgentCapabilities, AgentStatus, SessionMode, AgentRuntime — pure value objects
       - "src::domain::events"       # DomainEvent enum — pure data, no behaviour
