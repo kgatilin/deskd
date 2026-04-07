@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::app::mcp_service;
 use crate::config::UserConfig;
+use crate::infra::dto::BusMessage;
 
 // ─── Embedded bus for sub-agent orchestration ────────────────────────────────
 
@@ -143,7 +144,7 @@ pub async fn run(agent_name: &str) -> Result<()> {
     info!(agent = %agent_name, bus = %bus_socket, "MCP server started");
 
     let stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
+    let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let reader = BufReader::new(stdin);
 
     // Detect framing mode from first line of input.
@@ -151,53 +152,94 @@ pub async fn run(agent_name: &str) -> Result<()> {
     // Older MCP clients use Content-Length framed messages.
     let mut lines = reader.lines();
 
+    // Establish persistent bus subscription to receive incoming messages.
+    // The MCP server registers as `<agent>-mcp-channel` and subscribes to
+    // messages targeted at this agent so they can be forwarded as channel
+    // notifications into the Claude session.
+    let mut bus_rx = connect_bus_listener(agent_name, &bus_socket).await;
+
     loop {
-        let line = match lines.next_line().await {
-            Ok(Some(l)) => l,
-            Ok(None) => break, // stdin closed
-            Err(e) => {
-                warn!(error = %e, "failed to read line");
-                break;
+        // Select between stdin (JSON-RPC requests from Claude) and bus
+        // messages (events to push as channel notifications).
+        tokio::select! {
+            stdin_line = lines.next_line() => {
+                let line = match stdin_line {
+                    Ok(Some(l)) => l,
+                    Ok(None) => break, // stdin closed
+                    Err(e) => {
+                        warn!(error = %e, "failed to read line");
+                        break;
+                    }
+                };
+
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                // Skip Content-Length headers (compat with framed clients).
+                if trimmed.starts_with("Content-Length:") {
+                    continue;
+                }
+
+                debug!(msg = %trimmed, "received MCP message");
+
+                let req: Request = match serde_json::from_str(trimmed) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(error = %e, line = %trimmed, "failed to parse JSON-RPC request");
+                        let resp = Response::err(None, -32700, "Parse error");
+                        let mut out = stdout.lock().await;
+                        write_response(&mut *out, &resp).await?;
+                        continue;
+                    }
+                };
+
+                // Notifications (no id) — acknowledge and continue
+                if req.id.is_none() && req.method.starts_with("notifications/") {
+                    debug!(method = %req.method, "received notification");
+                    continue;
+                }
+
+                let resp = handle_request(
+                    &req,
+                    agent_name,
+                    &bus_socket,
+                    user_config.as_ref(),
+                    &internal_bus,
+                )
+                .await;
+                let mut out = stdout.lock().await;
+                write_response(&mut *out, &resp).await?;
             }
-        };
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Skip Content-Length headers (compat with framed clients).
-        if trimmed.starts_with("Content-Length:") {
-            continue;
-        }
-
-        debug!(msg = %trimmed, "received MCP message");
-
-        let req: Request = match serde_json::from_str(trimmed) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, line = %trimmed, "failed to parse JSON-RPC request");
-                let resp = Response::err(None, -32700, "Parse error");
-                write_response(&mut stdout, &resp).await?;
-                continue;
+            bus_msg = async {
+                match &bus_rx {
+                    Some(rx) => {
+                        let mut rx = rx.lock().await;
+                        rx.next_line().await
+                    }
+                    None => std::future::pending().await,
+                }
+            } => {
+                match bus_msg {
+                    Ok(Some(line)) if !line.is_empty() => {
+                        if let Ok(msg) = serde_json::from_str::<BusMessage>(&line) {
+                            debug!(source = %msg.source, target = %msg.target, "bus event → channel notification");
+                            let mut out = stdout.lock().await;
+                            emit_channel_notification(&mut *out, &msg).await?;
+                        }
+                    }
+                    Ok(None) => {
+                        warn!("bus connection closed — channel notifications disabled");
+                        bus_rx = None;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "bus read error");
+                    }
+                    _ => {} // empty line, skip
+                }
             }
-        };
-
-        // Notifications (no id) — acknowledge and continue
-        if req.id.is_none() && req.method.starts_with("notifications/") {
-            debug!(method = %req.method, "received notification");
-            continue;
         }
-
-        let resp = handle_request(
-            &req,
-            agent_name,
-            &bus_socket,
-            user_config.as_ref(),
-            &internal_bus,
-        )
-        .await;
-        write_response(&mut stdout, &resp).await?;
     }
 
     // Cleanup: stop all sub-agents on the internal bus.
@@ -249,7 +291,10 @@ fn handle_initialize(id: Option<Value>) -> Response {
         json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
-                "tools": {}
+                "tools": {},
+                "experimental": {
+                    "claude/channel": {}
+                }
             },
             "serverInfo": {
                 "name": "deskd",
@@ -1170,6 +1215,96 @@ async fn call_sm_query(args: &Value) -> Result<Value> {
         "content": [{"type": "text", "text": serde_json::to_string_pretty(&result)?}],
         "isError": false
     }))
+}
+
+// ─── Bus channel listener ────────────────────────────────────────────────────
+
+/// Connect to the bus as a persistent subscriber for channel notifications.
+/// Returns a line reader for incoming bus messages, or None if connection fails
+/// (MCP server degrades gracefully — tool calls still work without push).
+async fn connect_bus_listener(
+    agent_name: &str,
+    bus_socket: &str,
+) -> Option<Arc<Mutex<tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>>>> {
+    let stream = match UnixStream::connect(bus_socket).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "failed to connect bus listener — channel notifications disabled");
+            return None;
+        }
+    };
+
+    let (read_half, mut write_half) = stream.into_split();
+
+    // Register as a channel listener with subscriptions matching the agent.
+    let reg = json!({
+        "type": "register",
+        "name": format!("{}-mcp-channel", agent_name),
+        "subscriptions": [
+            format!("agent:{}", agent_name),
+            format!("reply:{}:*", agent_name),
+        ]
+    });
+    let mut line = serde_json::to_string(&reg).unwrap();
+    line.push('\n');
+
+    if let Err(e) = write_half.write_all(line.as_bytes()).await {
+        warn!(error = %e, "failed to register bus channel listener");
+        return None;
+    }
+    if let Err(e) = write_half.flush().await {
+        warn!(error = %e, "failed to flush bus channel registration");
+        return None;
+    }
+
+    info!(agent = %agent_name, "bus channel listener connected");
+
+    // Keep write_half alive by leaking it into a background task that does nothing
+    // but hold the connection open. When the MCP server exits, it'll be dropped.
+    tokio::spawn(async move {
+        // Hold the write half open until the MCP server exits.
+        let _keep = write_half;
+        std::future::pending::<()>().await;
+    });
+
+    let reader = BufReader::new(read_half);
+    Some(Arc::new(Mutex::new(reader.lines())))
+}
+
+/// Emit a channel notification to stdout for a bus message.
+/// Uses the `notifications/claude/channel` method per the MCP channels spec.
+async fn emit_channel_notification<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &BusMessage,
+) -> Result<()> {
+    // Extract the task text from the payload.
+    let content = if let Some(task) = msg.payload.get("task").and_then(|t| t.as_str()) {
+        task.to_string()
+    } else if let Some(result) = msg.payload.get("result").and_then(|r| r.as_str()) {
+        result.to_string()
+    } else {
+        serde_json::to_string(&msg.payload)?
+    };
+
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": {
+            "content": content,
+            "meta": {
+                "source": msg.source,
+                "target": msg.target,
+                "message_id": msg.id,
+            }
+        }
+    });
+
+    let json_str = serde_json::to_string(&notification)?;
+    writer.write_all(json_str.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    info!(source = %msg.source, "emitted channel notification");
+    Ok(())
 }
 
 // ─── I/O helpers ──────────────────────────────────────────────────────────────
