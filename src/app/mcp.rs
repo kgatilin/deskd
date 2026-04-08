@@ -714,21 +714,70 @@ async fn call_send_message(
         }
     };
 
-    // Connect to bus, send message, disconnect.
-    let mut stream = UnixStream::connect(&effective_socket)
+    // Connect to bus, register, send message, disconnect.
+    let stream = UnixStream::connect(&effective_socket)
         .await
         .with_context(|| format!("failed to connect to bus at {}", effective_socket))?;
 
-    // Register as the agent
+    let (read_half, mut write_half) = stream.into_split();
+
+    // Register as the agent.
+    let reg_name = format!("{}-mcp-send", agent_name);
     let reg = serde_json::json!({
         "type": "register",
-        "name": format!("{}-mcp", agent_name),
-        "subscriptions": []
+        "name": reg_name,
+        "subscriptions": [format!("agent:{}", reg_name)]
     });
     let mut line = serde_json::to_string(&reg)?;
     line.push('\n');
-    stream.write_all(line.as_bytes()).await?;
+    write_half.write_all(line.as_bytes()).await?;
 
+    // For agent:* targets, verify the target is connected before sending.
+    if let Some(target_agent) = target.strip_prefix("agent:") {
+        let list_cmd = serde_json::json!({"type": "list"});
+        let mut list_line = serde_json::to_string(&list_cmd)?;
+        list_line.push('\n');
+        write_half.write_all(list_line.as_bytes()).await?;
+        write_half.flush().await?;
+
+        // Read the list response with a short timeout.
+        let reader = BufReader::new(read_half);
+        let mut lines_reader = reader.lines();
+        let list_result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            lines_reader.next_line(),
+        )
+        .await;
+
+        let agent_connected = match list_result {
+            Ok(Ok(Some(resp_line))) => {
+                if let Ok(resp) = serde_json::from_str::<Value>(&resp_line) {
+                    resp.get("payload")
+                        .and_then(|p| p.get("clients"))
+                        .and_then(|c| c.as_array())
+                        .map(|clients| {
+                            clients
+                                .iter()
+                                .any(|c| c.as_str().map(|n| n == target_agent).unwrap_or(false))
+                        })
+                        .unwrap_or(false)
+                } else {
+                    true // can't parse, assume connected
+                }
+            }
+            _ => true, // timeout or error, proceed optimistically
+        };
+
+        if !agent_connected {
+            bail!(
+                "agent '{}' is not connected to the bus — message would be lost. \
+                 Check if the agent is running with `list_agents`.",
+                target_agent
+            );
+        }
+    }
+
+    // Build and send the message (same for all target types).
     let msg = serde_json::json!({
         "type": "message",
         "id": Uuid::new_v4().to_string(),
@@ -739,8 +788,8 @@ async fn call_send_message(
     });
     let mut msg_line = serde_json::to_string(&msg)?;
     msg_line.push('\n');
-    stream.write_all(msg_line.as_bytes()).await?;
-    stream.flush().await?;
+    write_half.write_all(msg_line.as_bytes()).await?;
+    write_half.flush().await?;
 
     info!(agent = %agent_name, target = %target, bus = %effective_socket, "send_message via MCP");
 
