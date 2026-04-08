@@ -5,8 +5,13 @@
 # All rules use the flat schema: rules.<rule>.{enabled, level, threshold, exclude}
 # Levels: taboo (CI blocker, exit 1) | telemetry (track, exit 0) | personal (info, exit 0)
 #
-# Current health: TBD — tightened thresholds to catch real violations.
-# Known violations: SRP (mcp, workflow, graph, worker, schedule, dto), DIP (workflow hardcodes UnixBus).
+# Current health: telemetry violations only (no taboo). Last reviewed: 2026-04-08.
+# Known violations (telemetry, tracked):
+#   fan-out: workflow(9), worker(9), commands(12) — exceed threshold 7
+#   srp:     mcp(39), worker(34), graph(33) — exceed threshold 30
+#   isp:     TaskWriter(8 methods), TaskRepository(9) — exceed threshold 7
+#   dip:     workflow::publish_event/notify_moved still call UnixBus::connect directly
+# PR #289 impact: workflow fan-out 8→9 (store trait injection), TaskWriter +save() (ISP).
 # See issues #290-#295 for cleanup plan.
 
 # Domain Model
