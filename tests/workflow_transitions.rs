@@ -607,8 +607,10 @@ async fn test_dispatch_pending_skips_completed_instances() {
     // Start workflow engine — dispatch_pending runs on startup.
     let sock_for_engine = socket.clone();
     let models: Vec<deskd::config::ModelDef> = vec![model.clone()];
+    let sm_store = deskd::app::statemachine::StateMachineStore::default_for_home();
+    let task_store = deskd::app::task::TaskStore::default_for_home();
     tokio::spawn(async move {
-        let _ = deskd::app::workflow::run(&sock_for_engine, models).await;
+        let _ = deskd::app::workflow::run(&sock_for_engine, models, &sm_store, &task_store).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 

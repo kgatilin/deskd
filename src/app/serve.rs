@@ -203,8 +203,10 @@ pub async fn serve(config_path: String) -> Result<()> {
             });
             info!(agent = %def.name, "started timeout sweep loop (interval=30s)");
 
+            let sm_store = crate::app::statemachine::StateMachineStore::default_for_home();
+            let task_store = crate::app::task::TaskStore::default_for_home();
             tokio::spawn(async move {
-                if let Err(e) = workflow::run(&bus, models).await {
+                if let Err(e) = workflow::run(&bus, models, &sm_store, &task_store).await {
                     tracing::error!(agent = %agent_name, error = %e, "workflow engine exited");
                 }
             });
