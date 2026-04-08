@@ -1,38 +1,33 @@
 use anyhow::Result;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::app::message::Message;
 use crate::app::statemachine;
-use crate::app::worker;
 use crate::domain::events::DomainEvent;
+use crate::domain::message::{Message, Metadata};
 use crate::domain::statemachine::{ModelDef, StepType};
 use crate::domain::workitem::WorkItem;
+use crate::ports::bus::MessageBus;
 use crate::ports::store::{StateMachineRepository, TaskRepository};
-
-type Writer = std::sync::Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>;
 
 /// Publish a domain event to the message bus.
 ///
 /// Events are sent to `events:<event_type>` targets so subscribers can
 /// use glob patterns like `events:*` to receive all events.
-async fn emit_event(writer: &Writer, event: &DomainEvent) {
-    let msg = serde_json::json!({
-        "type": "message",
-        "id": Uuid::new_v4().to_string(),
-        "source": "workflow-engine",
-        "target": format!("events:{}", event.event_type()),
-        "payload": event.to_json(),
-        "metadata": {"priority": 1u8},
-    });
-    if let Ok(mut line) = serde_json::to_string(&msg) {
-        line.push('\n');
-        let mut w = writer.lock().await;
-        if let Err(e) = w.write_all(line.as_bytes()).await {
-            warn!(error = %e, event = %event.event_type(), "failed to emit domain event");
-        }
+async fn emit_event(bus: &dyn MessageBus, event: &DomainEvent) {
+    let msg = Message {
+        id: Uuid::new_v4().to_string(),
+        source: "workflow-engine".to_string(),
+        target: format!("events:{}", event.event_type()),
+        payload: event.to_json(),
+        reply_to: None,
+        metadata: Metadata {
+            priority: 1,
+            ..Default::default()
+        },
+    };
+    if let Err(e) = bus.send(&msg).await {
+        warn!(error = %e, event = %event.event_type(), "failed to emit domain event");
     }
 }
 
@@ -41,30 +36,20 @@ async fn emit_event(writer: &Writer, event: &DomainEvent) {
 /// Used by callers outside the workflow engine (e.g. MCP handlers) to emit
 /// events without holding a persistent bus connection.
 pub async fn publish_event(bus_socket: &str, source: &str, event: &DomainEvent) -> Result<()> {
-    let mut stream = UnixStream::connect(bus_socket).await?;
-
-    let reg = serde_json::json!({
-        "type": "register",
-        "name": format!("{}-event-pub", source),
-        "subscriptions": []
-    });
-    let mut line = serde_json::to_string(&reg)?;
-    line.push('\n');
-    stream.write_all(line.as_bytes()).await?;
-
-    let msg = serde_json::json!({
-        "type": "message",
-        "id": Uuid::new_v4().to_string(),
-        "source": source,
-        "target": format!("events:{}", event.event_type()),
-        "payload": event.to_json(),
-        "metadata": {"priority": 1u8},
-    });
-    let mut msg_line = serde_json::to_string(&msg)?;
-    msg_line.push('\n');
-    stream.write_all(msg_line.as_bytes()).await?;
-    stream.flush().await?;
-
+    let bus = crate::infra::unix_bus::UnixBus::connect(bus_socket).await?;
+    bus.register(&format!("{}-event-pub", source), &[]).await?;
+    let msg = Message {
+        id: Uuid::new_v4().to_string(),
+        source: source.to_string(),
+        target: format!("events:{}", event.event_type()),
+        payload: event.to_json(),
+        reply_to: None,
+        metadata: Metadata {
+            priority: 1,
+            ..Default::default()
+        },
+    };
+    bus.send(&msg).await?;
     Ok(())
 }
 
@@ -73,30 +58,17 @@ pub async fn publish_event(bus_socket: &str, source: &str, event: &DomainEvent) 
 /// Connects to the bus, sends an `action: "moved"` message to `sm:<id>`,
 /// and disconnects. The workflow engine picks this up and dispatches if needed.
 pub async fn notify_moved(bus_socket: &str, instance_id: &str, source: &str) -> Result<()> {
-    let mut stream = UnixStream::connect(bus_socket).await?;
-
-    let reg = serde_json::json!({
-        "type": "register",
-        "name": format!("{}-sm-notify", source),
-        "subscriptions": []
-    });
-    let mut line = serde_json::to_string(&reg)?;
-    line.push('\n');
-    stream.write_all(line.as_bytes()).await?;
-
-    let msg = serde_json::json!({
-        "type": "message",
-        "id": Uuid::new_v4().to_string(),
-        "source": source,
-        "target": format!("sm:{}", instance_id),
-        "payload": {"action": "moved"},
-        "metadata": {"priority": 5u8},
-    });
-    let mut msg_line = serde_json::to_string(&msg)?;
-    msg_line.push('\n');
-    stream.write_all(msg_line.as_bytes()).await?;
-    stream.flush().await?;
-
+    let bus = crate::infra::unix_bus::UnixBus::connect(bus_socket).await?;
+    bus.register(&format!("{}-sm-notify", source), &[]).await?;
+    let msg = Message {
+        id: Uuid::new_v4().to_string(),
+        source: source.to_string(),
+        target: format!("sm:{}", instance_id),
+        payload: serde_json::json!({"action": "moved"}),
+        reply_to: None,
+        metadata: Metadata::default(),
+    };
+    bus.send(&msg).await?;
     Ok(())
 }
 
@@ -104,34 +76,22 @@ pub async fn notify_moved(bus_socket: &str, instance_id: &str, source: &str) -> 
 /// Registers as `workflow-engine`, subscribes to `sm:*`.
 /// On startup, dispatches pending instances. Then listens for completion messages.
 pub async fn run(
-    socket_path: &str,
+    bus: &dyn MessageBus,
     models: Vec<ModelDef>,
     sm_store: &dyn StateMachineRepository,
     task_store: &dyn TaskRepository,
 ) -> Result<()> {
-    let stream =
-        worker::bus_connect(socket_path, "workflow-engine", vec!["sm:*".to_string()]).await?;
-
-    let (reader, writer_half) = stream.into_split();
-
-    let writer: Writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer_half));
-    let mut lines = BufReader::new(reader).lines();
+    bus.register("workflow-engine", &["sm:*".to_string()])
+        .await?;
 
     info!("workflow engine started, subscribed to sm:*");
 
     // On startup: check for pending instances and dispatch them.
-    dispatch_pending(&writer, &models, sm_store, task_store).await;
+    dispatch_pending(bus, &models, sm_store, task_store).await;
 
     // Main loop: listen for completion messages.
-    while let Some(line) = lines.next_line().await? {
-        if line.is_empty() {
-            continue;
-        }
-
-        let msg: Message = match serde_json::from_str::<crate::infra::dto::BusMessage>(&line) {
-            Ok(dto) => dto.into(),
-            Err(_) => continue,
-        };
+    loop {
+        let msg = bus.recv().await?;
 
         // Extract instance ID from target: "sm:sm-a1b2c3d4"
         let instance_id = match msg.target.strip_prefix("sm:") {
@@ -143,7 +103,7 @@ pub async fn run(
         if msg.payload.get("action").and_then(|a| a.as_str()) == Some("moved") {
             info!(instance = %instance_id, "received move notification");
             if let Err(e) =
-                handle_move_notification(&writer, &models, sm_store, task_store, &instance_id).await
+                handle_move_notification(bus, &models, sm_store, task_store, &instance_id).await
             {
                 warn!(instance = %instance_id, error = %e, "failed to handle move notification");
             }
@@ -167,7 +127,7 @@ pub async fn run(
         info!(instance = %instance_id, "received completion");
 
         if let Err(e) = handle_completion(
-            &writer,
+            bus,
             &models,
             sm_store,
             task_store,
@@ -180,13 +140,11 @@ pub async fn run(
             warn!(instance = %instance_id, error = %e, "failed to process completion");
         }
     }
-
-    Ok(())
 }
 
 /// Handle a task completion: apply transitions and dispatch next step.
 async fn handle_completion(
-    writer: &Writer,
+    bus: &dyn MessageBus,
     models: &[ModelDef],
     store: &dyn StateMachineRepository,
     task_store: &dyn TaskRepository,
@@ -223,7 +181,7 @@ async fn handle_completion(
         );
 
         emit_event(
-            writer,
+            bus,
             &DomainEvent::TransitionApplied {
                 instance_id: instance_id.to_string(),
                 from: current_state.clone(),
@@ -236,7 +194,7 @@ async fn handle_completion(
         // If terminal, emit completion event.
         if statemachine::is_terminal(model, &inst) {
             emit_event(
-                writer,
+                bus,
                 &DomainEvent::InstanceCompleted {
                     instance_id: instance_id.to_string(),
                     model: inst.model.clone(),
@@ -245,7 +203,7 @@ async fn handle_completion(
             )
             .await;
         } else {
-            dispatch_instance(writer, model, &inst, store, task_store).await?;
+            dispatch_instance(bus, model, &inst, store, task_store).await?;
         }
     } else {
         info!(instance = %instance_id, state = %inst.state, "no matching transition, awaiting manual move");
@@ -256,7 +214,7 @@ async fn handle_completion(
 
 /// Handle a move notification: reload instance and dispatch if it has an assignee.
 async fn handle_move_notification(
-    writer: &Writer,
+    bus: &dyn MessageBus,
     models: &[ModelDef],
     store: &dyn StateMachineRepository,
     task_store: &dyn TaskRepository,
@@ -274,7 +232,7 @@ async fn handle_move_notification(
     }
 
     if !inst.assignee.is_empty() {
-        dispatch_instance(writer, model, &inst, store, task_store).await?;
+        dispatch_instance(bus, model, &inst, store, task_store).await?;
         info!(instance = %instance_id, assignee = %inst.assignee, "dispatched after move");
     }
 
@@ -360,7 +318,7 @@ fn build_work_item(model: &ModelDef, inst: &statemachine::Instance) -> WorkItem 
 ///
 /// Returns the task ID if a task was created (Agent steps always create one).
 async fn dispatch_work_item(
-    writer: &Writer,
+    bus: &dyn MessageBus,
     model: &ModelDef,
     inst: &statemachine::Instance,
     work_item: &WorkItem,
@@ -370,26 +328,22 @@ async fn dispatch_work_item(
     match work_item.step_type {
         StepType::Human => {
             if let Some(ref notify_target) = work_item.notify {
-                let msg = serde_json::json!({
-                    "type": "message",
-                    "id": Uuid::new_v4().to_string(),
-                    "source": "workflow-engine",
-                    "target": notify_target,
-                    "payload": {
+                let msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    source: "workflow-engine".to_string(),
+                    target: notify_target.clone(),
+                    payload: serde_json::json!({
                         "task": work_item.task_text,
                         "sm_instance_id": work_item.instance_id,
-                    },
-                    "reply_to": format!("sm:{}", work_item.instance_id),
-                    "metadata": {"priority": 5u8},
-                });
-                let mut line = serde_json::to_string(&msg)?;
-                line.push('\n');
-                let mut w = writer.lock().await;
-                w.write_all(line.as_bytes()).await?;
+                    }),
+                    reply_to: Some(format!("sm:{}", work_item.instance_id)),
+                    metadata: Metadata::default(),
+                };
+                bus.send(&msg).await?;
                 info!(instance = %work_item.instance_id, target = %notify_target, "human notification sent");
                 // Emit event so observers know a notification was sent.
                 emit_event(
-                    writer,
+                    bus,
                     &DomainEvent::TaskDispatched {
                         task_id: String::new(),
                         instance_id: Some(work_item.instance_id.clone()),
@@ -402,15 +356,15 @@ async fn dispatch_work_item(
         }
         StepType::Check => {
             let transition_def = model.transitions.iter().find(|t| t.to == inst.state);
-            dispatch_check_step(writer, model, inst, transition_def, sm_store, task_store).await?;
+            dispatch_check_step(bus, model, inst, transition_def, sm_store, task_store).await?;
             Ok(None)
         }
         StepType::Validate => {
-            dispatch_validate_step(writer, model, inst, work_item, sm_store, task_store).await?;
+            dispatch_validate_step(bus, model, inst, work_item, sm_store, task_store).await?;
             Ok(None)
         }
         StepType::Agent => {
-            let task_id = dispatch_agent(writer, inst, work_item, task_store).await?;
+            let task_id = dispatch_agent(bus, inst, work_item, task_store).await?;
             Ok(Some(task_id))
         }
     }
@@ -422,7 +376,7 @@ async fn dispatch_work_item(
 ///
 /// Returns the task ID of the created task.
 async fn dispatch_agent(
-    writer: &Writer,
+    bus: &dyn MessageBus,
     inst: &statemachine::Instance,
     work_item: &WorkItem,
     task_store: &dyn TaskRepository,
@@ -452,24 +406,19 @@ async fn dispatch_agent(
     } else {
         // Direct bus message dispatch — task exists for tracking but work
         // is pushed directly to the assignee.
-        let msg = serde_json::json!({
-            "type": "message",
-            "id": Uuid::new_v4().to_string(),
-            "source": "workflow-engine",
-            "target": &inst.assignee,
-            "payload": {
+        let msg = Message {
+            id: Uuid::new_v4().to_string(),
+            source: "workflow-engine".to_string(),
+            target: inst.assignee.clone(),
+            payload: serde_json::json!({
                 "task": work_item.task_text,
                 "sm_instance_id": work_item.instance_id,
                 "task_queue_id": task_id,
-            },
-            "reply_to": format!("sm:{}", work_item.instance_id),
-            "metadata": {"priority": 5u8},
-        });
-
-        let mut line = serde_json::to_string(&msg)?;
-        line.push('\n');
-        let mut w = writer.lock().await;
-        w.write_all(line.as_bytes()).await?;
+            }),
+            reply_to: Some(format!("sm:{}", work_item.instance_id)),
+            metadata: Metadata::default(),
+        };
+        bus.send(&msg).await?;
 
         info!(
             instance = %work_item.instance_id,
@@ -480,7 +429,7 @@ async fn dispatch_agent(
     }
 
     emit_event(
-        writer,
+        bus,
         &DomainEvent::TaskDispatched {
             task_id: task_id.clone(),
             instance_id: Some(work_item.instance_id.clone()),
@@ -495,7 +444,7 @@ async fn dispatch_agent(
 ///
 /// Creates a WorkItem and routes it to the appropriate execution path.
 async fn dispatch_instance(
-    writer: &Writer,
+    bus: &dyn MessageBus,
     model: &ModelDef,
     inst: &statemachine::Instance,
     sm_store: &dyn StateMachineRepository,
@@ -512,7 +461,7 @@ async fn dispatch_instance(
         step_type = %work_item.step_type,
         "work item created"
     );
-    let task_id = dispatch_work_item(writer, model, inst, &work_item, sm_store, task_store).await?;
+    let task_id = dispatch_work_item(bus, model, inst, &work_item, sm_store, task_store).await?;
 
     // Link the task_id to the instance aggregate and the last transition.
     if let Some(task_id) = task_id
@@ -561,7 +510,7 @@ fn build_task_text(prompt: &str, inst: &statemachine::Instance) -> String {
 /// Execute a check step: run a shell command and use the result to trigger
 /// the next transition. Exit 0 = pass (result is stdout), non-zero = fail.
 async fn dispatch_check_step(
-    writer: &Writer,
+    bus: &dyn MessageBus,
     model: &ModelDef,
     inst: &statemachine::Instance,
     transition_def: Option<&crate::domain::statemachine::TransitionDef>,
@@ -618,7 +567,7 @@ async fn dispatch_check_step(
     // the async recursion cycle: handle_completion → dispatch_instance →
     // dispatch_check_step → handle_completion.
     let _ = Box::pin(handle_completion(
-        writer,
+        bus,
         std::slice::from_ref(model),
         sm_store,
         task_store,
@@ -634,7 +583,7 @@ async fn dispatch_check_step(
 /// Execute a validate step: run Claude in print mode (-p) with structured
 /// output for a cheap LLM review. No full agent session — single inference.
 async fn dispatch_validate_step(
-    writer: &Writer,
+    bus: &dyn MessageBus,
     model: &ModelDef,
     inst: &statemachine::Instance,
     work_item: &WorkItem,
@@ -702,7 +651,7 @@ async fn dispatch_validate_step(
             "validate step: claude process failed"
         );
         let _ = Box::pin(handle_completion(
-            writer,
+            bus,
             std::slice::from_ref(model),
             sm_store,
             task_store,
@@ -751,7 +700,7 @@ async fn dispatch_validate_step(
     };
 
     let _ = Box::pin(handle_completion(
-        writer,
+        bus,
         std::slice::from_ref(model),
         sm_store,
         task_store,
@@ -785,7 +734,7 @@ fn extract_claude_json_result(raw: &str) -> String {
 /// (crash between result storage and transition), apply the transition
 /// from the stored result instead of re-dispatching.
 async fn dispatch_pending(
-    writer: &Writer,
+    bus: &dyn MessageBus,
     models: &[ModelDef],
     store: &dyn StateMachineRepository,
     task_store: &dyn TaskRepository,
@@ -825,7 +774,7 @@ async fn dispatch_pending(
                 "recovering: result present but not transitioned, applying transition"
             );
             if let Err(e) = handle_completion(
-                writer,
+                bus,
                 models,
                 store,
                 task_store,
@@ -848,7 +797,7 @@ async fn dispatch_pending(
 
         // Dispatch if has assignee (pending work).
         if !inst.assignee.is_empty()
-            && let Err(e) = dispatch_instance(writer, model, inst, store, task_store).await
+            && let Err(e) = dispatch_instance(bus, model, inst, store, task_store).await
         {
             warn!(instance = %inst.id, error = %e, "failed to dispatch pending instance");
         }
@@ -859,6 +808,7 @@ async fn dispatch_pending(
 mod tests {
     use super::*;
     use crate::domain::statemachine::{StepType, TransitionDef};
+    use crate::ports::store::{StateMachineReader, StateMachineWriter};
 
     fn test_model() -> ModelDef {
         ModelDef {
@@ -1609,5 +1559,89 @@ mod tests {
         assert_eq!(wi.step_type, StepType::Validate);
         assert_eq!(wi.command.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(wi.prompt, "Check for security issues.");
+    }
+
+    /// Test dispatch_pending with in-memory stores and bus — demonstrates
+    /// testability enabled by port trait wiring (#254).
+    #[tokio::test]
+    async fn test_dispatch_pending_with_mock_stores() {
+        use crate::infra::memory_bus::InMemoryBus;
+        use crate::infra::memory_store::{InMemoryStateMachineStore, InMemoryTaskStore};
+
+        let model = test_model();
+        let sm_store = InMemoryStateMachineStore::new();
+        let task_store = InMemoryTaskStore::new();
+        let (bus_client, bus_server) = InMemoryBus::pair();
+
+        // Create an instance in the "draft" state with an assignee.
+        // The test_model has an auto transition draft → review with assignee "agent:reviewer".
+        let mut inst = sm_store
+            .create(&model, "Test PR", "Please review", "kira")
+            .unwrap();
+        assert_eq!(inst.state, "draft");
+
+        // Manually set assignee to simulate a pending dispatch.
+        inst.assignee = "agent:reviewer".to_string();
+        sm_store.save(&inst).unwrap();
+
+        // Run dispatch_pending — should dispatch the instance via the bus.
+        dispatch_pending(&bus_client, &[model], &sm_store, &task_store).await;
+
+        // The bus server side should have received at least one message
+        // (the dispatched task or event).
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(100), bus_server.recv())
+            .await
+            .expect("expected a message on the bus")
+            .expect("bus recv failed");
+
+        // Verify the message targets the assignee.
+        assert_eq!(msg.target, "agent:reviewer");
+        assert!(msg.payload.get("task").and_then(|t| t.as_str()).is_some());
+    }
+
+    /// Test handle_completion with mock stores — verifies transition logic
+    /// without any filesystem or socket dependencies.
+    #[tokio::test]
+    async fn test_handle_completion_applies_transition() {
+        use crate::infra::memory_bus::InMemoryBus;
+        use crate::infra::memory_store::{InMemoryStateMachineStore, InMemoryTaskStore};
+
+        let model = test_model();
+        let sm_store = InMemoryStateMachineStore::new();
+        let task_store = InMemoryTaskStore::new();
+        let bus = InMemoryBus::loopback();
+
+        // Create an instance and move it to "review" state.
+        let inst = sm_store
+            .create(&model, "Fix bug", "Details", "kira")
+            .unwrap();
+        sm_store
+            .move_to(
+                &mut inst.clone(),
+                &model,
+                "review",
+                "auto",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Simulate a completion with "LGTM" result — should transition to "approved".
+        let result = handle_completion(
+            &bus,
+            &[model.clone()],
+            &sm_store,
+            &task_store,
+            &inst.id,
+            "LGTM looks good",
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // Verify the instance transitioned to terminal state "approved".
+        let updated = sm_store.load(&inst.id).unwrap();
+        assert_eq!(updated.state, "approved");
     }
 }

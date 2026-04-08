@@ -610,7 +610,10 @@ async fn test_dispatch_pending_skips_completed_instances() {
     let sm_store = deskd::app::statemachine::StateMachineStore::default_for_home();
     let task_store = deskd::app::task::TaskStore::default_for_home();
     tokio::spawn(async move {
-        let _ = deskd::app::workflow::run(&sock_for_engine, models, &sm_store, &task_store).await;
+        let bus = deskd::infra::unix_bus::UnixBus::connect(&sock_for_engine)
+            .await
+            .expect("failed to connect workflow engine to bus");
+        let _ = deskd::app::workflow::run(&bus, models, &sm_store, &task_store).await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
