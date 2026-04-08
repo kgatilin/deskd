@@ -5,8 +5,9 @@
 # All rules use the flat schema: rules.<rule>.{enabled, level, threshold, exclude}
 # Levels: taboo (CI blocker, exit 1) | telemetry (track, exit 0) | personal (info, exit 0)
 #
-# Current health: 95/100 — layer violations taboo, DIP resolved, agent.rs SRP resolved (#280).
-# Remaining telemetry: fan-out (worker/serve orchestration), SRP (dto.rs at 40 fns).
+# Current health: TBD — tightened thresholds to catch real violations.
+# Known violations: SRP (mcp, workflow, graph, worker, schedule, dto), DIP (workflow hardcodes UnixBus).
+# See issues #290-#295 for cleanup plan.
 
 # Domain Model
 # =============
@@ -75,7 +76,7 @@ rules:
   fan_out:
     enabled: true
     level: telemetry
-    threshold: 8     # raised from 7: worker.rs and serve.rs are orchestration entry points at fan-out=8
+    threshold: 7     # reverted: 8 was papering over worker.rs and serve.rs coupling
     exclude:
       - "src::main"
       - "src::lib"
@@ -115,7 +116,7 @@ rules:
   srp:
     enabled: true
     level: telemetry
-    threshold: 42    # tightened from 45: agent.rs split (#280) resolved SRP — max actual is dto.rs at 40 fns
+    threshold: 30    # real limit: modules with 30+ fns have multiple responsibilities (#293, #294)
 
   # Shotgun surgery: high afferent coupling (many dependents).
   # domain and app are container modules — naturally high Ca.
