@@ -179,7 +179,12 @@ async fn fire_raw(def: &ScheduleDef, bus_socket: &str, agent_name: &str) -> Resu
     let text = def
         .config
         .as_ref()
-        .and_then(|c| c.as_str())
+        .and_then(|c| {
+            // Try scalar string first (config: "message text"),
+            // then mapping with message key (config: { message: "..." }).
+            c.as_str()
+                .or_else(|| c.get("message").and_then(|m| m.as_str()))
+        })
         .unwrap_or("scheduled event");
 
     // Write to unified inbox
