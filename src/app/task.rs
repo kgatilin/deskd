@@ -289,7 +289,10 @@ impl TaskStore {
             task.attempt = next_attempt;
             task.assignee = None;
             task.error = Some(error_msg.to_string());
-            task.retry_after = Some(crate::domain::task::compute_retry_after(next_attempt));
+            task.retry_after = Some(crate::domain::task::compute_retry_after(
+                next_attempt,
+                Utc::now(),
+            ));
             task.updated_at = Utc::now().to_rfc3339();
         } else if task.max_retries > 0 {
             // Exhausted all retries — dead letter.

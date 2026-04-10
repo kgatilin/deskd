@@ -80,15 +80,15 @@ pub struct QueueSummary {
 }
 
 /// Compute the `retry_after` timestamp using exponential backoff.
-/// Formula: `min(30s * 2^attempt, 5m)` from now.
-pub fn compute_retry_after(attempt: u32) -> String {
+/// Formula: `min(30s * 2^attempt, 5m)` from `now`.
+pub fn compute_retry_after(attempt: u32, now: chrono::DateTime<chrono::Utc>) -> String {
     let base_secs: u64 = 30;
     let max_secs: u64 = 300; // 5 minutes
     let backoff_secs = std::cmp::min(
         base_secs.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1))),
         max_secs,
     );
-    let retry_at = chrono::Utc::now() + chrono::Duration::seconds(backoff_secs as i64);
+    let retry_at = now + chrono::Duration::seconds(backoff_secs as i64);
     retry_at.to_rfc3339()
 }
 
@@ -164,33 +164,31 @@ mod tests {
 
     #[test]
     fn test_compute_retry_after_backoff() {
+        let now = chrono::Utc::now();
+
         // attempt 1 -> 30s
-        let before = chrono::Utc::now();
-        let ts = compute_retry_after(1);
+        let ts = compute_retry_after(1, now);
         let parsed = chrono::DateTime::parse_from_rfc3339(&ts).unwrap();
-        let diff = parsed.signed_duration_since(before);
-        assert!(diff.num_seconds() >= 29 && diff.num_seconds() <= 31);
+        let diff = parsed.signed_duration_since(now);
+        assert_eq!(diff.num_seconds(), 30);
 
         // attempt 2 -> 60s
-        let before = chrono::Utc::now();
-        let ts = compute_retry_after(2);
+        let ts = compute_retry_after(2, now);
         let parsed = chrono::DateTime::parse_from_rfc3339(&ts).unwrap();
-        let diff = parsed.signed_duration_since(before);
-        assert!(diff.num_seconds() >= 59 && diff.num_seconds() <= 61);
+        let diff = parsed.signed_duration_since(now);
+        assert_eq!(diff.num_seconds(), 60);
 
         // attempt 4 -> 240s
-        let before = chrono::Utc::now();
-        let ts = compute_retry_after(4);
+        let ts = compute_retry_after(4, now);
         let parsed = chrono::DateTime::parse_from_rfc3339(&ts).unwrap();
-        let diff = parsed.signed_duration_since(before);
-        assert!(diff.num_seconds() >= 239 && diff.num_seconds() <= 241);
+        let diff = parsed.signed_duration_since(now);
+        assert_eq!(diff.num_seconds(), 240);
 
         // attempt 5 -> capped at 300s (5min)
-        let before = chrono::Utc::now();
-        let ts = compute_retry_after(5);
+        let ts = compute_retry_after(5, now);
         let parsed = chrono::DateTime::parse_from_rfc3339(&ts).unwrap();
-        let diff = parsed.signed_duration_since(before);
-        assert!(diff.num_seconds() >= 299 && diff.num_seconds() <= 301);
+        let diff = parsed.signed_duration_since(now);
+        assert_eq!(diff.num_seconds(), 300);
     }
 
     #[test]

@@ -100,6 +100,89 @@ impl From<BusEnvelope> for Envelope {
     }
 }
 
+// ─── Domain Event → JSON ────────────────────────────────────────────────────
+
+use crate::domain::events::DomainEvent;
+
+impl From<&DomainEvent> for serde_json::Value {
+    fn from(event: &DomainEvent) -> Self {
+        match event {
+            DomainEvent::InstanceCreated {
+                instance_id,
+                model,
+                title,
+                created_by,
+            } => serde_json::json!({
+                "event": "instance_created",
+                "instance_id": instance_id,
+                "model": model,
+                "title": title,
+                "created_by": created_by,
+            }),
+            DomainEvent::TransitionApplied {
+                instance_id,
+                from,
+                to,
+                trigger,
+            } => serde_json::json!({
+                "event": "transition_applied",
+                "instance_id": instance_id,
+                "from": from,
+                "to": to,
+                "trigger": trigger,
+            }),
+            DomainEvent::TaskDispatched {
+                task_id,
+                instance_id,
+                assignee,
+            } => serde_json::json!({
+                "event": "task_dispatched",
+                "task_id": task_id,
+                "instance_id": instance_id,
+                "assignee": assignee,
+            }),
+            DomainEvent::TaskCompleted {
+                task_id,
+                instance_id,
+                result_summary,
+            } => serde_json::json!({
+                "event": "task_completed",
+                "task_id": task_id,
+                "instance_id": instance_id,
+                "result_summary": result_summary,
+            }),
+            DomainEvent::TaskFailed {
+                task_id,
+                instance_id,
+                error,
+            } => serde_json::json!({
+                "event": "task_failed",
+                "task_id": task_id,
+                "instance_id": instance_id,
+                "error": error,
+            }),
+            DomainEvent::TaskTimedOut {
+                task_id,
+                instance_id,
+            } => serde_json::json!({
+                "event": "task_timed_out",
+                "task_id": task_id,
+                "instance_id": instance_id,
+            }),
+            DomainEvent::InstanceCompleted {
+                instance_id,
+                model,
+                final_state,
+            } => serde_json::json!({
+                "event": "instance_completed",
+                "instance_id": instance_id,
+                "model": model,
+                "final_state": final_state,
+            }),
+        }
+    }
+}
+
 // ─── Store format: Task ──────────────────────────────────────────────────────
 
 /// Storage format for tasks (JSON file on disk).
@@ -958,5 +1041,119 @@ mod tests {
         };
         let td: TransitionDef = dto.try_into().unwrap();
         assert_eq!(td.step_type, crate::domain::statemachine::StepType::Agent);
+    }
+
+    #[test]
+    fn test_domain_event_to_json_instance_created() {
+        let event = DomainEvent::InstanceCreated {
+            instance_id: "sm-abc".into(),
+            model: "pipeline".into(),
+            title: "Fix bug".into(),
+            created_by: "kira".into(),
+        };
+        let json = serde_json::Value::from(&event);
+        assert_eq!(json["event"], "instance_created");
+        assert_eq!(json["instance_id"], "sm-abc");
+        assert_eq!(json["model"], "pipeline");
+        assert_eq!(json["title"], "Fix bug");
+        assert_eq!(json["created_by"], "kira");
+    }
+
+    #[test]
+    fn test_domain_event_to_json_transition_applied() {
+        let event = DomainEvent::TransitionApplied {
+            instance_id: "sm-123".into(),
+            from: "draft".into(),
+            to: "review".into(),
+            trigger: "auto".into(),
+        };
+        let json = serde_json::Value::from(&event);
+        assert_eq!(json["event"], "transition_applied");
+        assert_eq!(json["from"], "draft");
+        assert_eq!(json["to"], "review");
+    }
+
+    #[test]
+    fn test_domain_event_to_json_task_completed() {
+        let event = DomainEvent::TaskCompleted {
+            task_id: "task-1".into(),
+            instance_id: Some("sm-123".into()),
+            result_summary: "Done".into(),
+        };
+        let json = serde_json::Value::from(&event);
+        assert_eq!(json["event"], "task_completed");
+        assert_eq!(json["task_id"], "task-1");
+        assert_eq!(json["instance_id"], "sm-123");
+    }
+
+    #[test]
+    fn test_domain_event_to_json_task_failed() {
+        let event = DomainEvent::TaskFailed {
+            task_id: "task-2".into(),
+            instance_id: None,
+            error: "timeout".into(),
+        };
+        let json = serde_json::Value::from(&event);
+        assert_eq!(json["event"], "task_failed");
+        assert!(json["instance_id"].is_null());
+        assert_eq!(json["error"], "timeout");
+    }
+
+    #[test]
+    fn test_domain_event_to_json_instance_completed() {
+        let event = DomainEvent::InstanceCompleted {
+            instance_id: "sm-done".into(),
+            model: "pipeline".into(),
+            final_state: "approved".into(),
+        };
+        let json = serde_json::Value::from(&event);
+        assert_eq!(json["event"], "instance_completed");
+        assert_eq!(json["final_state"], "approved");
+    }
+
+    #[test]
+    fn test_domain_event_all_variants_have_json() {
+        let events = vec![
+            DomainEvent::InstanceCreated {
+                instance_id: "a".into(),
+                model: "b".into(),
+                title: "c".into(),
+                created_by: "d".into(),
+            },
+            DomainEvent::TransitionApplied {
+                instance_id: "a".into(),
+                from: "b".into(),
+                to: "c".into(),
+                trigger: "d".into(),
+            },
+            DomainEvent::TaskDispatched {
+                task_id: "a".into(),
+                instance_id: Some("b".into()),
+                assignee: "c".into(),
+            },
+            DomainEvent::TaskCompleted {
+                task_id: "a".into(),
+                instance_id: None,
+                result_summary: "b".into(),
+            },
+            DomainEvent::TaskFailed {
+                task_id: "a".into(),
+                instance_id: None,
+                error: "b".into(),
+            },
+            DomainEvent::TaskTimedOut {
+                task_id: "a".into(),
+                instance_id: None,
+            },
+            DomainEvent::InstanceCompleted {
+                instance_id: "a".into(),
+                model: "b".into(),
+                final_state: "c".into(),
+            },
+        ];
+        for event in &events {
+            let json = serde_json::Value::from(event);
+            assert!(json["event"].is_string());
+        }
     }
 }

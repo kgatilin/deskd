@@ -19,7 +19,7 @@ async fn emit_event(bus: &dyn MessageBus, event: &DomainEvent) {
         id: Uuid::new_v4().to_string(),
         source: "workflow-engine".to_string(),
         target: format!("events:{}", event.event_type()),
-        payload: event.to_json(),
+        payload: serde_json::Value::from(event),
         reply_to: None,
         metadata: Metadata {
             priority: 1,
@@ -42,7 +42,7 @@ pub async fn publish_event(bus_socket: &str, source: &str, event: &DomainEvent) 
         id: Uuid::new_v4().to_string(),
         source: source.to_string(),
         target: format!("events:{}", event.event_type()),
-        payload: event.to_json(),
+        payload: serde_json::Value::from(event),
         reply_to: None,
         metadata: Metadata {
             priority: 1,
