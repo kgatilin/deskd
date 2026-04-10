@@ -1160,7 +1160,7 @@ async fn emit_event(
         writer,
         source,
         &format!("events:{}", event.event_type()),
-        event.to_json(),
+        serde_json::Value::from(event),
     )
     .await;
 }
