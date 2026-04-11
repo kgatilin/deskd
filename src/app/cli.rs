@@ -412,4 +412,26 @@ pub enum BusAction {
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: String,
     },
+    /// Start the bus API handler on an existing bus socket.
+    ///
+    /// Connects to a running bus and exposes the query/command API
+    /// (agent_list, task_list, sm_list, etc.) so external tools like
+    /// viewgraph can use the structured API without a full `deskd serve`.
+    ///
+    /// Examples:
+    ///   deskd bus api --socket /home/kira/.deskd/bus.sock
+    ///   DESKD_BUS_SOCKET=/tmp/bus.sock deskd bus api
+    Api {
+        /// Bus socket path. Defaults to $DESKD_BUS_SOCKET, or auto-discovered
+        /// from running serve state.
+        #[arg(long, env = "DESKD_BUS_SOCKET")]
+        socket: Option<String>,
+        /// Path to deskd.yaml for SM models and schedules.
+        /// Defaults to $DESKD_AGENT_CONFIG, or auto-discovered from serve state.
+        #[arg(long, env = "DESKD_AGENT_CONFIG")]
+        config: Option<String>,
+        /// Agent name for API responses. Defaults to $DESKD_AGENT_NAME or "cli".
+        #[arg(long, env = "DESKD_AGENT_NAME")]
+        agent: Option<String>,
+    },
 }
