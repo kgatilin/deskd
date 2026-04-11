@@ -6,6 +6,7 @@ use tracing::warn;
 use crate::app::cli::SmAction;
 use crate::app::{statemachine, workflow};
 use crate::config;
+use crate::ports::bus::MessageBus;
 
 use super::truncate;
 
@@ -136,9 +137,13 @@ pub async fn handle(
                     socket
                 });
                 if std::path::Path::new(&bus_socket).exists()
-                    && let Err(e) = workflow::notify_moved(&bus_socket, &id, "cli").await
+                    && let Ok(bus) =
+                        crate::infra::unix_bus::UnixBus::connect(&bus_socket).await
                 {
-                    warn!(instance = %id, error = %e, "failed to notify workflow engine");
+                    let _ = bus.register("cli-sm-notify", &[]).await;
+                    if let Err(e) = workflow::notify_moved(&bus, &id, "cli").await {
+                        warn!(instance = %id, error = %e, "failed to notify workflow engine");
+                    }
                 }
             }
         }

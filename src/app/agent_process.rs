@@ -267,7 +267,8 @@ impl AgentProcess {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| crate::app::context::default_main_path(&state.config.work_dir));
             if main_path.exists() {
-                match crate::app::context::MainBranch::load(&main_path) {
+                let ctx_repo = crate::infra::context_store::FileContextStore::new();
+                match crate::app::context::MainBranch::load(&ctx_repo, &main_path) {
                     Ok(mut branch) => match branch.materialize().await {
                         Ok(messages) if !messages.is_empty() => {
                             let combined: String = messages
@@ -283,7 +284,7 @@ impl AgentProcess {
                                 budget = ctx_domain.main_budget_tokens.unwrap_or(10000),
                                 "injected materialized context"
                             );
-                            if let Err(e) = branch.save(&main_path) {
+                            if let Err(e) = branch.save(&ctx_repo, &main_path) {
                                 warn!(agent = %name, error = %e, "failed to save context cache");
                             }
                         }

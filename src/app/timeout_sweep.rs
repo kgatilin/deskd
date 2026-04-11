@@ -19,6 +19,7 @@ use crate::app::workflow;
 use crate::domain::events::DomainEvent;
 use crate::domain::statemachine::ModelDef;
 use crate::domain::task::TaskStatus;
+use crate::ports::bus::MessageBus;
 
 /// Parse a human-readable duration string into [`Duration`].
 ///
@@ -193,15 +194,18 @@ async fn sweep_once(models: &[ModelDef], bus_socket: &str) -> anyhow::Result<()>
         );
 
         // Emit TaskTimedOut event.
-        let _ = workflow::publish_event(
-            bus_socket,
-            "timeout-sweep",
-            &DomainEvent::TaskTimedOut {
-                task_id: task.id.clone(),
-                instance_id: Some(sm_id),
-            },
-        )
-        .await;
+        if let Ok(bus) = crate::infra::unix_bus::UnixBus::connect(bus_socket).await {
+            let _ = bus.register("timeout-sweep-event-pub", &[]).await;
+            let _ = workflow::publish_event(
+                &bus,
+                "timeout-sweep",
+                &DomainEvent::TaskTimedOut {
+                    task_id: task.id.clone(),
+                    instance_id: Some(sm_id),
+                },
+            )
+            .await;
+        }
     }
 
     Ok(())

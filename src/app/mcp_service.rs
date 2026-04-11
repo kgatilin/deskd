@@ -16,6 +16,7 @@ use crate::app::unified_inbox;
 use crate::app::workflow;
 use crate::config::UserConfig;
 use crate::domain::events::DomainEvent;
+use crate::ports::bus::MessageBus;
 use crate::ports::store::{StateMachineRepository, TaskRepository};
 
 // ─── Reminder ────────────────────────────────────────────────────────────────
@@ -326,17 +327,22 @@ pub async fn sm_create(
     info!(agent = %agent_name, instance = %inst.id, model = %model_name, "sm_create");
 
     // Emit InstanceCreated event.
-    let _ = workflow::publish_event(
-        bus_socket,
-        agent_name,
-        &DomainEvent::InstanceCreated {
-            instance_id: inst.id.clone(),
-            model: model_name.to_string(),
-            title: title.to_string(),
-            created_by: agent_name.to_string(),
-        },
-    )
-    .await;
+    if let Ok(bus) = crate::infra::unix_bus::UnixBus::connect(bus_socket).await {
+        let _ = bus
+            .register(&format!("{}-event-pub", agent_name), &[])
+            .await;
+        let _ = workflow::publish_event(
+            &bus,
+            agent_name,
+            &DomainEvent::InstanceCreated {
+                instance_id: inst.id.clone(),
+                model: model_name.to_string(),
+                title: title.to_string(),
+                created_by: agent_name.to_string(),
+            },
+        )
+        .await;
+    }
 
     // If the initial state has an assignee, dispatch the first task via the bus.
     if !inst.assignee.is_empty() {
@@ -431,25 +437,30 @@ pub async fn sm_move(
     sm_store.move_to(&mut inst, &model, state, agent_name, note, None, None)?;
     info!(agent = %agent_name, instance = %id, from = %from, to = %state, "sm_move");
 
-    // Emit TransitionApplied event.
-    let _ = workflow::publish_event(
-        bus_socket,
-        agent_name,
-        &DomainEvent::TransitionApplied {
-            instance_id: id.to_string(),
-            from: from.clone(),
-            to: state.to_string(),
-            trigger: agent_name.to_string(),
-        },
-    )
-    .await;
+    // Emit TransitionApplied event and notify workflow engine via one-shot bus.
+    if let Ok(bus) = crate::infra::unix_bus::UnixBus::connect(bus_socket).await {
+        let _ = bus
+            .register(&format!("{}-event-pub", agent_name), &[])
+            .await;
+        let _ = workflow::publish_event(
+            &bus,
+            agent_name,
+            &DomainEvent::TransitionApplied {
+                instance_id: id.to_string(),
+                from: from.clone(),
+                to: state.to_string(),
+                trigger: agent_name.to_string(),
+            },
+        )
+        .await;
 
-    // Notify workflow engine to dispatch if the new state has an assignee.
-    if !inst.assignee.is_empty()
-        && !statemachine::is_terminal(&model, &inst)
-        && let Err(e) = crate::app::workflow::notify_moved(bus_socket, id, agent_name).await
-    {
-        tracing::warn!(agent = %agent_name, instance = %id, error = %e, "failed to notify workflow engine after sm_move");
+        // Notify workflow engine to dispatch if the new state has an assignee.
+        if !inst.assignee.is_empty()
+            && !statemachine::is_terminal(&model, &inst)
+            && let Err(e) = crate::app::workflow::notify_moved(&bus, id, agent_name).await
+        {
+            tracing::warn!(agent = %agent_name, instance = %id, error = %e, "failed to notify workflow engine after sm_move");
+        }
     }
 
     Ok(SmMoved {

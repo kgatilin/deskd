@@ -35,9 +35,7 @@ async fn emit_event(bus: &dyn MessageBus, event: &DomainEvent) {
 ///
 /// Used by callers outside the workflow engine (e.g. MCP handlers) to emit
 /// events without holding a persistent bus connection.
-pub async fn publish_event(bus_socket: &str, source: &str, event: &DomainEvent) -> Result<()> {
-    let bus = crate::infra::unix_bus::UnixBus::connect(bus_socket).await?;
-    bus.register(&format!("{}-event-pub", source), &[]).await?;
+pub async fn publish_event(bus: &dyn MessageBus, source: &str, event: &DomainEvent) -> Result<()> {
     let msg = Message {
         id: Uuid::new_v4().to_string(),
         source: source.to_string(),
@@ -55,11 +53,9 @@ pub async fn publish_event(bus_socket: &str, source: &str, event: &DomainEvent) 
 
 /// Notify the workflow engine that an SM instance was moved.
 ///
-/// Connects to the bus, sends an `action: "moved"` message to `sm:<id>`,
-/// and disconnects. The workflow engine picks this up and dispatches if needed.
-pub async fn notify_moved(bus_socket: &str, instance_id: &str, source: &str) -> Result<()> {
-    let bus = crate::infra::unix_bus::UnixBus::connect(bus_socket).await?;
-    bus.register(&format!("{}-sm-notify", source), &[]).await?;
+/// Sends an `action: "moved"` message to `sm:<id>` on the given bus.
+/// The workflow engine picks this up and dispatches if needed.
+pub async fn notify_moved(bus: &dyn MessageBus, instance_id: &str, source: &str) -> Result<()> {
     let msg = Message {
         id: Uuid::new_v4().to_string(),
         source: source.to_string(),
