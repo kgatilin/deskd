@@ -237,12 +237,14 @@ pub mod app {
         truncate(&s, 80)
     }
 
-    fn truncate(s: &str, max: usize) -> String {
+    pub(crate) fn truncate(s: &str, max: usize) -> String {
         let clean: String = s.chars().filter(|c| !c.is_control()).collect();
-        if clean.len() <= max {
+        let char_count = clean.chars().count();
+        if char_count <= max {
             clean
         } else {
-            format!("{}…", &clean[..max])
+            let truncated: String = clean.chars().take(max).collect();
+            format!("{}…", truncated)
         }
     }
 
@@ -571,5 +573,47 @@ pub mod app {
         terminal.show_cursor()?;
 
         Ok(app.should_quit_all)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::truncate;
+
+        #[test]
+        fn test_truncate_short_string() {
+            assert_eq!(truncate("hello", 10), "hello");
+        }
+
+        #[test]
+        fn test_truncate_exact_length() {
+            assert_eq!(truncate("hello", 5), "hello");
+        }
+
+        #[test]
+        fn test_truncate_long_ascii() {
+            assert_eq!(truncate("hello world", 5), "hello…");
+        }
+
+        #[test]
+        fn test_truncate_multibyte_no_panic() {
+            // Each char is 4 bytes in UTF-8; byte-slicing at max would panic
+            let s = "🦀🦀🦀🦀🦀";
+            let result = truncate(s, 3);
+            assert_eq!(result, "🦀🦀🦀…");
+        }
+
+        #[test]
+        fn test_truncate_cyrillic() {
+            // Each Cyrillic char is 2 bytes; max=3 chars
+            let s = "привет"; // 6 chars, 12 bytes
+            let result = truncate(s, 3);
+            assert_eq!(result, "при…");
+        }
+
+        #[test]
+        fn test_truncate_strips_control_chars() {
+            let s = "ab\x00cd";
+            assert_eq!(truncate(s, 10), "abcd");
+        }
     }
 }
