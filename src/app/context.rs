@@ -4,21 +4,20 @@
 //! persistence (load/save via ContextRepository) and materialization
 //! (execute live nodes).
 
-use crate::infra::context_store::FileContextStore;
 use crate::ports::store::ContextRepository;
 
 // Re-export all domain types for backward compatibility.
 pub use crate::domain::context::*;
 
 impl MainBranch {
-    /// Load from YAML file (convenience wrapper over ContextRepository).
-    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
-        FileContextStore::new().load(path)
+    /// Load from file via the given repository.
+    pub fn load(repo: &dyn ContextRepository, path: &std::path::Path) -> anyhow::Result<Self> {
+        repo.load(path)
     }
 
-    /// Save to YAML file (convenience wrapper over ContextRepository).
-    pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
-        FileContextStore::new().save(self, path)
+    /// Save to file via the given repository.
+    pub fn save(&self, repo: &dyn ContextRepository, path: &std::path::Path) -> anyhow::Result<()> {
+        repo.save(self, path)
     }
 
     /// Materialize: execute live nodes and produce message list for session injection
@@ -154,8 +153,9 @@ mod tests {
             tokens_estimate: 50,
         });
 
-        branch.save(&path).expect("save failed");
-        let loaded = MainBranch::load(&path).expect("load failed");
+        let repo = crate::infra::context_store::FileContextStore::new();
+        branch.save(&repo, &path).expect("save failed");
+        let loaded = MainBranch::load(&repo, &path).expect("load failed");
 
         assert_eq!(loaded.agent, "test-agent");
         assert_eq!(loaded.budget_tokens, 8000);
