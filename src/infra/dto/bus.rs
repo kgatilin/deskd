@@ -178,6 +178,39 @@ impl From<&DomainEvent> for serde_json::Value {
     }
 }
 
+// ─── TokenUsage JSON parsing ────────────────────────────────────────────────
+
+use crate::ports::executor::TokenUsage;
+
+/// Parse a Claude `usage` JSON object into a [`TokenUsage`] struct.
+///
+/// Expects the `usage` object from Claude's assistant message, e.g.:
+/// ```json
+/// { "input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 10 }
+/// ```
+impl From<&serde_json::Value> for TokenUsage {
+    fn from(usage: &serde_json::Value) -> Self {
+        Self {
+            input_tokens: usage
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_creation_input_tokens: usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cache_read_input_tokens: usage
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

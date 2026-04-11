@@ -8,6 +8,12 @@ use anyhow::Result;
 use std::future::Future;
 use std::pin::Pin;
 
+/// Callback for streaming progress text chunks from the executor.
+///
+/// Implementations call this with each text chunk as it arrives.
+/// The concrete channel/mechanism is chosen by the caller, not the port.
+pub type ProgressSink = dyn Fn(String) + Send + Sync;
+
 /// Accumulated token usage across all messages in a task.
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
@@ -24,29 +30,6 @@ impl TokenUsage {
         self.output_tokens += other.output_tokens;
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
         self.cache_read_input_tokens += other.cache_read_input_tokens;
-    }
-
-    /// Accumulate usage from a parsed JSON value.
-    /// Expects the `usage` object from a Claude assistant message.
-    pub fn accumulate(&mut self, usage: &serde_json::Value) {
-        if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-            self.input_tokens += v;
-        }
-        if let Some(v) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
-            self.output_tokens += v;
-        }
-        if let Some(v) = usage
-            .get("cache_creation_input_tokens")
-            .and_then(|v| v.as_u64())
-        {
-            self.cache_creation_input_tokens += v;
-        }
-        if let Some(v) = usage
-            .get("cache_read_input_tokens")
-            .and_then(|v| v.as_u64())
-        {
-            self.cache_read_input_tokens += v;
-        }
     }
 }
 
@@ -78,12 +61,12 @@ pub struct TurnResult {
 pub trait Executor: Send {
     /// Send a task to the executor and wait for completion.
     ///
-    /// `progress_tx` receives streaming text chunks for real-time progress.
+    /// `progress` receives streaming text chunks for real-time progress.
     /// `image` is an optional (base64_data, media_type) pair for image attachments.
     fn send_task<'a>(
         &'a self,
         message: &'a str,
-        progress_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<String>>,
+        progress: Option<&'a ProgressSink>,
         image: Option<(&'a str, &'a str)>,
         limits: &'a TaskLimits,
     ) -> Pin<Box<dyn Future<Output = Result<TurnResult>> + Send + 'a>>;

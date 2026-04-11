@@ -407,9 +407,14 @@ pub async fn run(
 
         let task_start = std::time::Instant::now();
 
+        // Wrap the tokio channel sender in a closure for the Executor trait.
+        let progress_sink = move |text: String| {
+            let _ = progress_tx.send(text);
+        };
+
         // Use the persistent process. send_task writes to its stdin and reads
         // stdout events until the result event marks the turn complete.
-        let mut task_fut = Box::pin(process.send_task(task, Some(&progress_tx), image, &limits));
+        let mut task_fut = Box::pin(process.send_task(task, Some(&progress_sink), image, &limits));
 
         // Concurrently await task completion OR new bus messages for injection.
         let result = loop {
@@ -462,9 +467,10 @@ pub async fn run(
             }
         };
 
-        // Drop the future to release borrows on process and progress_tx.
+        // Drop the future to release borrows on process and progress_sink,
+        // then drop the sink itself to close the underlying channel.
         drop(task_fut);
-        drop(progress_tx);
+        drop(progress_sink);
         let full_response = fwd_task.await.unwrap_or_default();
 
         // Stop Telegram progress indicators.
