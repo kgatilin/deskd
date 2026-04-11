@@ -3,7 +3,7 @@
 use anyhow::Result;
 use tracing::info;
 
-use crate::app::{adapters, agent, bus, schedule, worker, workflow};
+use crate::app::{adapters, agent, bus, bus_api, schedule, worker, workflow};
 use crate::config;
 use crate::infra::paths;
 
@@ -103,6 +103,29 @@ pub async fn serve(config_path: String, tui: bool) -> Result<()> {
                 schedule::run_reminders(bus, agent_name).await;
             });
             info!(agent = %name, "started reminder runner");
+        }
+
+        // Start bus API handler for TUI / external clients.
+        {
+            let bus = bus_socket.clone();
+            let agent_name = name.clone();
+            let ucfg_clone = user_cfg.clone();
+            tokio::spawn(async move {
+                let task_store = crate::app::task::TaskStore::default_for_home();
+                let sm_store = crate::app::statemachine::StateMachineStore::default_for_home();
+                if let Err(e) = bus_api::run(
+                    &bus,
+                    &task_store,
+                    &sm_store,
+                    ucfg_clone.as_ref(),
+                    &agent_name,
+                )
+                .await
+                {
+                    tracing::error!(agent = %agent_name, error = %e, "bus_api exited");
+                }
+            });
+            info!(agent = %name, "started bus API handler");
         }
 
         // Start worker on the agent's bus.
