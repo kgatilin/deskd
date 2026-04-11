@@ -539,7 +539,9 @@ async fn test_sm_move_notifies_workflow_engine() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Simulate what sm_move does: send "moved" notification via bus.
-    let bus = deskd::infra::unix_bus::UnixBus::connect(&socket).await.unwrap();
+    let bus = deskd::infra::unix_bus::UnixBus::connect(&socket)
+        .await
+        .unwrap();
     bus.register("cli-sm-notify", &[]).await.unwrap();
     deskd::app::workflow::notify_moved(&bus, &inst.id, "cli")
         .await
