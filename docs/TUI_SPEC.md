@@ -32,11 +32,14 @@ interface ObservabilityGraph {
 
 interface ObservableNode {
   id: string                          // unique identifier
-  source: string                      // data source: "deskd:query/agent_list", "bus:*", etc.
+  source: string                      // data source (see Node Source Types below)
   type: 'poll' | 'stream' | 'derived' // how data arrives
   interval?: number                   // poll interval in ms (for type: poll)
   trigger?: string                    // bus event pattern that forces refresh (for type: poll)
   transform?: (raw: any) => any       // optional data transformation
+  render?: 'table' | 'text' | 'json' | 'list' | 'chart' // how to display (for shell/http sources)
+  columns?: string[]                  // which fields to show (for render: table)
+  params?: Record<string, string>     // parameters, supports $selected interpolation
 }
 
 interface ObservableEdge {
@@ -45,6 +48,96 @@ interface ObservableEdge {
   on: string         // what triggers navigation/filtering: "select", field name, event
   type: 'navigate' | 'filter' | 'derive'
 }
+```
+
+### Node Source Types
+
+Nodes can pull data from different source types:
+
+```typescript
+// Built-in deskd sources
+{ source: "deskd:query/agent_list" }          // bus API query
+{ source: "bus:*" }                            // raw bus stream
+{ source: "bus:agent:dev" }                    // filtered bus stream
+
+// Shell commands — execute any command, parse output
+{ source: "shell:gh issue list --repo kgatilin/deskd --json number,title,state --jq '.[]'" }
+{ source: "shell:gh pr list --repo kgatilin/deskd --state open --json number,title,headRefName" }
+{ source: "shell:git -C /home/dev/nassau/deskd log --oneline -10" }
+{ source: "shell:git -C /home/dev/nassau/deskd branch --list" }
+{ source: "shell:cat /home/dev/.deskd/reminders/*.json" }
+
+// HTTP endpoints
+{ source: "http:https://api.github.com/repos/kgatilin/deskd/actions/runs?per_page=5" }
+{ source: "http:https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFF" }
+
+// File watch — re-read on change
+{ source: "file:/home/dev/nassau/deskd/.archlint.yaml" }
+{ source: "file:/home/dev/deskd.yaml" }
+```
+
+Shell sources are the most powerful — anything you can get via CLI, you can observe. The TUI just runs the command, captures stdout, parses as JSON (or raw text), and renders it.
+
+### External Data in tui.yaml
+
+```yaml
+views:
+  # Custom view: My Work Context
+  my_context:
+    title: "My Work"
+    layout: vertical
+    nodes:
+      - id: open_issues
+        source: "shell:gh issue list --repo kgatilin/deskd --state open --label agent-ready --json number,title,labels"
+        poll: 60s
+        render: table
+        columns: [number, title, labels]
+
+      - id: open_prs
+        source: "shell:gh pr list --repo kgatilin/deskd --state open --json number,title,headRefName,reviewDecision"
+        poll: 30s
+        render: table
+        columns: [number, title, headRefName, reviewDecision]
+
+      - id: ci_status
+        source: "shell:gh run list --repo kgatilin/deskd --limit 5 --json databaseId,conclusion,displayTitle,event"
+        poll: 60s
+        render: table
+        columns: [displayTitle, conclusion, event]
+
+      - id: dirty_worktrees
+        source: "shell:git -C /home/dev/nassau/deskd worktree list --porcelain"
+        poll: 30s
+        render: text
+
+      - id: archlint_health
+        source: "shell:cd /home/dev/nassau/archlint && go run ./cmd/archlint check /home/dev/nassau/deskd --format json"
+        poll: 300s
+        render: json
+        highlight: [health, violations]
+
+    edges:
+      - from: open_issues -> open_prs (filter by linked PR)
+      - from: open_prs -> ci_status (filter by branch)
+
+  # Custom view: Trading
+  trading:
+    title: "Trading"
+    nodes:
+      - id: portfolio
+        source: "shell:sc broker holdings --json"
+        poll: 60s
+        render: table
+
+      - id: watchlist
+        source: "shell:sc broker watchlist --json"
+        poll: 300s
+        render: table
+
+      - id: fed_rate
+        source: "http:https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFF&obs_start=2026-01-01"
+        poll: 3600s
+        render: text
 ```
 
 ### How It Works
@@ -683,12 +776,57 @@ Full task queue management — create, filter, cancel.
 - `r` — add reminder (prompts for delay/time, target, message)
 - `Esc` — back
 
+## Custom Views
+
+Beyond the 8 built-in views, users define custom views in `tui.yaml`. Each custom view is a set of nodes (data sources) and edges (relationships), with a layout and render hints.
+
+Custom views appear after the built-in views. Navigation: `1`-`8` for built-in, then `F1`-`F12` for custom views, or `/` to search by name.
+
+```yaml
+# tui.yaml
+custom_views:
+  - name: work
+    title: "My Work"
+    key: F1
+    nodes:
+      - id: issues
+        source: "shell:gh issue list --repo kgatilin/deskd --state open --json number,title,labels"
+        poll: 60s
+        render: table
+        columns: [number, title, labels]
+      - id: prs
+        source: "shell:gh pr list --state open --json number,title,headRefName"
+        poll: 30s
+        render: table
+      - id: ci
+        source: "shell:gh run list --limit 5 --json displayTitle,conclusion"
+        poll: 60s
+        render: table
+    layout: vertical   # stack panels vertically
+
+  - name: trading
+    title: "Trading"
+    key: F2
+    nodes:
+      - id: portfolio
+        source: "shell:sc broker holdings --json"
+        poll: 60s
+        render: table
+      - id: alerts
+        source: "shell:sc broker price-alerts --json"
+        poll: 300s
+        render: table
+```
+
+Custom views have the same navigation as built-in views: `j/k` scroll, `Enter` expand, `Esc` back. Shell sources run with the deskd user's permissions.
+
 ## Global Navigation
 
 | Key | Action |
 |-----|--------|
-| `1`-`8` | Switch to view 1-8 |
-| `Tab` | Cycle focus between panels (Dashboard only) |
+| `1`-`8` | Switch to built-in view 1-8 |
+| `F1`-`F12` | Switch to custom view (defined in tui.yaml) |
+| `Tab` | Cycle focus between panels |
 | `j` / `k` | Move selection down/up in lists |
 | `g` / `G` | Jump to top/bottom |
 | `Enter` | Drill into selected item |
