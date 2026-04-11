@@ -16,17 +16,155 @@ Terminal UI for deskd — the primary interface for observing and controlling th
 4. Flexbox layout, hooks, state management — all built in
 5. Rich ecosystem: syntax highlighting, markdown rendering, spinners, tables
 
-## Architecture
+## Core Concept: Observability Graph
+
+The TUI is built on top of an **observability graph** — a declarative data structure that defines what the system observes and how observations relate to each other.
+
+**Every widget on screen is a node in the graph. Every data subscription is an edge.** The graph IS the behavioral specification of the system. Adding a widget = extending the spec. Removing a widget = narrowing what you observe, which means the underlying code graph could potentially be simplified.
+
+### Graph Structure
+
+```typescript
+interface ObservabilityGraph {
+  nodes: ObservableNode[]
+  edges: ObservableEdge[]
+}
+
+interface ObservableNode {
+  id: string                          // unique identifier
+  source: string                      // data source: "deskd:query/agent_list", "bus:*", etc.
+  type: 'poll' | 'stream' | 'derived' // how data arrives
+  interval?: number                   // poll interval in ms (for type: poll)
+  trigger?: string                    // bus event pattern that forces refresh (for type: poll)
+  transform?: (raw: any) => any       // optional data transformation
+}
+
+interface ObservableEdge {
+  from: string       // source node id
+  to: string         // target node id
+  on: string         // what triggers navigation/filtering: "select", field name, event
+  type: 'navigate' | 'filter' | 'derive'
+}
+```
+
+### How It Works
+
+```typescript
+// The dashboard is defined as a graph, not hardcoded components:
+const dashboardGraph: ObservabilityGraph = {
+  nodes: [
+    { id: "agents", source: "deskd:query/agent_list", type: "poll", interval: 5000,
+      trigger: "event:agent_*" },
+    { id: "tasks", source: "deskd:query/task_list", type: "poll", interval: 10000,
+      trigger: "event:task_*" },
+    { id: "workflows", source: "deskd:query/sm_list", type: "poll", interval: 10000,
+      trigger: "event:transition_*" },
+    { id: "bus", source: "bus:*", type: "stream" },
+    { id: "cost", source: "deskd:query/usage_stats", type: "poll", interval: 30000 },
+  ],
+  edges: [
+    { from: "agents", to: "tasks", on: "select", type: "filter" },
+    { from: "tasks", to: "workflows", on: "smInstanceId", type: "navigate" },
+    { from: "workflows", to: "tasks", on: "taskIds", type: "navigate" },
+    { from: "agents", to: "bus", on: "select", type: "filter" },
+  ]
+}
+
+// One hook drives all data:
+function Dashboard() {
+  const graph = useGraph(dashboardGraph)
+  // graph.nodes["agents"].data -> AgentInfo[]
+  // graph.nodes["tasks"].data -> TaskInfo[]
+  // graph.select("agents", agentName) -> filters tasks and bus by agent
+  // graph.navigate("tasks", taskId) -> switches to TaskDetail view
+}
+```
+
+### useGraph() — The Single Hook
+
+`useGraph(graph: ObservabilityGraph)` is the only data hook. It:
+
+1. **Subscribes** to all node sources (bus subscriptions, poll intervals)
+2. **Updates** node data when events arrive or polls complete
+3. **Propagates** through edges — selecting an agent filters tasks, bus messages
+4. **Navigates** — following an edge of type "navigate" switches the view
+5. **Serializes** — the current graph state can be saved/loaded as `tui.yaml`
+
+### Graph as Behavioral Spec
+
+The graph is serializable to YAML:
+
+```yaml
+# tui.yaml — this file IS the behavioral specification
+views:
+  dashboard:
+    nodes:
+      - id: agents
+        source: deskd:query/agent_list
+        poll: 5s
+        trigger: event:agent_*
+      - id: tasks
+        source: deskd:query/task_list
+        poll: 10s
+        trigger: event:task_*
+      - id: bus
+        source: bus:*
+        type: stream
+        buffer: 2000
+    edges:
+      - from: agents -> tasks (filter by assignee)
+      - from: tasks -> workflows (navigate by smInstanceId)
+
+  agent_detail:
+    nodes:
+      - id: agent
+        source: deskd:query/agent_detail
+        params: { name: "$selected" }
+      - id: agent_tasks
+        source: deskd:query/task_list
+        params: { assignee: "$selected" }
+      - id: agent_bus
+        source: bus:agent:$selected
+        type: stream
+    # ...
+```
+
+This means:
+- **Customizable**: user edits `tui.yaml` to change what they observe
+- **Comparable**: the observability graph can be compared to the code dependency graph
+- **Optimizable**: same algorithms (bisimulation, MDL) can compress both graphs
+- **Versionable**: behavioral spec lives in git alongside the code
+
+### Connection to Architecture Optimization
+
+The observability graph and the code dependency graph form a **Galois connection**:
+
+```
+Observability Graph (what you watch)
+        ↕ co-optimization
+Code Dependency Graph (how it's built)
+```
+
+If an observable node has no corresponding code path → dead observation (remove widget).
+If a code module has no observable output → unobserved code (maybe unnecessary, or missing observability).
+
+The archlint graph optimizer (#132) can take both graphs as input and suggest:
+- Code modules that are never observed → candidates for removal
+- Observations that require unnecessarily complex code paths → candidates for abstraction
+- The **minimum code graph** that satisfies the observability graph
+
+## Process Architecture
 
 ```
 deskd serve (Rust)          deskd-tui (TypeScript/Ink)
-┌──────────────┐            ┌──────────────────┐
-│ agents       │            │ React components  │
-│ workflow     │◄──bus.sock──│ useAgent()       │
-│ tasks        │            │ useTask()         │
-│ schedules    │            │ useBus()          │
-│ bus server   │            │ useWorkflow()     │
-└──────────────┘            └──────────────────┘
+┌──────────────┐            ┌──────────────────────────┐
+│ agents       │            │ ObservabilityGraph       │
+│ workflow     │◄──bus.sock──│   ↓                     │
+│ tasks        │            │ useGraph(graph)          │
+│ schedules    │            │   ↓                     │
+│ bus server   │            │ React views (rendering)  │
+│ bus_api      │            │                          │
+└──────────────┘            └──────────────────────────┘
 ```
 
 ### Bus Protocol
@@ -59,14 +197,11 @@ tui/
     bus.tsx                -- bus client: connect, send, receive, reconnect
     theme.ts               -- colors, styles, box characters
 
-    hooks/
-      useAgents.ts         -- poll agent list + status, subscribe to updates
-      useTasks.ts          -- task queue state
-      useWorkflows.ts      -- SM instances state
-      useBus.ts            -- live bus message stream
-      useCost.ts           -- usage stats
-      useSchedules.ts      -- schedule list
-      useInbox.ts          -- unified inbox
+    graph/
+      types.ts             -- ObservabilityGraph, ObservableNode, ObservableEdge
+      useGraph.ts          -- the single hook: subscribe, update, propagate, navigate
+      graphs.ts            -- predefined graphs for each view (dashboard, agent, task, etc.)
+      serialize.ts         -- load/save graph as tui.yaml
 
     views/
       Dashboard.tsx        -- main overview (default view)
@@ -92,7 +227,7 @@ tui/
 
 ## Data Layer
 
-Each hook encapsulates a data source. Hooks handle polling, bus event subscription, and state management.
+All data flows through `useGraph()`. The individual type definitions below describe the shape of data at each node. Views don't call these hooks directly — they access `graph.nodes["agents"].data` etc.
 
 ### useAgents()
 
