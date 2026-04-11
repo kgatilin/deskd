@@ -3,11 +3,20 @@
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tracing::info;
 
 use crate::app::cli::BusAction;
+use crate::config;
 
 pub async fn handle(action: BusAction) -> Result<()> {
     match action {
+        BusAction::Api {
+            socket,
+            config: config_opt,
+            agent,
+        } => {
+            return handle_api(socket, config_opt, agent).await;
+        }
         BusAction::Status { socket } => {
             if !std::path::Path::new(&socket).exists() {
                 println!("Bus is not running (socket not found: {})", socket);
@@ -139,4 +148,66 @@ pub async fn handle(action: BusAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolve the bus socket path from: explicit flag > serve state > error.
+fn resolve_bus_socket(explicit: Option<String>) -> Result<String> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    if let Some(state) = config::ServeState::load()
+        && let Some(agent) = state.find_agent_config()
+    {
+        return Ok(agent.bus_socket.clone());
+    }
+    anyhow::bail!(
+        "no --socket provided, $DESKD_BUS_SOCKET not set, and no running serve state found"
+    )
+}
+
+/// Resolve the agent config (deskd.yaml) path from: explicit flag > serve state > None.
+fn resolve_config(explicit: Option<String>) -> Option<String> {
+    if let Some(path) = explicit {
+        return Some(path);
+    }
+    config::ServeState::load()
+        .and_then(|state| state.find_agent_config().map(|a| a.config_path.clone()))
+}
+
+async fn handle_api(
+    socket: Option<String>,
+    config_opt: Option<String>,
+    agent: Option<String>,
+) -> Result<()> {
+    let bus_socket = resolve_bus_socket(socket)?;
+    let agent_name = agent.unwrap_or_else(|| "cli".to_string());
+
+    if !std::path::Path::new(&bus_socket).exists() {
+        anyhow::bail!("Bus socket not found: {}", bus_socket);
+    }
+
+    let user_config = resolve_config(config_opt)
+        .and_then(|path| match config::UserConfig::load(&path) {
+            Ok(cfg) => {
+                info!(config = %path, "loaded user config");
+                Some(cfg)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path, "failed to load user config, continuing without");
+                None
+            }
+        });
+
+    let task_store = crate::app::task::TaskStore::default_for_home();
+    let sm_store = crate::app::statemachine::StateMachineStore::default_for_home();
+
+    info!(socket = %bus_socket, agent = %agent_name, "starting bus API handler");
+    crate::app::bus_api::run(
+        &bus_socket,
+        &task_store,
+        &sm_store,
+        user_config.as_ref(),
+        &agent_name,
+    )
+    .await
 }
