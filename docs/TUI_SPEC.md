@@ -1,0 +1,760 @@
+# deskd TUI — Terminal UI Specification
+
+## Overview
+
+Terminal UI for deskd — the primary interface for observing and controlling the agent orchestration runtime. Replaces Telegram as the main interaction channel.
+
+**Framework:** Ink (React for terminal) + TypeScript. Same paradigm as Claude Code.
+**Architecture:** Separate process, communicates with deskd via Unix socket bus.
+**Launch:** `deskd tui` spawns the Ink process and connects to the running `deskd serve`.
+
+## Why Ink / React
+
+1. Claude Code uses Ink — proven in production for exactly this kind of UI
+2. React is the UI paradigm LLMs write best — agents can modify/extend the TUI
+3. Declarative components map naturally to "widget = observable" concept
+4. Flexbox layout, hooks, state management — all built in
+5. Rich ecosystem: syntax highlighting, markdown rendering, spinners, tables
+
+## Architecture
+
+```
+deskd serve (Rust)          deskd-tui (TypeScript/Ink)
+┌──────────────┐            ┌──────────────────┐
+│ agents       │            │ React components  │
+│ workflow     │◄──bus.sock──│ useAgent()       │
+│ tasks        │            │ useTask()         │
+│ schedules    │            │ useBus()          │
+│ bus server   │            │ useWorkflow()     │
+└──────────────┘            └──────────────────┘
+```
+
+### Bus Protocol
+
+The TUI connects to deskd's Unix socket as a regular bus client:
+
+```json
+{"type":"register","name":"tui","subscriptions":["*"]}
+```
+
+For queries and mutations, TUI sends messages to specific targets and reads responses. The bus is the only communication channel — no HTTP, no gRPC, no shared filesystem reads.
+
+### Process Lifecycle
+
+1. `deskd tui` checks if `deskd serve` is running (bus socket exists)
+2. Spawns `bun run` / `npx` the Ink app
+3. Ink app connects to bus, registers as `tui`
+4. On quit (`q`): Ink app disconnects, process exits. deskd keeps running.
+5. On force quit (`Q`): sends shutdown signal to deskd, then exits.
+
+### Project Structure
+
+```
+tui/
+  package.json
+  tsconfig.json
+  src/
+    index.tsx              -- entry point, arg parsing, bus connection
+    app.tsx                -- root App component, view routing, global state
+    bus.tsx                -- bus client: connect, send, receive, reconnect
+    theme.ts               -- colors, styles, box characters
+
+    hooks/
+      useAgents.ts         -- poll agent list + status, subscribe to updates
+      useTasks.ts          -- task queue state
+      useWorkflows.ts      -- SM instances state
+      useBus.ts            -- live bus message stream
+      useCost.ts           -- usage stats
+      useSchedules.ts      -- schedule list
+      useInbox.ts          -- unified inbox
+
+    views/
+      Dashboard.tsx        -- main overview (default view)
+      AgentDetail.tsx      -- single agent deep dive
+      TaskDetail.tsx       -- single task inspection
+      WorkflowDetail.tsx   -- SM instance + ASCII diagram
+      BusStream.tsx        -- live message tail with filters
+      CostTracker.tsx      -- usage and budget dashboard
+      TaskQueue.tsx        -- full task queue management
+      Schedules.tsx        -- schedule list and management
+
+    components/
+      AgentList.tsx        -- agent table with status badges
+      TaskList.tsx         -- task table with status colors
+      WorkflowList.tsx     -- active workflow instances
+      BusTail.tsx          -- last N bus messages
+      SmDiagram.tsx        -- ASCII state machine renderer
+      StatusBar.tsx        -- bottom bar: daily stats, key hints
+      FilterInput.tsx      -- search/filter prompt
+      ConfirmDialog.tsx    -- confirmation for destructive actions
+      MessageComposer.tsx  -- compose and send message to agent
+```
+
+## Data Layer
+
+Each hook encapsulates a data source. Hooks handle polling, bus event subscription, and state management.
+
+### useAgents()
+
+```typescript
+interface AgentInfo {
+  name: string
+  status: 'ready' | 'busy' | 'unhealthy' | 'stopped'
+  model: string
+  currentTask?: string
+  pid?: number
+  turns: number
+  costUsd: number
+  budgetUsd: number
+  uptime: string
+  unixUser: string
+  workDir: string
+  sessionMode: string
+}
+
+// Returns:
+{
+  agents: AgentInfo[]
+  refresh: () => void
+}
+```
+
+**Data source:** Send `{"type":"message","target":"deskd:agent_list"}` to bus, parse response. Poll every 5s. Also update on bus events matching `agent:*`.
+
+### useTasks()
+
+```typescript
+interface TaskInfo {
+  id: string
+  description: string
+  status: 'pending' | 'active' | 'done' | 'failed' | 'cancelled' | 'dead_letter'
+  assignee?: string
+  model?: string
+  labels: string[]
+  createdAt: string
+  updatedAt: string
+  attempt: number
+  maxAttempts: number
+  costUsd: number
+  turns: number
+  smInstanceId?: string
+}
+
+// Returns:
+{
+  tasks: TaskInfo[]
+  create: (desc: string, opts?: TaskCreateOpts) => void
+  cancel: (id: string) => void
+  refresh: () => void
+}
+```
+
+**Data source:** `task_list` via bus. Update on `event:task_*` bus events.
+
+### useWorkflows()
+
+```typescript
+interface WorkflowInfo {
+  instanceId: string
+  model: string
+  title: string
+  currentState: string
+  assignee?: string
+  costUsd: number
+  transitions: TransitionInfo[]
+  taskIds: string[]
+  createdAt: string
+}
+
+// Returns:
+{
+  instances: WorkflowInfo[]
+  models: ModelDef[]
+  create: (model: string, title: string) => void
+  move: (instanceId: string, toState: string, note?: string) => void
+  cancel: (instanceId: string) => void
+  refresh: () => void
+}
+```
+
+**Data source:** `sm_query` via bus.
+
+### useBus()
+
+```typescript
+interface BusMessage {
+  timestamp: string
+  source: string
+  target: string
+  messageId: string
+  payload: string
+  type: string
+}
+
+// Returns:
+{
+  messages: BusMessage[]     // ring buffer, last 2000
+  send: (target: string, payload: string) => void
+  filter: string
+  setFilter: (f: string) => void
+  filteredMessages: BusMessage[]
+}
+```
+
+**Data source:** All bus messages received by TUI's `*` subscription. No polling — purely event-driven.
+
+### useCost()
+
+```typescript
+interface CostStats {
+  period: string
+  totalCost: number
+  totalTasks: number
+  totalInputTokens: number
+  totalOutputTokens: number
+  byAgent: { name: string, cost: number, tasks: number, input: number, output: number }[]
+  budgetUsed: number
+  budgetTotal: number
+}
+
+// Returns:
+{
+  stats: CostStats
+  period: 'today' | '7d' | '30d' | 'all'
+  setPeriod: (p: string) => void
+}
+```
+
+**Data source:** `usage_stats` via bus.
+
+### useSchedules()
+
+```typescript
+interface ScheduleInfo {
+  index: number
+  cron: string
+  action: string
+  target: string
+  nextFire: string
+  description: string
+}
+
+// Returns:
+{
+  schedules: ScheduleInfo[]
+  add: (cron: string, action: string, target: string) => void
+  remove: (index: number) => void
+}
+```
+
+**Data source:** `schedule_list` via bus.
+
+### useInbox()
+
+```typescript
+interface InboxMessage {
+  inbox: string
+  from: string
+  text: string
+  timestamp: string
+  source: string
+}
+
+// Returns:
+{
+  inboxes: { name: string, count: number }[]
+  messages: InboxMessage[]
+  selectedInbox: string
+  selectInbox: (name: string) => void
+  search: (query: string) => InboxMessage[]
+}
+```
+
+**Data source:** `list_inboxes`, `read_inbox`, `search_inbox` via bus.
+
+## Views
+
+### View 1: Dashboard (default, key: `1`)
+
+```
+┌─ deskd ──────────────────────────────── 11 Apr 2026 14:32 ── $12.47 ─┐
+│                                                                       │
+│ ┌─ Agents ────────────────────┐ ┌─ Tasks ────────────────────────────┐│
+│ │ ● dev      BUSY  opus-4-6  │ │ #142 ● review PR #89    → dev     ││
+│ │   └─ task-142  12m  $2.30  │ │ #143 ○ fix CI            → sonnet  ││
+│ │ ● reviewer READY sonnet-4  │ │ #138 ✓ update docs       → dev     ││
+│ │ ● opus     READY opus-4-6  │ │ #140 ✗ refactor bus      → opus    ││
+│ │ ● sonnet   READY sonnet-4  │ │ #141 ☠ parse cfg         → haiku   ││
+│ │ ○ haiku    READY haiku-4.5 │ │                                     ││
+│ └─────────────────────────────┘ └─────────────────────────────────────┘│
+│ ┌─ Workflows ─────────────────┐ ┌─ Bus ──────────────────────────────┐│
+│ │ pr-review #a3f              │ │ 14:32:05 dev → reviewer            ││
+│ │   review → TESTING  $1.20  │ │   "review PR #89"                   ││
+│ │ deploy #b71                 │ │ 14:31:58 reviewer → telegram.out   ││
+│ │   build → DONE      $0.80  │ │   "merged #88, tagged v0.9.2"      ││
+│ └─────────────────────────────┘ └─────────────────────────────────────┘│
+│                                                                       │
+│ 23 tasks │ $12.47 today │ 142K in 38K out │  ? help  1-8 views  / search│
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+**Panels:** 2×2 grid. Agents (top-left), Tasks (top-right), Workflows (bottom-left), Bus tail (bottom-right). Footer with daily stats and key hints.
+
+**Interactions:**
+- `Tab` — cycle focus between panels
+- `Enter` on agent — go to AgentDetail
+- `Enter` on task — go to TaskDetail
+- `Enter` on workflow — go to WorkflowDetail
+- `a` — quick-add task (opens TaskQueue with create prompt)
+- `s` — send message to agent (opens MessageComposer)
+
+### View 2: Agent Detail (key: `2`, or `Enter` on agent)
+
+```
+┌─ Agent: dev ─────────────────────────────────────── Esc back ────────┐
+│ Status: BUSY (task-142)     Model: claude-opus-4-6                   │
+│ Session: persistent          PID: 48291          Uptime: 4h 23m      │
+│ Work dir: /home/dev          User: dev           Bus: bus.sock       │
+│ Budget: $50.00               Used: $12.47 (24.9%)                    │
+│ Capabilities: coding, review, delegation                             │
+├──────────────────────────────────────────────────────────────────────┤
+│ Current Task                                                         │
+│ #142 "Review PR #89 in kgatilin/deskd"                               │
+│ Status: active  Attempt: 1/3  Elapsed: 12m  Cost: $2.30  Turns: 8   │
+├──────────────────────────────────────────────────────────────────────┤
+│ Recent Tasks                                                j/k ↕    │
+│ #138 ✓ update docs for v0.9          $0.45    3m   5 turns           │
+│ #135 ✓ fix telegram adapter          $1.80   18m  14 turns           │
+│ #131 ✗ refactor config parser        $0.90    8m   6 turns           │
+│ #128 ✓ create archlint issues        $0.20    2m   3 turns           │
+├──────────────────────────────────────────────────────────────────────┤
+│ Agent Bus Messages                                          f follow │
+│ 14:32:05 → reviewer  "review PR #89"                                │
+│ 14:31:30 → opus      "analyze arch for TUI"                         │
+│ 14:28:12 ← schedule  github_poll trigger                            │
+│ 14:25:00 ← telegram  [Telegram: design TUI spec]                    │
+├──────────────────────────────────────────────────────────────────────┤
+│ s send message  k kill  p pause  l logs  e stderr         Esc back  │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Interactions:**
+- `s` — send message to this agent (opens MessageComposer)
+- `k` — kill agent process (ConfirmDialog)
+- `p` — pause/resume agent (stop dispatching tasks)
+- `l` — show full task log (scrollable)
+- `e` — show stderr tail (scrollable)
+- `Enter` on task — go to TaskDetail
+- `Esc` — back to Dashboard
+
+### View 3: Task Detail (key: `3`, or `Enter` on task)
+
+```
+┌─ Task #142 ──────────────────────────────────────── Esc back ────────┐
+│ Description: Review PR #89 in kgatilin/deskd                         │
+│ Status: active         Assignee: dev                                 │
+│ Created: 14:20:01      Updated: 14:32:05      Elapsed: 12m 04s      │
+│ Created by: schedule   SM Instance: pr-review #a3f                   │
+│ Attempt: 1/3           Retry after: —                                │
+│ Cost: $2.30            Turns: 8                                      │
+│ Model: claude-opus-4-6 Labels: [review, github]                      │
+├──────────────────────────────────────────────────────────────────────┤
+│ Metadata                                                             │
+│ {"pr_number": 89, "repo": "kgatilin/deskd", "branch": "fix-bus"}    │
+├──────────────────────────────────────────────────────────────────────┤
+│ Result                                                               │
+│ (task still active — no result yet)                                  │
+├──────────────────────────────────────────────────────────────────────┤
+│ Timeline                                                             │
+│ 14:20:01  created (by schedule, via sm-a3f review→testing)           │
+│ 14:20:02  dispatched to agent:dev                                    │
+│ 14:20:03  agent:dev accepted                                         │
+│ 14:32:05  ... (still running)                                        │
+├──────────────────────────────────────────────────────────────────────┤
+│ c cancel  w go to workflow                                 Esc back  │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Interactions:**
+- `c` — cancel task (ConfirmDialog)
+- `w` — jump to linked workflow (View 4)
+- `y` — copy result to clipboard
+- `Esc` — back
+
+### View 4: Workflow Detail (key: `4`, or `Enter` on workflow)
+
+```
+┌─ Workflow: pr-review  Instance: #a3f ────────────── Esc back ────────┐
+│ Title: Review PR #89                                                 │
+│ State: TESTING          Assignee: reviewer                           │
+│ Created: 14:18:00       Cost: $3.50     Transitions: 4               │
+├──────────────────────────────────────────────────────────────────────┤
+│ State Machine                                                        │
+│                                                                      │
+│  [new] ──auto──▶ [review] ──pass──▶ [TESTING] ──pass──▶ [merge]     │
+│                     │                   ▲                   │        │
+│                     └──fail──▶ [fix] ───┘               [[done]]    │
+│                                                                      │
+│  Current: TESTING (step: check, cmd: "cargo test")                   │
+│  Timeout: 10m → fix                                                  │
+├──────────────────────────────────────────────────────────────────────┤
+│ Transition History                                                   │
+│ 14:18:00  new → review       auto          $0.00  task-140           │
+│ 14:18:02  review → testing   pass (dev)    $1.80  task-141           │
+│ 14:28:15  testing → fix      fail (check)  $0.00  —                  │
+│ 14:29:00  fix → testing      retry (dev)   $1.70  task-142           │
+├──────────────────────────────────────────────────────────────────────┤
+│ Owned Tasks                                                          │
+│ #140 ✓  #141 ✓  #142 ●                                              │
+├──────────────────────────────────────────────────────────────────────┤
+│ m manual move  x cancel workflow  Enter on task → detail   Esc back │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Interactions:**
+- `m` — manual move: select target state from allowed transitions
+- `x` — cancel workflow instance (ConfirmDialog)
+- `Enter` on task — go to TaskDetail
+- `Esc` — back
+
+### View 5: Bus Stream (key: `5`)
+
+```
+┌─ Bus Stream ──────────────────── filter: source:dev ── 847 msgs ─────┐
+│                                                                       │
+│ 14:32:05.123  agent:dev → agent:reviewer                             │
+│   type: message  id: msg-8a3f                                        │
+│   payload: {"task": "review PR #89 in kgatilin/deskd"}               │
+│                                                                       │
+│ 14:31:58.456  agent:reviewer → telegram.out:-1003563053115           │
+│   type: message  id: msg-7b2e                                        │
+│   payload: {"text": "merged #88, tagged v0.9.2"}                     │
+│                                                                       │
+│ 14:31:42.789  schedule → agent:reviewer                              │
+│   type: message  id: msg-6c1d                                        │
+│   payload: {"action": "github_poll"}                                 │
+│                                                                       │
+│ 14:31:30.012  agent:dev → agent:opus                                 │
+│   type: message  id: msg-5d0c                                        │
+│   payload: {"task": "analyze architecture for TUI"}                  │
+│                                                                       │
+├───────────────────────────────────────────────────────────────────────┤
+│ / filter  f follow  c compact  y copy  Enter expand/collapse  Esc    │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+**Filter syntax** (type `/` then enter filter):
+- `source:dev` — messages from agent dev
+- `target:telegram*` — messages to any telegram target
+- `type:event` — only domain events
+- `pr` — freetext search in payload
+- Combine: `source:dev target:reviewer`
+
+**Interactions:**
+- `/` — open filter prompt
+- `f` — toggle follow (auto-scroll)
+- `c` — toggle compact mode (1 line vs expanded)
+- `Enter` — expand/collapse selected message
+- `y` — copy message JSON to clipboard
+- `Esc` — back to Dashboard
+
+### View 6: Cost Tracker (key: `6`)
+
+```
+┌─ Cost Tracker ─────────────────────── Period: [today] 7d  30d  all ──┐
+│                                                                       │
+│ Agent       Tasks    Cost    Input     Output    Duration              │
+│ ─────────────────────────────────────────────────────────────────      │
+│ dev            8   $4.30    42.1K     12.3K       48m                 │
+│ reviewer       6   $3.20    28.5K      8.1K       35m                 │
+│ opus           3   $3.80    51.2K     15.4K       22m                 │
+│ sonnet         4   $0.95    18.3K      5.2K       15m                 │
+│ haiku          2   $0.22     2.1K      0.8K        3m                 │
+│ ─────────────────────────────────────────────────────────────────      │
+│ TOTAL         23  $12.47   142.2K     41.8K      123m                 │
+│                                                                       │
+│ Avg per task: 6.2K input, 1.8K output, $0.54, 5.3m                   │
+├───────────────────────────────────────────────────────────────────────┤
+│ Cost Timeline (hourly)                                                │
+│  $4 │          ██                                                     │
+│  $3 │       ██ ██                                                     │
+│  $2 │    ██ ██ ██ ██                                                  │
+│  $1 │ ██ ██ ██ ██ ██                                                  │
+│  $0 ┼──┼──┼──┼──┼──┼──┼──┼──                                         │
+│     08 09 10 11 12 13 14                                              │
+├───────────────────────────────────────────────────────────────────────┤
+│ Budget: $50.00/day    Used: $12.47 (24.9%)    ████████░░░░░░░░░░░░   │
+├───────────────────────────────────────────────────────────────────────┤
+│ t cycle period  Enter agent detail                         Esc back  │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+**Interactions:**
+- `t` — cycle period: today → 7d → 30d → all
+- `Enter` on agent row — go to AgentDetail
+- `Esc` — back
+
+### View 7: Task Queue (key: `7`)
+
+Full task queue management — create, filter, cancel.
+
+```
+┌─ Task Queue ──────────── filter: [all] pending active done failed ───┐
+│                                                                       │
+│ ID    Status       Description                  Assignee  Cost  Age   │
+│ ─────────────────────────────────────────────────────────────────      │
+│ #143  ○ pending    fix CI pipeline              —         —     2m    │
+│ #142  ● active     review PR #89               dev       $2.30 12m   │
+│ #141  ☠ dead_letter parse config edge cases     haiku     $0.10 45m   │
+│ #140  ✗ failed     refactor bus error handling  opus      $1.20 1h    │
+│ #139  ✗ failed     update archlint config       sonnet    $0.30 1h    │
+│ #138  ✓ done       update docs for v0.9         dev       $0.45 2h    │
+│ #137  ✓ done       fix telegram adapter         dev       $1.80 3h    │
+│                                                                       │
+├───────────────────────────────────────────────────────────────────────┤
+│ a add task  c cancel  Enter detail  1-5 filter status      Esc back  │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+**Interactions:**
+- `a` — add task: opens input prompt for description, optional model/labels
+- `c` — cancel selected task (ConfirmDialog)
+- `1`-`5` in this view — filter by status (all/pending/active/done/failed)
+- `Enter` — go to TaskDetail
+- `Esc` — back
+
+### View 8: Schedules (key: `8`)
+
+```
+┌─ Schedules ──────────────────────────────────────────────────────────┐
+│                                                                       │
+│ #  Cron              Action         Target        Next Fire           │
+│ ──────────────────────────────────────────────────────────────────     │
+│ 0  */30 * * * *      github_poll    reviewer      14:30:00            │
+│ 1  0 9 * * 1-5       raw            dev           Mon 09:00           │
+│ 2  0 0 * * *         raw            reviewer      00:00:00            │
+│                                                                       │
+├───────────────────────────────────────────────────────────────────────┤
+│ Reminders                                                             │
+│ (none active)                                                         │
+├───────────────────────────────────────────────────────────────────────┤
+│ a add schedule  d delete  r add reminder                   Esc back  │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+**Interactions:**
+- `a` — add schedule (prompts for cron, action, target)
+- `d` — delete selected schedule (ConfirmDialog)
+- `r` — add reminder (prompts for delay/time, target, message)
+- `Esc` — back
+
+## Global Navigation
+
+| Key | Action |
+|-----|--------|
+| `1`-`8` | Switch to view 1-8 |
+| `Tab` | Cycle focus between panels (Dashboard only) |
+| `j` / `k` | Move selection down/up in lists |
+| `g` / `G` | Jump to top/bottom |
+| `Enter` | Drill into selected item |
+| `Esc` | Back to previous view / cancel |
+| `/` | Open filter/search prompt |
+| `?` | Toggle help overlay |
+| `q` | Quit TUI (deskd keeps running) |
+| `Q` | Quit deskd entirely |
+| `r` | Force refresh all data |
+
+## Bus Communication Protocol
+
+The TUI communicates with deskd exclusively through the bus. All operations map to bus messages.
+
+### Query Pattern
+
+```typescript
+// TUI sends:
+{ type: "message", target: "deskd:query", payload: {
+  method: "agent_list",  // or: task_list, sm_query, usage_stats, schedule_list, ...
+  params: { /* method-specific params */ },
+  reply_to: "tui"
+}}
+
+// deskd responds:
+{ type: "message", target: "tui", payload: {
+  method: "agent_list",
+  result: [ /* data */ ]
+}}
+```
+
+### Mutation Pattern
+
+```typescript
+// TUI sends:
+{ type: "message", target: "deskd:command", payload: {
+  method: "task_cancel",  // or: sm_move, send_message, schedule_add, ...
+  params: { id: "task-142" },
+  reply_to: "tui"
+}}
+
+// deskd responds:
+{ type: "message", target: "tui", payload: {
+  method: "task_cancel",
+  result: { success: true }
+}}
+```
+
+### Required Bus API Additions in deskd
+
+Currently the bus is message-passing only. For the TUI to query state, deskd needs a **query handler** on the bus that routes requests to the right store/service. This is a new component:
+
+```rust
+// src/app/bus_api.rs — handles query/command messages from bus clients like TUI
+//
+// Subscribes to: "deskd:query", "deskd:command"
+// Routes to: TaskStore, StateMachineStore, AgentRegistry, UsageStats, ScheduleManager
+```
+
+**Methods to implement:**
+
+| Method | Type | Maps to |
+|--------|------|---------|
+| `agent_list` | query | `agent_registry::list()` + `agent_status` |
+| `agent_detail` | query | `agent_registry::load_state()` + process info |
+| `agent_kill` | mutation | kill agent process |
+| `agent_pause` | mutation | pause task dispatching |
+| `task_list` | query | `TaskStore::list()` |
+| `task_detail` | query | `TaskStore::get()` |
+| `task_create` | mutation | `TaskStore::push()` |
+| `task_cancel` | mutation | `TaskStore::cancel()` |
+| `sm_list` | query | `StateMachineStore::list_instances()` |
+| `sm_detail` | query | `StateMachineStore::get_instance()` |
+| `sm_models` | query | loaded model definitions |
+| `sm_create` | mutation | `StateMachineStore::create_instance()` |
+| `sm_move` | mutation | workflow `handle_move_notification()` |
+| `sm_cancel` | mutation | move to terminal state |
+| `usage_stats` | query | `compute_stats()` |
+| `schedule_list` | query | `ScheduleManager::list()` |
+| `schedule_add` | mutation | `ScheduleManager::add()` |
+| `schedule_remove` | mutation | `ScheduleManager::remove()` |
+| `send_message` | mutation | bus publish to target |
+| `inbox_list` | query | `list_inboxes()` |
+| `inbox_read` | query | `read_inbox()` |
+| `inbox_search` | query | `search_inbox()` |
+| `bus_status` | query | connected clients list |
+
+## Implementation Roadmap
+
+### Step 1: Bus API in deskd (Rust)
+
+Add `src/app/bus_api.rs` — a bus client that subscribes to `deskd:query` and `deskd:command`, routes to existing stores/services, responds to the sender.
+
+This is the foundation. Without it, TUI can only watch bus messages but not query state.
+
+**Acceptance criteria:**
+- `bus_api` starts as part of `deskd serve`
+- All 22 methods in the table above work
+- Test: send a query message via `deskd agent send` to `deskd:query`, get valid JSON response
+- No changes to existing CLI or MCP interfaces
+
+### Step 2: TUI Scaffold (TypeScript/Ink)
+
+Set up the project:
+- `tui/` directory with package.json, tsconfig, Ink deps
+- `bus.ts` — Unix socket client, connect/register/send/receive
+- `app.tsx` — root component with view switching (1-8)
+- Empty view components (just titles)
+- `deskd tui` CLI command in Rust spawns the Bun process
+
+**Acceptance criteria:**
+- `deskd tui` launches alternate screen
+- View switching with 1-8 works
+- Bus connection established, raw messages visible in console
+- `q` exits cleanly
+
+### Step 3: Dashboard + Bus Stream
+
+- `hooks/useAgents.ts`, `hooks/useBus.ts`, `hooks/useTasks.ts`, `hooks/useWorkflows.ts`
+- `views/Dashboard.tsx` — 2×2 grid, all four panels, live updates
+- `views/BusStream.tsx` — live tail, follow mode, filter syntax
+- `components/StatusBar.tsx` — daily stats footer
+
+**Acceptance criteria:**
+- Dashboard shows real agent status, tasks, workflows from running deskd
+- Bus Stream shows live messages in real time
+- Filter syntax works (source:X, target:X, freetext)
+- Follow mode auto-scrolls
+
+### Step 4: Detail Views
+
+- `views/AgentDetail.tsx` — full agent info, task history, filtered bus, send message
+- `views/TaskDetail.tsx` — full task info, timeline, cancel
+- `views/WorkflowDetail.tsx` — ASCII SM diagram, transition history, manual move
+
+**Acceptance criteria:**
+- `Enter` on any item in Dashboard drills into detail
+- `Esc` goes back
+- Send message to agent works
+- Cancel task works
+- Manual SM move works (selects from available transitions)
+
+### Step 5: Management Views
+
+- `views/CostTracker.tsx` — per-agent table, hourly chart, budget bar
+- `views/TaskQueue.tsx` — full list, create task, cancel, filter by status
+- `views/Schedules.tsx` — list, add, remove schedules and reminders
+
+**Acceptance criteria:**
+- Cost tracker shows real usage data, period switching works
+- Task queue allows creating and cancelling tasks
+- Schedules view shows cron schedules, allows add/remove
+
+### Step 6: Remove ratatui TUI
+
+- Remove `src/app/tui.rs`
+- Remove ratatui/crossterm from Cargo.toml
+- Remove `--features tui` flag
+- `deskd tui` now always launches the Ink version
+
+## Dependencies
+
+### TypeScript (tui/package.json)
+
+```json
+{
+  "name": "deskd-tui",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "ink": "^5.2",
+    "react": "^18.3",
+    "ink-text-input": "^6.0",
+    "ink-select-input": "^6.0",
+    "ink-spinner": "^5.0",
+    "ink-table": "^4.0",
+    "cli-boxes": "^4.0",
+    "date-fns": "^4.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7",
+    "@types/react": "^18.3",
+    "tsx": "^4.19"
+  }
+}
+```
+
+### Rust additions
+
+```toml
+# No new Rust dependencies for TUI itself.
+# bus_api.rs uses existing crate dependencies.
+# The `deskd tui` command just spawns a child process.
+```
+
+## Open Questions
+
+1. **Bun vs Node:** Bun is faster and has better TypeScript support. But Node is more universally available. Recommendation: support both, prefer Bun if available.
+
+2. **Agent stdout streaming:** Should TUI show live agent output (token by token)? High bandwidth but useful for debugging. Defer to after Step 5.
+
+3. **Reconnection:** If deskd restarts, TUI should detect and reconnect. The bus client should have exponential backoff retry.
+
+4. **Multi-workspace:** Currently single deskd instance. If multiple workspaces exist, TUI should let you pick which one to connect to.
