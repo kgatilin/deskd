@@ -30,6 +30,3 @@ pub mod timeout_sweep;
 pub mod unified_inbox;
 pub mod worker;
 pub mod workflow;
-
-#[cfg(feature = "tui")]
-pub mod tui;
