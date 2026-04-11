@@ -9,6 +9,7 @@ pub mod agent;
 pub mod agent_process;
 pub mod agent_registry;
 pub mod bus;
+pub mod bus_api;
 pub mod cli;
 pub mod commands;
 pub mod context;
