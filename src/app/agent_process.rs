@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
 
 use crate::infra::dto::ConfigSessionMode;
-use crate::ports::executor::{Executor, TaskLimits, TokenUsage, TurnResult};
+use crate::ports::executor::{Executor, ProgressSink, TaskLimits, TokenUsage, TurnResult};
 
 use super::agent_registry::{
     format_user_message, load_state, rotate_stream_log, save_state, save_state_pub,
@@ -466,11 +466,10 @@ impl AgentProcess {
                                     }
                                 }
                             }
-                            let usage = v.get("message").and_then(|m| m.get("usage")).map(|u| {
-                                let mut tu = TokenUsage::default();
-                                tu.accumulate(u);
-                                tu
-                            });
+                            let usage = v
+                                .get("message")
+                                .and_then(|m| m.get("usage"))
+                                .map(TokenUsage::from);
                             if (!block_text.is_empty() || usage.is_some())
                                 && event_tx
                                     .send(StdoutEvent::TextBlock(block_text, usage))
@@ -540,7 +539,7 @@ impl AgentProcess {
     pub async fn send_task(
         &self,
         message: &str,
-        progress_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+        progress: Option<&ProgressSink>,
         image: Option<(&str, &str)>,
         limits: &TaskLimits,
     ) -> Result<TurnResult> {
@@ -681,8 +680,8 @@ impl AgentProcess {
                             );
                         }
 
-                        if let Some(tx) = &progress_tx {
-                            let _ = tx.send(text.clone());
+                        if let Some(sink) = &progress {
+                            sink(text.clone());
                         }
                         response_text.push_str(&text);
                     }
@@ -694,8 +693,8 @@ impl AgentProcess {
                             len = trailing.len(),
                             "drained trailing text block after result event"
                         );
-                        if let Some(tx) = &progress_tx {
-                            let _ = tx.send(trailing.clone());
+                        if let Some(sink) = &progress {
+                            sink(trailing.clone());
                         }
                         response_text.push_str(&trailing);
                     }
@@ -792,11 +791,11 @@ impl Executor for AgentProcess {
     fn send_task<'a>(
         &'a self,
         message: &'a str,
-        progress_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<String>>,
+        progress: Option<&'a ProgressSink>,
         image: Option<(&'a str, &'a str)>,
         limits: &'a TaskLimits,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TurnResult>> + Send + 'a>> {
-        Box::pin(self.send_task(message, progress_tx, image, limits))
+        Box::pin(self.send_task(message, progress, image, limits))
     }
 
     fn inject_message(&self, message: &str) -> Result<()> {

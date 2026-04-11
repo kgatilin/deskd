@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 use crate::app::agent::{
-    self, AgentConfig, Executor, TaskLimits, TokenUsage, TurnResult, build_command,
+    self, AgentConfig, Executor, ProgressSink, TaskLimits, TokenUsage, TurnResult, build_command,
 };
 use crate::app::jsonrpc::{
     JsonRpcRequest, JsonRpcResponse, MessageKind, classify_message, parse_response,
@@ -347,7 +347,7 @@ impl AcpProcess {
     async fn send_request(
         &self,
         req: &JsonRpcRequest,
-        progress_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+        progress: Option<&ProgressSink>,
     ) -> Result<JsonRpcResponse> {
         let line = req.to_line()?;
         self.stdin_tx
@@ -376,8 +376,8 @@ impl AcpProcess {
                     let _ = self.stdin_tx.send(approval);
                 }
                 Some(AcpEvent::TextBlock(text)) => {
-                    if let Some(tx) = progress_tx {
-                        let _ = tx.send(text);
+                    if let Some(sink) = progress {
+                        sink(text);
                     }
                 }
                 Some(AcpEvent::SessionComplete) => {
@@ -447,7 +447,7 @@ impl AcpProcess {
     pub async fn send_task(
         &self,
         message: &str,
-        progress_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+        progress: Option<&ProgressSink>,
         limits: &TaskLimits,
     ) -> Result<TurnResult> {
         let session_id = self
@@ -494,8 +494,8 @@ impl AcpProcess {
                         );
                     }
 
-                    if let Some(tx) = progress_tx {
-                        let _ = tx.send(text.clone());
+                    if let Some(sink) = progress {
+                        sink(text.clone());
                     }
                     response_text.push_str(&text);
                 }
@@ -587,7 +587,7 @@ impl Executor for AcpProcess {
     fn send_task<'a>(
         &'a self,
         message: &'a str,
-        progress_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<String>>,
+        progress: Option<&'a ProgressSink>,
         image: Option<(&'a str, &'a str)>,
         limits: &'a TaskLimits,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TurnResult>> + Send + 'a>> {
@@ -601,8 +601,7 @@ impl Executor for AcpProcess {
             } else {
                 message.to_string()
             };
-            self.send_task(&effective_message, progress_tx, limits)
-                .await
+            self.send_task(&effective_message, progress, limits).await
         })
     }
 
