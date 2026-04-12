@@ -12,6 +12,10 @@ import { useState, useEffect, useCallback } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import type { BusClient, ConnectionState, BusMessage } from "./bus.js";
 import { colors, viewLabels, symbols } from "./theme.js";
+import type { NavigationTarget } from "./views/types.js";
+import type { AgentState } from "./hooks/useAgents.js";
+import type { TaskState } from "./hooks/useTasks.js";
+import type { WorkflowState } from "./hooks/useWorkflows.js";
 
 // Views
 import { Dashboard } from "./views/Dashboard.js";
@@ -27,16 +31,13 @@ interface AppProps {
   bus: BusClient;
 }
 
-const views = [
-  Dashboard,
-  BusStream,
-  AgentDetail,
-  TaskDetail,
-  WorkflowView,
-  CostTracker,
-  TaskQueue,
-  Schedules,
-] as const;
+/** Navigation context for detail views. */
+interface NavContext {
+  agent: AgentState | null;
+  task: TaskState | null;
+  workflow: WorkflowState | null;
+  previousView: number;
+}
 
 export function App({ bus }: AppProps) {
   const { exit } = useApp();
@@ -45,6 +46,12 @@ export function App({ bus }: AppProps) {
     useState<ConnectionState>("disconnected");
   const [showHelp, setShowHelp] = useState(false);
   const [debugMessages, setDebugMessages] = useState<BusMessage[]>([]);
+  const [navContext, setNavContext] = useState<NavContext>({
+    agent: null,
+    task: null,
+    workflow: null,
+    previousView: 1,
+  });
 
   useEffect(() => {
     const onStateChange = (state: ConnectionState) => {
@@ -80,6 +87,45 @@ export function App({ bus }: AppProps) {
     }, 200);
   }, [bus, exit]);
 
+  const handleNavigate = useCallback(
+    (target: NavigationTarget) => {
+      switch (target.view) {
+        case "agent-detail":
+          setNavContext((prev) => ({
+            ...prev,
+            agent: target.agent,
+            previousView: activeView,
+          }));
+          setActiveView(3);
+          break;
+        case "task-detail":
+          setNavContext((prev) => ({
+            ...prev,
+            task: target.task,
+            previousView: activeView,
+          }));
+          setActiveView(4);
+          break;
+        case "workflow-detail":
+          setNavContext((prev) => ({
+            ...prev,
+            workflow: target.workflow,
+            previousView: activeView,
+          }));
+          setActiveView(5);
+          break;
+        case "dashboard":
+          setActiveView(1);
+          break;
+      }
+    },
+    [activeView],
+  );
+
+  const handleBack = useCallback(() => {
+    setActiveView(navContext.previousView);
+  }, [navContext.previousView]);
+
   useInput((input, key) => {
     // View switching: 1-8
     const num = parseInt(input, 10);
@@ -105,7 +151,52 @@ export function App({ bus }: AppProps) {
     }
   });
 
-  const ViewComponent = views[activeView - 1];
+  const renderView = () => {
+    const baseProps = {
+      bus,
+      messages: debugMessages,
+      onNavigate: handleNavigate,
+    };
+
+    switch (activeView) {
+      case 1:
+        return <Dashboard {...baseProps} />;
+      case 2:
+        return <BusStream {...baseProps} />;
+      case 3:
+        return (
+          <AgentDetail
+            {...baseProps}
+            agent={navContext.agent}
+            onBack={handleBack}
+          />
+        );
+      case 4:
+        return (
+          <TaskDetail
+            {...baseProps}
+            task={navContext.task}
+            onBack={handleBack}
+          />
+        );
+      case 5:
+        return (
+          <WorkflowView
+            {...baseProps}
+            workflow={navContext.workflow}
+            onBack={handleBack}
+          />
+        );
+      case 6:
+        return <CostTracker {...baseProps} />;
+      case 7:
+        return <TaskQueue {...baseProps} />;
+      case 8:
+        return <Schedules {...baseProps} />;
+      default:
+        return <Dashboard {...baseProps} />;
+    }
+  };
 
   return (
     <Box flexDirection="column" width="100%" height="100%">
@@ -157,7 +248,7 @@ export function App({ bus }: AppProps) {
         <HelpOverlay />
       ) : (
         <Box flexGrow={1} flexDirection="column">
-          <ViewComponent bus={bus} messages={debugMessages} />
+          {renderView()}
         </Box>
       )}
     </Box>
@@ -182,6 +273,38 @@ function HelpOverlay() {
       </Text>
       <Text>
         <Text bold>?</Text> {"  "}Toggle this help
+      </Text>
+      <Text> </Text>
+      <Text bold color={colors.primary}>
+        Dashboard
+      </Text>
+      <Text>
+        <Text bold>Tab</Text> Cycle panel focus
+      </Text>
+      <Text>
+        <Text bold>Enter</Text> Drill into focused item
+      </Text>
+      <Text> </Text>
+      <Text bold color={colors.primary}>
+        Detail Views
+      </Text>
+      <Text>
+        <Text bold>Esc</Text> {"  "}Back to previous view
+      </Text>
+      <Text>
+        <Text bold>s</Text> {"    "}Send message (Agent Detail)
+      </Text>
+      <Text>
+        <Text bold>k</Text> {"    "}Kill agent (Agent Detail)
+      </Text>
+      <Text>
+        <Text bold>c</Text> {"    "}Cancel task (Task Detail)
+      </Text>
+      <Text>
+        <Text bold>m</Text> {"    "}Manual move (Workflow)
+      </Text>
+      <Text>
+        <Text bold>x</Text> {"    "}Cancel workflow (Workflow)
       </Text>
       <Text> </Text>
       <Text color={colors.textDim}>Press any key to dismiss</Text>
