@@ -68,25 +68,41 @@ impl BusState {
                 }
             }
         } else {
-            // Subscription-based routing for reply:* and other custom targets.
-            // Match clients whose subscriptions match the target (supports glob with *).
             let mut delivered = false;
-            for client in self.clients.values() {
-                if client.name != msg.source {
-                    for sub in &client.subscriptions {
-                        if sub == target
-                            || (sub.ends_with('*') && target.starts_with(&sub[..sub.len() - 1]))
-                        {
-                            let _ = client.tx.send(msg.clone());
-                            delivered = true;
-                            break;
+
+            // Direct name-based routing: if the target matches a client name,
+            // deliver directly. This enables request-response patterns where
+            // the responder sends to msg.source (the requester's name) without
+            // requiring the requester to subscribe to its own name.
+            if let Some(client) = self.clients.get(target)
+                && client.name != msg.source
+            {
+                let _ = client.tx.send(msg.clone());
+                delivered = true;
+                debug!(target = %target, "delivered via direct name match");
+            }
+
+            // Subscription-based routing for glob patterns and custom targets.
+            if !delivered {
+                for client in self.clients.values() {
+                    if client.name != msg.source {
+                        for sub in &client.subscriptions {
+                            if sub == target
+                                || (sub.ends_with('*') && target.starts_with(&sub[..sub.len() - 1]))
+                            {
+                                let _ = client.tx.send(msg.clone());
+                                delivered = true;
+                                break;
+                            }
                         }
                     }
                 }
+                if delivered {
+                    debug!(target = %target, "delivered via pattern match");
+                }
             }
-            if delivered {
-                debug!(target = %target, "delivered via pattern match");
-            } else {
+
+            if !delivered {
                 warn!(target = %target, "no subscriber for target");
             }
         }
@@ -510,6 +526,49 @@ mod tests {
         assert!(
             rx_other.try_recv().is_err(),
             "other clients should not receive agent:dev message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_direct_name_routing_without_subscription() {
+        // Core bug #326: a client registers with no subscriptions matching its name.
+        // Responses sent to the client's name should still be delivered via direct
+        // name-based routing.
+        let mut bus = make_bus();
+        let mut rx_api = register_client(&mut bus, "deskd:api", vec!["deskd:query"]);
+        let mut rx_client = register_client(&mut bus, "viewgraph", vec![]); // no self-subscription
+
+        // Client sends query to deskd:query — delivered via subscription match
+        let query = make_msg("viewgraph", "deskd:query");
+        bus.route(&query);
+        assert!(
+            rx_api.try_recv().is_ok(),
+            "deskd:api should receive message to deskd:query"
+        );
+
+        // API sends response back to client name — must be delivered via direct name match
+        let response = make_msg("deskd:api", "viewgraph");
+        bus.route(&response);
+        let received = rx_client.try_recv();
+        assert!(
+            received.is_ok(),
+            "viewgraph should receive response via direct name routing even without self-subscription"
+        );
+        assert_eq!(received.unwrap().source, "deskd:api");
+    }
+
+    #[tokio::test]
+    async fn test_direct_name_no_self_delivery() {
+        // Direct name routing should still exclude self-delivery
+        let mut bus = make_bus();
+        let mut rx = register_client(&mut bus, "alice", vec![]);
+
+        let msg = make_msg("alice", "alice");
+        bus.route(&msg);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "direct name routing should not deliver to sender"
         );
     }
 }
