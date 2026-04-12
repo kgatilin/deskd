@@ -479,14 +479,14 @@ fn handle_agent_messages(params: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow::anyhow!("missing 'agent' parameter"))?;
     let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
 
-    let messages = crate::app::unified_inbox::agent_messages(agent, limit)?;
+    let messages = crate::app::unified_inbox::read_messages(agent, limit, None)?;
     let result: Vec<Value> = messages
         .iter()
         .map(|m| {
             json!({
-                "role": m.role,
+                "role": m.from,
                 "text": m.text,
-                "timestamp": m.timestamp,
+                "timestamp": m.ts,
             })
         })
         .collect();
@@ -500,10 +500,17 @@ async fn handle_send_message(params: &Value, bus_socket: &str, agent_name: &str)
         .get("target")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'target' parameter"))?;
-    let payload = params
-        .get("payload")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("missing 'payload' parameter"))?;
+
+    // Support `text` shorthand: wraps as {"task": text} matching MCP send_message format.
+    // Falls back to `payload` for callers needing arbitrary JSON.
+    let payload = if let Some(text) = params.get("text").and_then(|v| v.as_str()) {
+        json!({"task": text})
+    } else {
+        params
+            .get("payload")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing 'text' or 'payload' parameter"))?
+    };
     let fresh = params
         .get("fresh")
         .and_then(|v| v.as_bool())
