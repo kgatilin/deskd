@@ -168,6 +168,8 @@ impl AgentProcess {
                 if let Ok(mut s) = load_state(name) {
                     s.session_id.clear();
                     s.session_start = None;
+                    s.session_cost = 0.0;
+                    s.session_turns = 0;
                     save_state_pub(&s).ok();
                 }
 
@@ -719,11 +721,15 @@ impl AgentProcess {
                         {
                             if state.session_id != result.session_id {
                                 state.session_start = Some(Utc::now().to_rfc3339());
+                                state.session_cost = 0.0;
+                                state.session_turns = 0;
                             }
                             state.session_id = result.session_id.clone();
                         }
                         state.total_cost += cost_delta;
                         state.total_turns += turns_delta;
+                        state.session_cost += cost_delta;
+                        state.session_turns += turns_delta;
                         let _ = save_state(&state);
 
                         if let Some(budget) = limits.budget_usd

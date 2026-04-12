@@ -78,6 +78,12 @@ pub struct AgentState {
     /// Updated whenever session_id changes (new session or resume).
     #[serde(default)]
     pub session_start: Option<String>,
+    /// Cost accumulated in the current session (resets on session_id change).
+    #[serde(default)]
+    pub session_cost: f64,
+    /// Turns accumulated in the current session (resets on session_id change).
+    #[serde(default)]
+    pub session_turns: u32,
 }
 
 fn default_status() -> String {
@@ -157,6 +163,8 @@ pub async fn create(cfg: &AgentConfig) -> Result<AgentState> {
         current_task: String::new(),
         parent: None,
         session_start: None,
+        session_cost: 0.0,
+        session_turns: 0,
     };
 
     save_state(&state)?;
@@ -187,6 +195,8 @@ pub async fn create_or_update_from_config(cfg: &AgentConfig) -> Result<AgentStat
         current_task: String::new(),
         parent: None,
         session_start: None,
+        session_cost: 0.0,
+        session_turns: 0,
     };
     save_state(&state)?;
     info!(agent = %cfg.name, "sub-agent created");
@@ -248,6 +258,8 @@ pub async fn create_or_recover(
         current_task: String::new(),
         parent: None,
         session_start: None,
+        session_cost: 0.0,
+        session_turns: 0,
     };
     save_state(&state)?;
     info!(agent = %def.name, "agent created");
@@ -476,11 +488,15 @@ async fn send_inner(
     if state.config.session == ConfigSessionMode::Persistent && !new_session_id.is_empty() {
         if state.session_id != new_session_id {
             state.session_start = Some(Utc::now().to_rfc3339());
+            state.session_cost = 0.0;
+            state.session_turns = 0;
         }
         state.session_id = new_session_id;
     }
     state.total_cost += task_cost;
     state.total_turns += task_turns;
+    state.session_cost += task_cost;
+    state.session_turns += task_turns;
     save_state(&state)?;
 
     if response_text.is_empty() {
@@ -491,6 +507,8 @@ async fn send_inner(
             warn!(agent = %name, session_id = %state.session_id, "stale session_id — retrying without --resume");
             state.session_id = String::new();
             state.session_start = None;
+            state.session_cost = 0.0;
+            state.session_turns = 0;
             save_state(&state)?;
             return Box::pin(send_inner(
                 name,
@@ -700,6 +718,8 @@ created_at: "2024-01-01T00:00:00Z"
             current_task: String::new(),
             parent: None,
             session_start: Some(Utc::now().to_rfc3339()),
+            session_cost: 0.0,
+            session_turns: 0,
         };
         let yaml = serde_yaml::to_string(&state).unwrap();
         let restored: AgentState = serde_yaml::from_str(&yaml).unwrap();
@@ -757,6 +777,8 @@ created_at: "2024-01-01T00:00:00Z"
             current_task: String::new(),
             parent: Some("parent-agent".to_string()),
             session_start: Some("2026-01-01T00:00:00Z".to_string()),
+            session_cost: 0.5,
+            session_turns: 3,
         };
 
         save_state(&state).unwrap();

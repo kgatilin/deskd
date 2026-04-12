@@ -528,11 +528,14 @@ impl AcpProcess {
             if state.config.session == ConfigSessionMode::Persistent {
                 if state.session_id != session_id {
                     state.session_start = Some(Utc::now().to_rfc3339());
+                    state.session_cost = 0.0;
+                    state.session_turns = 0;
                 }
                 state.session_id = session_id;
             }
             // ACP doesn't report cost — we track turns only.
             state.total_turns += assistant_turns;
+            state.session_turns += assistant_turns;
             let _ = agent::save_state_pub(&state);
 
             // Check budget (cost-based; ACP doesn't report cost, so this is
