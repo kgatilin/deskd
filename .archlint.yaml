@@ -5,7 +5,7 @@
 # All rules use the flat schema: rules.<rule>.{enabled, level, threshold, exclude}
 # Levels: taboo (CI blocker, exit 1) | telemetry (track, exit 0) | personal (info, exit 0)
 #
-# Current health: telemetry violations only (no taboo). Last reviewed: 2026-04-11.
+# Current health: telemetry violations only (no taboo). Last reviewed: 2026-04-12.
 # Known violations (telemetry, tracked):
 #   fan-out: worker(9), commands(12), bus_api(~8) — exceed threshold 7
 #   srp:     mcp_tools(773L/many fns), worker(34), graph(33) — exceed threshold 30
@@ -133,7 +133,7 @@ rules:
   shotgun_surgery:
     enabled: true
     level: telemetry
-    threshold: 12    # tightened from 15; max actual fan-in is 11 (infra::dto), catches regressions
+    threshold: 11    # tightened from 12; max actual fan-in is 11 (infra::dto), catches regressions
     exclude:
       - "src::domain"
       - "src::app"
