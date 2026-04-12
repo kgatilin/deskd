@@ -144,6 +144,7 @@ async fn dispatch(
         "room_list" => handle_room_list().await,
         "room_children" => handle_room_children(params),
         "agent_requests" => handle_agent_requests(params, task_store),
+        "agent_messages" => handle_agent_messages(params),
         "agent_config_list" => handle_agent_config_list(),
 
         // ── Mutations ───────────────────────────────────────────────────
@@ -469,6 +470,27 @@ fn handle_agent_config_list() -> Result<Value> {
     }
 
     Ok(json!(configs))
+}
+
+fn handle_agent_messages(params: &Value) -> Result<Value> {
+    let agent = params
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'agent' parameter"))?;
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+
+    let messages = crate::app::unified_inbox::agent_messages(agent, limit)?;
+    let result: Vec<Value> = messages
+        .iter()
+        .map(|m| {
+            json!({
+                "role": m.role,
+                "text": m.text,
+                "timestamp": m.timestamp,
+            })
+        })
+        .collect();
+    Ok(json!(result))
 }
 
 // ─── Mutation handlers ──────────────────────────────────────────────────────
@@ -803,5 +825,22 @@ mod tests {
         let result = handle_inbox_search(&json!({}));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("missing 'query'"));
+    }
+
+    #[test]
+    fn test_agent_messages_missing_agent() {
+        let result = handle_agent_messages(&json!({}));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("missing 'agent'"));
+    }
+
+    #[test]
+    fn test_agent_messages_returns_array() {
+        // With a non-existent agent we get an empty array (no inbox files).
+        let result = handle_agent_messages(&json!({"agent": "nonexistent-agent-xyz"}));
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert!(val.is_array());
+        assert_eq!(val.as_array().unwrap().len(), 0);
     }
 }
