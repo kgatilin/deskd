@@ -4,6 +4,7 @@
  * Panels: Agents, Tasks, Workflows, Bus Tail.
  * Status bar at bottom with daily aggregates.
  * Tab cycles focus between panels, Enter for drill-down.
+ * Up/Down arrows scroll within focused panel.
  */
 
 import { useState, useMemo } from "react";
@@ -18,6 +19,7 @@ import type { BusMessage } from "../bus.js";
 
 const PANEL_COUNT = 4;
 const BUS_TAIL_COUNT = 15;
+const PANEL_MAX_ITEMS = 8;
 
 const statusBadge: Record<AgentState["status"], string> = {
   online: symbols.connected,
@@ -89,9 +91,11 @@ function PanelHeader({ title, focused }: { title: string; focused: boolean }) {
 function AgentsPanel({
   agents,
   focused,
+  selectedIndex,
 }: {
   agents: AgentState[];
   focused: boolean;
+  selectedIndex: number;
 }) {
   return (
     <Box
@@ -106,13 +110,16 @@ function AgentsPanel({
       {agents.length === 0 ? (
         <Text color={colors.textDim}>No agents connected</Text>
       ) : (
-        agents.slice(0, 8).map((a) => (
+        agents.slice(0, PANEL_MAX_ITEMS).map((a, i) => (
           <Text key={a.name} wrap="truncate">
-            <Text color={statusColor[a.status]}>
-              {statusBadge[a.status]}
+            <Text color={focused && i === selectedIndex ? colors.accent : statusColor[a.status]}>
+              {focused && i === selectedIndex ? symbols.arrow : statusBadge[a.status]}
             </Text>
             {" "}
-            <Text color={colors.text} bold>
+            <Text
+              color={focused && i === selectedIndex ? colors.textBright : colors.text}
+              bold={focused && i === selectedIndex}
+            >
               {a.name}
             </Text>
             {a.model ? (
@@ -134,9 +141,11 @@ function AgentsPanel({
 function TasksPanel({
   tasks,
   focused,
+  selectedIndex,
 }: {
   tasks: TaskState[];
   focused: boolean;
+  selectedIndex: number;
 }) {
   return (
     <Box
@@ -151,11 +160,18 @@ function TasksPanel({
       {tasks.length === 0 ? (
         <Text color={colors.textDim}>No tasks yet</Text>
       ) : (
-        tasks.slice(0, 8).map((t) => (
+        tasks.slice(0, PANEL_MAX_ITEMS).map((t, i) => (
           <Text key={t.id} wrap="truncate">
-            <Text color={taskColor[t.status]}>{taskIcon[t.status]}</Text>
+            <Text color={focused && i === selectedIndex ? colors.accent : taskColor[t.status]}>
+              {focused && i === selectedIndex ? symbols.arrow : taskIcon[t.status]}
+            </Text>
             {" "}
-            <Text color={colors.text}>{t.title}</Text>
+            <Text
+              color={focused && i === selectedIndex ? colors.textBright : colors.text}
+              bold={focused && i === selectedIndex}
+            >
+              {t.title}
+            </Text>
             {t.assignee ? (
               <Text color={colors.textDim}> @{t.assignee}</Text>
             ) : null}
@@ -169,9 +185,11 @@ function TasksPanel({
 function WorkflowsPanel({
   workflows,
   focused,
+  selectedIndex,
 }: {
   workflows: WorkflowState[];
   focused: boolean;
+  selectedIndex: number;
 }) {
   return (
     <Box
@@ -186,9 +204,15 @@ function WorkflowsPanel({
       {workflows.length === 0 ? (
         <Text color={colors.textDim}>No active workflows</Text>
       ) : (
-        workflows.slice(0, 8).map((w) => (
+        workflows.slice(0, PANEL_MAX_ITEMS).map((w, i) => (
           <Text key={w.id} wrap="truncate">
-            <Text color={colors.secondary} bold>
+            <Text color={focused && i === selectedIndex ? colors.accent : colors.secondary}>
+              {focused && i === selectedIndex ? symbols.arrow + " " : "  "}
+            </Text>
+            <Text
+              color={focused && i === selectedIndex ? colors.textBright : colors.secondary}
+              bold={focused && i === selectedIndex}
+            >
               {w.name}
             </Text>
             <Text color={colors.textDim}> [{w.currentState}]</Text>
@@ -269,14 +293,15 @@ function StatusBar({
         {"  "}|{"  "}
         Cost: <Text color={colors.accent}>${totalCost.toFixed(2)}</Text>
         {"  "}|{"  "}
-        <Text color={colors.textDim}>Tab:focus  Enter:detail  1-8:views  ?:help</Text>
+        <Text color={colors.textDim}>Tab:focus  {symbols.arrow}/{symbols.arrow}:select  Enter:detail  1-8:views  ?:help</Text>
       </Text>
     </Box>
   );
 }
 
-export function Dashboard({ bus }: ViewProps) {
+export function Dashboard({ bus, onNavigate }: ViewProps) {
   const [focusedPanel, setFocusedPanel] = useState(0);
+  const [selectedIndices, setSelectedIndices] = useState([0, 0, 0, 0]);
   const agents = useAgents(bus);
   const tasks = useTasks(bus);
   const workflows = useWorkflows(bus);
@@ -287,11 +312,59 @@ export function Dashboard({ bus }: ViewProps) {
       setFocusedPanel((prev) => (prev + 1) % PANEL_COUNT);
       return;
     }
-    // Enter — placeholder for drill-down navigation
-    if (key.return) {
-      // Future: emit navigation event based on focused panel
+
+    // Up/Down to select items within focused panel
+    if (key.upArrow) {
+      setSelectedIndices((prev) => {
+        const next = [...prev];
+        next[focusedPanel] = Math.max(0, (next[focusedPanel] ?? 0) - 1);
+        return next;
+      });
       return;
     }
+    if (key.downArrow) {
+      const maxItems = [agents.length, tasks.length, workflows.length, 0];
+      setSelectedIndices((prev) => {
+        const next = [...prev];
+        const max = Math.min((maxItems[focusedPanel] ?? 0) - 1, PANEL_MAX_ITEMS - 1);
+        next[focusedPanel] = Math.min((next[focusedPanel] ?? 0) + 1, Math.max(0, max));
+        return next;
+      });
+      return;
+    }
+
+    // Enter — drill-down based on focused panel
+    if (key.return && onNavigate) {
+      const idx = selectedIndices[focusedPanel] ?? 0;
+      switch (focusedPanel) {
+        case 0: {
+          const agent = agents[idx];
+          if (agent) {
+            onNavigate({ view: "agent-detail", agent });
+          }
+          break;
+        }
+        case 1: {
+          const task = tasks[idx];
+          if (task) {
+            onNavigate({ view: "task-detail", task });
+          }
+          break;
+        }
+        case 2: {
+          const workflow = workflows[idx];
+          if (workflow) {
+            onNavigate({ view: "workflow-detail", workflow });
+          }
+          break;
+        }
+        // Panel 3 (Bus Tail) — no drill-down, switch to Bus Stream
+        case 3:
+          break;
+      }
+      return;
+    }
+
     // Suppress unused variable warning
     void input;
   });
@@ -300,13 +373,25 @@ export function Dashboard({ bus }: ViewProps) {
     <Box flexDirection="column" flexGrow={1}>
       {/* Top row: Agents + Tasks */}
       <Box flexGrow={1}>
-        <AgentsPanel agents={agents} focused={focusedPanel === 0} />
-        <TasksPanel tasks={tasks} focused={focusedPanel === 1} />
+        <AgentsPanel
+          agents={agents}
+          focused={focusedPanel === 0}
+          selectedIndex={selectedIndices[0] ?? 0}
+        />
+        <TasksPanel
+          tasks={tasks}
+          focused={focusedPanel === 1}
+          selectedIndex={selectedIndices[1] ?? 0}
+        />
       </Box>
 
       {/* Bottom row: Workflows + Bus Tail */}
       <Box flexGrow={1}>
-        <WorkflowsPanel workflows={workflows} focused={focusedPanel === 2} />
+        <WorkflowsPanel
+          workflows={workflows}
+          focused={focusedPanel === 2}
+          selectedIndex={selectedIndices[2] ?? 0}
+        />
         <BusTailPanel messages={messages} focused={focusedPanel === 3} />
       </Box>
 
