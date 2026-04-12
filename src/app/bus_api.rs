@@ -208,6 +208,19 @@ async fn handle_agent_detail(params: &Value) -> Result<Value> {
         0.0
     };
 
+    // Compute session duration dynamically from session_start.
+    let session_duration_ms = state
+        .session_start
+        .as_ref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|start| {
+            let now = chrono::Utc::now();
+            (now - start.with_timezone(&chrono::Utc))
+                .num_milliseconds()
+                .max(0) as u64
+        })
+        .unwrap_or(0);
+
     Ok(json!({
         "name": state.config.name,
         "model": state.config.model,
@@ -218,6 +231,11 @@ async fn handle_agent_detail(params: &Value) -> Result<Value> {
         "session_id": state.session_id,
         "claude_session_id": state.session_id,
         "session_start": state.session_start,
+        "session_cost_usd": state.session_cost,
+        "session_turns": state.session_turns,
+        "session_duration_ms": session_duration_ms,
+        "lifetime_cost_usd": state.total_cost,
+        "lifetime_turns": state.total_turns,
         "total_turns": state.total_turns,
         "total_cost": state.total_cost,
         "created_at": state.created_at,
