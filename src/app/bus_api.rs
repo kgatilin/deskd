@@ -942,11 +942,7 @@ fn handle_schedule_remove(
     }))
 }
 
-async fn handle_agent_restart(
-    params: &Value,
-    _bus_socket: &str,
-    caller: &str,
-) -> Result<Value> {
+async fn handle_agent_restart(params: &Value, _bus_socket: &str, caller: &str) -> Result<Value> {
     let agent = params
         .get("agent")
         .and_then(|v| v.as_str())
@@ -977,11 +973,7 @@ async fn handle_agent_restart(
     }))
 }
 
-async fn handle_agent_compress(
-    params: &Value,
-    bus_socket: &str,
-    caller: &str,
-) -> Result<Value> {
+async fn handle_agent_compress(params: &Value, bus_socket: &str, caller: &str) -> Result<Value> {
     let agent = params
         .get("agent")
         .and_then(|v| v.as_str())
