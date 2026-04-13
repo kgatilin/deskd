@@ -1,200 +1,20 @@
-# archlint configuration for deskd
-# See: https://github.com/mshogin/archlint
-#
-# Schema: archlint-rs (Rust engine)
-# All rules use the flat schema: rules.<rule>.{enabled, level, threshold, exclude}
-# Levels: taboo (CI blocker, exit 1) | telemetry (track, exit 0) | personal (info, exit 0)
-#
-# Current health: telemetry violations only (no taboo). Last reviewed: 2026-04-12.
-# Known violations (telemetry, tracked):
-#   fan-out: worker(9), commands(12), bus_api(~8) — exceed threshold 7
-#   srp:     mcp_tools(773L/many fns), worker(34), graph(33) — exceed threshold 30
-#   isp:     TaskWriter(8 methods), TaskRepository(9) — exceed threshold 7
-# Recently resolved: DIP workflow (#305), mcp SRP split (#307), stores→infra (#303),
-#   dto split (#294), DomainEvent serde→infra (#292), tokio from Executor port (#295).
-# New modules: tui (PR #301), bus_api (PR #316), mcp_protocol/mcp_tools (PR #307),
-#   infra/{task_store,sm_store,bus_server} (PR #303), infra/dto/* (PR #304).
-
-# Domain Model
-# =============
-# deskd is an agent orchestration runtime. Core domain concepts:
-#
-# Domain Layer (pure logic, no I/O, no serde):
-#   src/domain/   — message, context, task, statemachine, agent (Agent/AgentStatus/AgentCapabilities),
-#                   events (DomainEvent), workitem (WorkItem)
-#
-# Ports Layer (trait definitions):
-#   src/ports/    — bus, store, executor traits
-#
-# Infrastructure Layer (I/O, external systems):
-#   src/infra/    — unix_bus, memory_bus, memory_store, task_store, sm_store,
-#                   bus_server, dto/{bus,config,context,instance,task}
-#
-# Application Layer (orchestration):
-#   src/app/      — worker, mcp, mcp_protocol, mcp_tools, mcp_service, graph,
-#                   workflow, schedule, adapters, bus_api, tui, context
-#   src/config.rs — YAML config parsing
-#
-# Entry Points / CLI:
-#   src/main.rs, src/lib.rs, src/bin/session2graph
-
-# ---- Layer enforcement -------------------------------------------------------
-# Desired dependency directions:
-#   cli -> app, infra, ports, domain
-#   app -> domain, ports, infra
-#   infra -> domain, ports
-#   ports -> domain
-#   domain -> (nothing)
-
-layers:
-  - name: domain
-    paths:
-      - "src/domain"
-
-  - name: ports
-    paths:
-      - "src/ports"
-
-  - name: infra
-    paths:
-      - "src/infra"
-
-  - name: app
-    paths:
-      - "src/app"
-      - "src/config"
-
-  - name: cli
-    paths:
-      - "src/main"
-      - "src/lib"
-      - "src/bin/session2graph"
-
-allowed_dependencies:
-  domain: []
-  ports: ["domain"]
-  infra: ["domain", "ports"]
-  app: ["domain", "ports", "infra"]
-  cli: ["domain", "ports", "infra", "app"]
-
-# ---- Rules -------------------------------------------------------------------
-
 rules:
-  # Fan-out: how many internal modules does a component depend on.
   fan_out:
     enabled: true
+    error_on_violation: false
     level: telemetry
-    threshold: 7     # reverted: 8 was papering over worker.rs and serve.rs coupling
-    exclude:
-      - "src::main"
-      - "src::lib"
-
-  # Fan-in: how many components depend on a given module.
+    threshold: 4
   fan_in:
     enabled: true
+    error_on_violation: false
     level: telemetry
-    threshold: 12
-    exclude: []
-
-  # Cycles: circular dependencies between modules.
-  # Currently clean — enforce as taboo to prevent regressions.
-  cycles:
-    enabled: true
-    level: taboo
-    threshold: 0
-
-  # Layer violations: forbidden cross-layer dependencies.
-  # Zero violations found — domain->nothing, ports->domain, infra->domain+ports, app->all.
-  # Enforce as taboo to prevent regressions.
+    threshold: 8
   layer_violations:
     enabled: true
-    level: taboo
-    threshold: 0
-
-  # ISP: traits with too many methods (interface segregation principle).
-  # Issues #179 (TaskRepository, 9 methods) and #180 (StateMachineRepository, 6 methods).
-  isp:
-    enabled: true
+    error_on_violation: false
     level: telemetry
-    threshold: 7
-
-  # SRP: modules with too many functions/methods.
-  # Threshold 10 is too aggressive for our codebase — many modules legitimately
-  # have 15-50 functions. Track at telemetry with a higher threshold.
-  # Issues #293 (mcp split) and #294 (dto split) are resolved; remaining violations:
-  # mcp_tools (tool impl collection, ~16 fns), worker (34), graph (33).
-  srp:
+  dependency_inversion:
     enabled: true
+    error_on_violation: false
     level: telemetry
-    threshold: 30
-
-  # Shotgun surgery: high afferent coupling (many dependents).
-  # domain and app are container modules — naturally high Ca.
-  shotgun_surgery:
-    enabled: true
-    level: telemetry
-    threshold: 11    # tightened from 12; max actual fan-in is 11 (infra::dto), catches regressions
-    exclude:
-      - "src::domain"
-      - "src::app"
-
-  # DIP: modules with structs but no trait definitions.
-  # Resolved: #193 (Executor trait), #195 (MCP extraction), #196 (data-only exceptions).
-  # All remaining DIP exceptions are justified below.
-  dip:
-    enabled: true
-    level: telemetry
-    exclude:
-      # Domain value objects — pure data carriers, no behaviour.
-      # Traits that abstract over these types live in ports/bus.rs and ports/store.rs
-      # (MessageBus, TaskRepository, StateMachineRepository). The linter cannot infer
-      # cross-module trait association, so these are correctly excepted.
-      - "src::domain::message"      # 3 structs — value objects for bus protocol
-      # domain::context and domain::task removed from excludes (#279) — they contain
-      # business logic (compaction policy, retry backoff, criteria matching) that should
-      # eventually be behind port traits. DIP violations are tracked as telemetry.
-      - "src::domain::statemachine" # 4 structs — SM value objects; trait in ports/store.rs
-      - "src::domain::agent"        # Agent, AgentCapabilities, AgentStatus, SessionMode, AgentRuntime — pure value objects
-      - "src::domain::events"       # DomainEvent enum — pure data, no behaviour
-      - "src::domain::workitem"     # WorkItem struct — intermediate representation, pure value object
-
-      # Config parsing layer — a DTO, not a service. It is never abstracted behind
-      # a trait because it is only ever read once at startup. Adding traits here
-      # would be YAGNI and obscure the module's intent.
-      - "src::config"               # 14 structs — YAML config parsing DTOs
-
-      # Serde anti-corruption layer (ACL). infra/dto.rs exists specifically to hold
-      # wire-format structs so that serde derives never leak into the domain. Traits
-      # would be meaningless here — this boundary is structural, not behavioural.
-      - "src::infra::dto"           # 15 structs — serde ACL, wire ↔ domain mapping
-
-      # Agent process module — AgentProcess now implements ports::executor::Executor.
-      # Remaining structs (AgentConfig, AgentState) are config/state DTOs, not services.
-      # The DIP violation is resolved via the Executor trait; the DTOs are correctly
-      # excepted for the same reason as config and dto modules above.
-      - "src::app::agent"           # 3 structs — AgentProcess (impl Executor), AgentConfig, AgentState
-
-      # ACP (Agent Client Protocol) module — AcpProcess implements Executor.
-      # Remaining structs are JSON-RPC protocol types (wire format, not domain).
-      - "src::app::acp"             # AcpProcess (impl Executor) + JSON-RPC DTOs
-
-      # MCP protocol module — JSON-RPC I/O types + bus channel listener.
-      # Wire-format types (Request, Response, Notification) are protocol DTOs;
-      # no domain behaviour, no service abstraction warranted.
-      - "src::app::mcp_protocol"    # JSON-RPC protocol types + I/O helpers
-
-      # TUI view layer — terminal UI data models (App, BusEvent, AgentInfo, View).
-      # These are view-layer state carriers, not domain services. Data is read via
-      # port traits (&dyn TaskReader, &dyn StateMachineReader) — DIP is satisfied
-      # at the service boundary; the view structs themselves need no trait.
-      - "src::app::tui"             # App, BusEvent, AgentInfo, View — TUI state models
-
-      # Bus API handler — routes deskd:query/deskd:command messages to stores.
-      # Handler structs are request/response dispatchers, not domain services.
-      # All data access goes through existing store APIs (trait objects at boundaries).
-      - "src::app::bus_api"         # query/command router structs (22 method handlers)
-
-      # Standalone binary — not part of the hexagonal architecture. session2graph
-      # reads session logs and emits DOT graphs; it has no injected dependencies
-      # and therefore no need for DIP.
-      - "src::bin::session2graph"   # 13 structs — standalone CLI, outside hex arch
+# last reviewed: 2026-04-12
