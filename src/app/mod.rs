@@ -4,6 +4,7 @@
 //! (domain types and port traits). Reduces lib.rs fan-out.
 
 pub mod a2a;
+pub mod a2a_server;
 pub mod acp;
 pub mod adapters;
 pub mod agent;

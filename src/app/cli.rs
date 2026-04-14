@@ -459,4 +459,13 @@ pub enum A2aAction {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Start the A2A HTTP server (Agent Card endpoint + JSON-RPC).
+    Serve {
+        /// Path to workspace.yaml. Auto-detected from running serve if omitted.
+        #[arg(long)]
+        config: Option<String>,
+        /// Listen address override (default from workspace.yaml a2a.listen).
+        #[arg(long)]
+        listen: Option<String>,
+    },
 }
