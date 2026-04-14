@@ -47,6 +47,10 @@ pub struct AgentConfig {
     /// Context system configuration (main branch, compaction).
     #[serde(default)]
     pub context: Option<ConfigContextConfig>,
+    /// Memory agent: context usage fraction (0.0–1.0) that triggers compaction.
+    /// Default: 0.8.
+    #[serde(default)]
+    pub compact_threshold: Option<f64>,
 }
 
 fn default_budget_usd() -> f64 {
@@ -236,6 +240,7 @@ pub async fn create_or_recover(
         session: ConfigSessionMode::default(),
         runtime: def.runtime.clone(),
         context: user_cfg.and_then(|c| c.context.clone()),
+        compact_threshold: None,
     };
 
     let path = state_path(&def.name);
@@ -653,6 +658,7 @@ pub async fn spawn_ephemeral(
         session: ConfigSessionMode::default(),
         runtime: ConfigAgentRuntime::default(),
         context: None,
+        compact_threshold: None,
     };
 
     create(&cfg).await?;
@@ -707,6 +713,7 @@ created_at: "2024-01-01T00:00:00Z"
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
             context: None,
+            compact_threshold: None,
         };
         let state = AgentState {
             config: cfg,
@@ -766,6 +773,7 @@ created_at: "2024-01-01T00:00:00Z"
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
             context: None,
+            compact_threshold: None,
         };
         let state = AgentState {
             config: cfg,
