@@ -8,7 +8,7 @@ rules:
     enabled: true
     error_on_violation: false
     level: telemetry
-    threshold: 8
+    threshold: 6
   layer_violations:
     enabled: true
     error_on_violation: false
@@ -17,4 +17,4 @@ rules:
     enabled: true
     error_on_violation: false
     level: telemetry
-# last reviewed: 2026-04-12
+# last reviewed: 2026-04-13
