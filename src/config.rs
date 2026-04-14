@@ -45,6 +45,30 @@ pub struct WorkspaceConfig {
     /// Telegram user IDs allowed to run admin commands (/restart, etc.).
     #[serde(default)]
     pub admin_telegram_ids: Vec<i64>,
+    /// A2A protocol configuration for cross-instance agent communication.
+    #[serde(default)]
+    pub a2a: Option<A2aConfig>,
+}
+
+/// A2A protocol configuration in workspace.yaml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct A2aConfig {
+    /// Public URL for this deskd instance (e.g. "https://dev.nassau.example.com").
+    pub url: String,
+    /// API key for authenticating incoming A2A requests.
+    /// Typically set via ${A2A_API_KEY}.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// HTTP listen address for the A2A server (e.g. "0.0.0.0:3000").
+    #[serde(default = "default_a2a_listen")]
+    pub listen: String,
+    /// Instance-level description shown in the Agent Card.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+fn default_a2a_listen() -> String {
+    "0.0.0.0:3000".to_string()
 }
 
 /// A room is a named work context: namespace + context folder + set of agents.
@@ -291,6 +315,25 @@ pub struct UserConfig {
     /// Context system configuration (main branch, compaction).
     #[serde(default)]
     pub context: Option<ConfigContextConfig>,
+    /// A2A skills advertised in the Agent Card.
+    #[serde(default)]
+    pub skills: Vec<SkillDef>,
+}
+
+/// An A2A skill advertised in the Agent Card (per A2A spec).
+/// Defined in deskd.yaml under `skills:`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillDef {
+    /// Unique skill identifier (e.g. "code-review").
+    pub id: String,
+    /// Human-readable name (e.g. "Code Review").
+    pub name: String,
+    /// What this skill does.
+    #[serde(default)]
+    pub description: String,
+    /// Tags for discovery (e.g. ["go", "rust"]).
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 fn default_model() -> String {

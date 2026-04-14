@@ -103,6 +103,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: TaskAction,
     },
+    /// A2A protocol: Agent Card generation and (future) HTTP server.
+    A2a {
+        #[command(subcommand)]
+        action: A2aAction,
+    },
     /// Show aggregate token usage and cost across all agents.
     ///
     /// Examples:
@@ -443,5 +448,24 @@ pub enum BusAction {
         /// Agent name for API responses. Defaults to $DESKD_AGENT_NAME or "cli".
         #[arg(long, env = "DESKD_AGENT_NAME")]
         agent: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum A2aAction {
+    /// Generate and print the Agent Card JSON for this workspace.
+    AgentCard {
+        /// Path to workspace.yaml. Auto-detected from running serve if omitted.
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Start the A2A HTTP server (Agent Card endpoint + JSON-RPC).
+    Serve {
+        /// Path to workspace.yaml. Auto-detected from running serve if omitted.
+        #[arg(long)]
+        config: Option<String>,
+        /// Listen address override (default from workspace.yaml a2a.listen).
+        #[arg(long)]
+        listen: Option<String>,
     },
 }
