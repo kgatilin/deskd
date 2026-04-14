@@ -45,6 +45,30 @@ pub struct WorkspaceConfig {
     /// Telegram user IDs allowed to run admin commands (/restart, etc.).
     #[serde(default)]
     pub admin_telegram_ids: Vec<i64>,
+    /// A2A protocol configuration for cross-instance agent communication.
+    #[serde(default)]
+    pub a2a: Option<A2aConfig>,
+}
+
+/// A2A protocol configuration in workspace.yaml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct A2aConfig {
+    /// Public URL for this deskd instance (e.g. "https://dev.nassau.example.com").
+    pub url: String,
+    /// API key for authenticating incoming A2A requests.
+    /// Typically set via ${A2A_API_KEY}.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// HTTP listen address for the A2A server (e.g. "0.0.0.0:3000").
+    #[serde(default = "default_a2a_listen")]
+    pub listen: String,
+    /// Instance-level description shown in the Agent Card.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+fn default_a2a_listen() -> String {
+    "0.0.0.0:3000".to_string()
 }
 
 /// A room is a named work context: namespace + context folder + set of agents.
@@ -291,6 +315,25 @@ pub struct UserConfig {
     /// Context system configuration (main branch, compaction).
     #[serde(default)]
     pub context: Option<ConfigContextConfig>,
+    /// A2A skills advertised in the Agent Card.
+    #[serde(default)]
+    pub skills: Vec<SkillDef>,
+}
+
+/// An A2A skill advertised in the Agent Card (per A2A spec).
+/// Defined in deskd.yaml under `skills:`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillDef {
+    /// Unique skill identifier (e.g. "code-review").
+    pub id: String,
+    /// Human-readable name (e.g. "Code Review").
+    pub name: String,
+    /// What this skill does.
+    #[serde(default)]
+    pub description: String,
+    /// Tags for discovery (e.g. ["go", "rust"]).
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 fn default_model() -> String {
@@ -331,6 +374,14 @@ pub struct SubAgentDef {
     /// Per-agent context configuration (overrides global UserConfig.context).
     #[serde(default)]
     pub context: Option<ConfigContextConfig>,
+    /// Memory agent: context usage fraction (0.0–1.0) that triggers compaction.
+    /// Default: 0.8. Only used when runtime is `memory`.
+    #[serde(default)]
+    pub compact_threshold: Option<f64>,
+    /// Memory agent: compaction strategy name. Default: "smart".
+    /// Only used when runtime is `memory`.
+    #[serde(default)]
+    pub compact_strategy: Option<String>,
 }
 
 /// Telegram channel routing config in the per-user deskd.yaml.
@@ -873,5 +924,62 @@ context:
         let global = cfg.context.as_ref().unwrap();
         assert!(global.enabled);
         assert_eq!(global.main_path.as_deref(), Some("contexts/default.yaml"));
+    }
+
+    #[test]
+    fn test_sub_agent_memory_runtime() {
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Test"
+
+agents:
+  - name: memory-all
+    model: claude-haiku-4-5
+    system_prompt: "You accumulate bus events as context."
+    subscribe:
+      - "agent:memory-all"
+      - "agent:*"
+    runtime: memory
+    compact_threshold: 0.75
+    compact_strategy: aggressive
+
+  - name: worker
+    model: claude-sonnet-4-6
+    system_prompt: "Worker"
+    subscribe:
+      - "agent:worker"
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.agents[0].runtime, ConfigAgentRuntime::Memory);
+        assert_eq!(cfg.agents[0].compact_threshold, Some(0.75));
+        assert_eq!(
+            cfg.agents[0].compact_strategy.as_deref(),
+            Some("aggressive")
+        );
+        // Worker has default runtime (Claude).
+        assert_eq!(cfg.agents[1].runtime, ConfigAgentRuntime::Claude);
+        assert!(cfg.agents[1].compact_threshold.is_none());
+        assert!(cfg.agents[1].compact_strategy.is_none());
+    }
+
+    #[test]
+    fn test_sub_agent_memory_defaults() {
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Test"
+
+agents:
+  - name: memory-all
+    model: claude-haiku-4-5
+    system_prompt: "Memory agent"
+    subscribe:
+      - "agent:*"
+    runtime: memory
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.agents[0].runtime, ConfigAgentRuntime::Memory);
+        // Defaults are None — worker.rs applies the actual defaults.
+        assert!(cfg.agents[0].compact_threshold.is_none());
+        assert!(cfg.agents[0].compact_strategy.is_none());
     }
 }

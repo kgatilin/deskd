@@ -25,7 +25,9 @@ async fn start_executor(
     runtime: &AgentRuntime,
 ) -> Result<Box<dyn Executor>> {
     match runtime {
-        AgentRuntime::Claude => {
+        AgentRuntime::Claude | AgentRuntime::Memory => {
+            // Memory agents use the same Claude executor — the difference
+            // is in how the worker loop processes bus messages.
             let p = agent::AgentProcess::start(name, bus_socket).await?;
             Ok(Box::new(p))
         }
@@ -43,7 +45,7 @@ async fn start_executor_fresh(
     runtime: &AgentRuntime,
 ) -> Result<Box<dyn Executor>> {
     match runtime {
-        AgentRuntime::Claude => {
+        AgentRuntime::Claude | AgentRuntime::Memory => {
             let p = agent::AgentProcess::start_fresh(name, bus_socket).await?;
             Ok(Box::new(p))
         }
@@ -213,6 +215,9 @@ pub async fn run(
     let agent_model = initial_state.config.model.clone();
     let agent_labels: Vec<String> = Vec::new(); // TODO: add labels to AgentConfig
 
+    // Memory agent: track number of injected events for metrics.
+    let mut memory_injected_count: u64 = 0;
+
     loop {
         // Wait for either a bus message or a queue poll tick.
         let line = tokio::select! {
@@ -264,6 +269,35 @@ pub async fn run(
                 continue;
             }
         };
+
+        // ── Memory agent: inject bus events as context ──────────────────
+        // For memory agents, messages that are NOT direct questions
+        // (target != agent:{name}) are injected as context into the
+        // running Claude session instead of being processed as tasks.
+        if agent_runtime == AgentRuntime::Memory {
+            let direct_target = format!("agent:{}", name);
+            if msg.target != direct_target {
+                let event_text = format_memory_event(&msg);
+                info!(
+                    agent = %name,
+                    source = %msg.source,
+                    target = %msg.target,
+                    "memory: injecting bus event as context"
+                );
+                if let Err(e) = process.inject_message(&event_text) {
+                    warn!(agent = %name, error = %e, "memory: failed to inject event");
+                }
+                memory_injected_count += 1;
+                debug!(
+                    agent = %name,
+                    injected_count = memory_injected_count,
+                    "memory: event injected"
+                );
+                continue;
+            }
+            // Direct question — fall through to normal task processing.
+            debug!(agent = %name, source = %msg.source, "memory: direct question, processing as task");
+        }
 
         // Extract task context from the message.
         let ctx = match extract_task_context(&msg, name) {
@@ -536,7 +570,15 @@ pub async fn run(
     }
 
     process.stop().await;
-    info!(agent = %name, "disconnected from bus");
+    if agent_runtime == AgentRuntime::Memory {
+        info!(
+            agent = %name,
+            injected_events = memory_injected_count,
+            "memory agent disconnected from bus"
+        );
+    } else {
+        info!(agent = %name, "disconnected from bus");
+    }
     Ok(())
 }
 
@@ -1193,6 +1235,48 @@ async fn emit_event(
     .await;
 }
 
+/// Format a bus message as a compact event string for memory agent context injection.
+///
+/// Produces lines like:
+/// `[agent:dev @ 2026-04-14T10:30:00Z] task_result: merged PR #331`
+fn format_memory_event(msg: &Message) -> String {
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // Determine event type from payload.
+    let event_type = if msg.payload.get("result").is_some() {
+        "task_result"
+    } else if msg.payload.get("error").is_some() {
+        "error"
+    } else if msg.payload.get("event").and_then(|v| v.as_str()).is_some() {
+        msg.payload["event"].as_str().unwrap_or("event")
+    } else if msg.payload.get("task").is_some() {
+        "task"
+    } else {
+        "message"
+    };
+
+    // Extract a summary from the payload.
+    let summary = if let Some(result) = msg.payload.get("result").and_then(|v| v.as_str()) {
+        truncate(result, 200).to_string()
+    } else if let Some(error) = msg.payload.get("error").and_then(|v| v.as_str()) {
+        truncate(error, 200).to_string()
+    } else if let Some(task) = msg.payload.get("task").and_then(|v| v.as_str()) {
+        truncate(task, 200).to_string()
+    } else {
+        // Fallback: serialize the payload compactly.
+        let s = serde_json::to_string(&msg.payload).unwrap_or_default();
+        truncate(&s, 200).to_string()
+    };
+
+    format!(
+        "[{source} @ {ts}] {event_type}: {summary}",
+        source = msg.source,
+        ts = ts,
+        event_type = event_type,
+        summary = summary,
+    )
+}
+
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
@@ -1356,5 +1440,99 @@ mod tests {
         }));
         let ctx = extract_task_context(&msg, "test").unwrap();
         assert_eq!(ctx.task_queue_id.as_deref(), Some("tq-456"));
+    }
+
+    // ─── format_memory_event tests ──────────────────────────────────────
+
+    #[test]
+    fn test_format_memory_event_task_result() {
+        let msg = Message {
+            id: "msg-1".into(),
+            source: "agent:dev".into(),
+            target: "agent:kira".into(),
+            payload: json!({"result": "merged PR #331 — archlint scan passed"}),
+            reply_to: None,
+            metadata: Default::default(),
+        };
+        let event = format_memory_event(&msg);
+        assert!(event.starts_with("[agent:dev @ "));
+        assert!(event.contains("] task_result: merged PR #331"));
+    }
+
+    #[test]
+    fn test_format_memory_event_error() {
+        let msg = Message {
+            id: "msg-2".into(),
+            source: "agent:worker".into(),
+            target: "broadcast".into(),
+            payload: json!({"error": "process exited with code 1"}),
+            reply_to: None,
+            metadata: Default::default(),
+        };
+        let event = format_memory_event(&msg);
+        assert!(event.contains("] error: process exited"));
+    }
+
+    #[test]
+    fn test_format_memory_event_task() {
+        let msg = Message {
+            id: "msg-3".into(),
+            source: "cli".into(),
+            target: "agent:dev".into(),
+            payload: json!({"task": "review the PR"}),
+            reply_to: None,
+            metadata: Default::default(),
+        };
+        let event = format_memory_event(&msg);
+        assert!(event.contains("] task: review the PR"));
+    }
+
+    #[test]
+    fn test_format_memory_event_generic() {
+        let msg = Message {
+            id: "msg-4".into(),
+            source: "scheduler".into(),
+            target: "broadcast".into(),
+            payload: json!({"event": "agent_output", "line": "hello world"}),
+            reply_to: None,
+            metadata: Default::default(),
+        };
+        let event = format_memory_event(&msg);
+        assert!(event.contains("] agent_output: "));
+    }
+
+    #[test]
+    fn test_format_memory_event_truncates_long_payload() {
+        let long_text = "x".repeat(500);
+        let msg = Message {
+            id: "msg-5".into(),
+            source: "agent:dev".into(),
+            target: "agent:kira".into(),
+            payload: json!({"result": long_text}),
+            reply_to: None,
+            metadata: Default::default(),
+        };
+        let event = format_memory_event(&msg);
+        // The summary should be truncated to 200 chars.
+        assert!(event.len() < 300);
+    }
+
+    // ─── memory agent: direct question detection ────────────────────────
+
+    #[test]
+    fn test_memory_direct_question_detection() {
+        let agent_name = "memory-all";
+        let direct_target = format!("agent:{}", agent_name);
+
+        // Direct question — target matches agent's own address.
+        assert_eq!(direct_target, "agent:memory-all");
+
+        // Bus event — target is some other agent, arrived via glob subscription.
+        let event_target = "agent:dev";
+        assert_ne!(event_target, direct_target);
+
+        // Another bus event — broadcast.
+        let broadcast_target = "broadcast";
+        assert_ne!(broadcast_target, direct_target);
     }
 }

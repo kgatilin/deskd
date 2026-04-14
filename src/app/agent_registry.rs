@@ -560,6 +560,7 @@ pub fn to_domain_agent(
     let runtime = match state.config.runtime {
         ConfigAgentRuntime::Claude => AgentRuntime::Claude,
         ConfigAgentRuntime::Acp => AgentRuntime::Acp,
+        ConfigAgentRuntime::Memory => AgentRuntime::Memory,
     };
 
     let session_mode = match state.config.session {
