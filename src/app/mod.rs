@@ -3,6 +3,7 @@
 //! Groups internal modules that aren't part of the public library API
 //! (domain types and port traits). Reduces lib.rs fan-out.
 
+pub mod a2a;
 pub mod acp;
 pub mod adapters;
 pub mod agent;
