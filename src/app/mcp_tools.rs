@@ -1039,9 +1039,9 @@ pub(crate) async fn call_propose_for_need(args: &Value) -> Result<Value> {
 ///
 /// MCP tool: `query_agent(target, question, timeout_secs?)`
 ///
-/// Creates a temporary bus connection, sends the question with `reply_to`
-/// pointing to the temporary name, and waits for the response via direct
-/// name routing.
+/// Delegates to `bus::query_and_wait` which creates a temporary bus connection,
+/// sends the question with `reply_to` and correlation ID, and waits for the
+/// response. The temp connection is cleaned up automatically on drop.
 pub(crate) async fn call_query_agent(
     args: &Value,
     agent_name: &str,
@@ -1061,88 +1061,33 @@ pub(crate) async fn call_query_agent(
         .unwrap_or(30);
 
     let query_id = Uuid::new_v4().to_string();
-    let temp_name = format!("{}-query-{}", agent_name, &query_id[..8]);
-
-    // Connect to bus with a temporary identity for receiving the response.
-    use crate::infra::unix_bus::UnixBus;
-    use crate::ports::bus::MessageBus;
-    let bus = UnixBus::connect(bus_socket).await?;
-    bus.register(&temp_name, &[]).await?;
-
-    // Send query to target with reply_to pointing to our temporary name.
-    let msg = crate::domain::message::Message {
-        id: query_id.clone(),
-        source: temp_name.clone(),
-        target: target.to_string(),
-        payload: json!({"task": question}),
-        reply_to: Some(temp_name.clone()),
-        metadata: crate::domain::message::Metadata::default(),
-    };
-    bus.send(&msg).await?;
+    let timeout = std::time::Duration::from_secs(timeout_secs);
 
     info!(
         agent = %agent_name,
         target = %target,
         query_id = %query_id,
         timeout = timeout_secs,
-        "query_agent: waiting for response"
+        "query_agent: sending query"
     );
 
-    // Wait for response with timeout.
-    let timeout = std::time::Duration::from_secs(timeout_secs);
-    let response = tokio::time::timeout(timeout, async {
-        // Collect all response chunks until we get a "final" one.
-        let mut full_response = String::new();
-        loop {
-            let resp = bus.recv().await?;
-            // Extract text from payload.
-            if let Some(text) = resp.payload.get("text").and_then(|v| v.as_str()) {
-                full_response.push_str(text);
-            } else if let Some(result) = resp.payload.get("result").and_then(|v| v.as_str()) {
-                full_response.push_str(result);
-            } else if let Some(task) = resp.payload.get("task").and_then(|v| v.as_str()) {
-                full_response.push_str(task);
-            }
+    let text = crate::app::bus::query_and_wait(
+        bus_socket, agent_name, target, question, &query_id, timeout,
+    )
+    .await?;
 
-            // Check if this is the final response.
-            let is_final = resp
-                .payload
-                .get("final")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+    info!(
+        agent = %agent_name,
+        target = %target,
+        len = text.len(),
+        "query_agent: received response"
+    );
 
-            if is_final || !full_response.is_empty() {
-                return Ok::<String, anyhow::Error>(full_response);
-            }
-        }
-    })
-    .await;
-
-    match response {
-        Ok(Ok(text)) => {
-            info!(
-                agent = %agent_name,
-                target = %target,
-                len = text.len(),
-                "query_agent: received response"
-            );
-            Ok(json!({
-                "status": "ok",
-                "source": target,
-                "response": text,
-            }))
-        }
-        Ok(Err(e)) => {
-            bail!("query_agent: bus error while waiting for response: {}", e);
-        }
-        Err(_) => {
-            bail!(
-                "query_agent: timed out after {}s waiting for response from {}",
-                timeout_secs,
-                target
-            );
-        }
-    }
+    Ok(json!({
+        "status": "ok",
+        "source": target,
+        "response": text,
+    }))
 }
 
 #[cfg(test)]

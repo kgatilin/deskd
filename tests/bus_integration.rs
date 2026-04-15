@@ -330,11 +330,11 @@ async fn test_memory_agent_receives_events_from_two_agents() {
     let _ = std::fs::remove_file(&socket);
 }
 
-/// Test: query/response pattern via reply_to + direct name routing.
+/// Test: query/response pattern via reply_to + correlation ID + direct name routing.
 ///
-/// Agent A sends a query to agent B with reply_to=A's name.
-/// Agent B receives the query, sends a response back to A's name.
-/// Agent A receives the response via direct name routing.
+/// Agent A sends a query to agent B with reply_to=A's name and query_id in payload.
+/// Agent B receives the query, sends a response with matching query_id back to A.
+/// Agent A matches the response by query_id (correlation) via direct name routing.
 #[tokio::test]
 async fn test_query_response_via_reply_to() {
     let socket = temp_socket();
@@ -354,13 +354,15 @@ async fn test_query_response_via_reply_to() {
     let (mut b_lines, mut b_writer) = connect_and_register(&socket, "b", &["agent:b"]).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // A sends a query to B with reply_to pointing back to A.
+    let query_id = "corr-test-123";
+
+    // A sends a query to B with reply_to and query_id for correlation.
     let query_msg = serde_json::json!({
         "type": "message",
-        "id": "query-123",
+        "id": query_id,
         "source": "agent-a-query",
         "target": "agent:b",
-        "payload": {"task": "What is the bus module?"},
+        "payload": {"task": "What is the bus module?", "query_id": query_id},
         "reply_to": "agent-a-query",
         "metadata": {"priority": 5},
     });
@@ -376,14 +378,19 @@ async fn test_query_response_via_reply_to() {
         q["payload"]["task"].as_str().unwrap(),
         "What is the bus module?"
     );
+    assert_eq!(q["payload"]["query_id"].as_str().unwrap(), query_id);
     assert_eq!(q["reply_to"].as_str().unwrap(), "agent-a-query");
 
-    // B sends response back to A's name (reply_to target).
+    // B sends response with matching query_id back to A.
     send_message(
         &mut b_writer,
         "b",
         "agent-a-query",
-        serde_json::json!({"text": "Bus routing is in bus.rs", "final": true}),
+        serde_json::json!({
+            "text": "Bus routing is in bus.rs",
+            "query_id": query_id,
+            "final": true
+        }),
     )
     .await;
 
@@ -395,6 +402,7 @@ async fn test_query_response_via_reply_to() {
         r["payload"]["text"].as_str().unwrap(),
         "Bus routing is in bus.rs"
     );
+    assert_eq!(r["payload"]["query_id"].as_str().unwrap(), query_id);
     assert!(r["payload"]["final"].as_bool().unwrap());
 
     let _ = std::fs::remove_file(&socket);
