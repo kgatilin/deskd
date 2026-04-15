@@ -26,6 +26,10 @@ pub struct A2aState {
     pub api_key: Option<String>,
     /// Bus socket path for routing tasks to local agents.
     pub bus_socket: String,
+    /// Authentication mode: "api_key", "jwt", or "none".
+    pub auth_mode: String,
+    /// JWKS public key bytes for JWT verification. None if not using JWT.
+    pub jwt_public_key: Option<Vec<u8>>,
 }
 
 /// Start the A2A HTTP server.
@@ -106,19 +110,12 @@ async fn handle_a2a_rpc(
     headers: axum::http::HeaderMap,
     Json(req): Json<JsonRpcRequest>,
 ) -> (StatusCode, Json<JsonRpcResponse>) {
-    // API key authentication.
-    if let Some(expected_key) = &state.api_key {
-        let provided = headers.get("x-api-key").and_then(|v| v.to_str().ok());
-        if provided != Some(expected_key.as_str()) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(JsonRpcResponse::error(
-                    req.id,
-                    -32000,
-                    "unauthorized: invalid or missing API key".into(),
-                )),
-            );
-        }
+    // Authentication.
+    if let Some(auth_error) = check_auth(&state, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(JsonRpcResponse::error(req.id, -32000, auth_error)),
+        );
     }
 
     match req.method.as_str() {
@@ -254,6 +251,39 @@ fn handle_tasks_cancel(
     )
 }
 
+/// Check authentication based on the configured auth mode.
+/// Returns None if auth passes, Some(error_message) if auth fails.
+fn check_auth(state: &A2aState, headers: &axum::http::HeaderMap) -> Option<String> {
+    match state.auth_mode.as_str() {
+        "none" => None,
+        "jwt" => {
+            let public_key = state.jwt_public_key.as_ref()?;
+            let token = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+
+            match token {
+                None => Some("unauthorized: missing Bearer token".into()),
+                Some(t) => match crate::app::a2a_jwt::verify_jwt(t, public_key) {
+                    Ok(_claims) => None,
+                    Err(e) => Some(format!("unauthorized: invalid JWT — {e}")),
+                },
+            }
+        }
+        _ => {
+            // Default: api_key mode.
+            if let Some(expected_key) = &state.api_key {
+                let provided = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+                if provided != Some(expected_key.as_str()) {
+                    return Some("unauthorized: invalid or missing API key".into());
+                }
+            }
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,10 +315,17 @@ mod tests {
                     } else {
                         vec![]
                     },
+                    jwks: None,
                 },
             },
             api_key: api_key.map(String::from),
             bus_socket: "/tmp/test.sock".into(),
+            auth_mode: if api_key.is_some() {
+                "api_key".into()
+            } else {
+                "none".into()
+            },
+            jwt_public_key: None,
         })
     }
 
@@ -380,5 +417,83 @@ mod tests {
                 .unwrap()
                 .contains("missing")
         );
+    }
+
+    fn make_jwt_state() -> (Arc<A2aState>, crate::app::a2a_jwt::KeyPair) {
+        let kp = crate::app::a2a_jwt::KeyPair::generate().unwrap();
+        let state = Arc::new(A2aState {
+            agent_card: crate::app::a2a::AgentCard {
+                name: "test".into(),
+                description: None,
+                url: "https://test.example.com".into(),
+                version: "0.1.0".into(),
+                capabilities: crate::app::a2a::AgentCapabilities {
+                    streaming: true,
+                    push_notifications: false,
+                },
+                skills: vec![],
+                needs: vec![],
+                authentication: crate::app::a2a::AgentAuthentication {
+                    schemes: vec!["jwt".into()],
+                    jwks: None,
+                },
+            },
+            api_key: None,
+            bus_socket: "/tmp/test.sock".into(),
+            auth_mode: "jwt".into(),
+            jwt_public_key: Some(kp.public_key_bytes().to_vec()),
+        });
+        (state, kp)
+    }
+
+    #[tokio::test]
+    async fn a2a_jwt_auth_valid() {
+        let (state, kp) = make_jwt_state();
+        let app = router(state);
+        let token = kp.sign_jwt("https://sender.example.com", 60).unwrap();
+
+        let req = Request::post("/a2a")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", token))
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"taskId":"abc"}}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a2a_jwt_auth_missing_token() {
+        let (state, _kp) = make_jwt_state();
+        let app = router(state);
+
+        let req = Request::post("/a2a")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"taskId":"abc"}}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a2a_jwt_auth_wrong_key() {
+        let (state, _kp) = make_jwt_state();
+        let app = router(state);
+        // Sign with a different key.
+        let other_kp = crate::app::a2a_jwt::KeyPair::generate().unwrap();
+        let token = other_kp.sign_jwt("https://evil.example.com", 60).unwrap();
+
+        let req = Request::post("/a2a")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", token))
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"taskId":"abc"}}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -68,10 +68,21 @@ pub struct A2aConfig {
     /// Instance-level description shown in the Agent Card.
     #[serde(default)]
     pub description: Option<String>,
+    /// Authentication mode: "api_key" (default), "jwt", or "none".
+    #[serde(default = "default_a2a_auth")]
+    pub auth: String,
+    /// Path to Ed25519 private key PEM for JWT signing.
+    /// Default: ~/.deskd/a2a_key.pem
+    #[serde(default)]
+    pub private_key: Option<String>,
 }
 
 fn default_a2a_listen() -> String {
     "0.0.0.0:3000".to_string()
+}
+
+fn default_a2a_auth() -> String {
+    "api_key".to_string()
 }
 
 /// A room is a named work context: namespace + context folder + set of agents.

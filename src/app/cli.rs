@@ -468,4 +468,6 @@ pub enum A2aAction {
         #[arg(long)]
         listen: Option<String>,
     },
+    /// Generate an Ed25519 key pair for JWT authentication.
+    Keygen {},
 }

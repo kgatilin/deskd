@@ -57,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
             let config_path = match &action {
                 deskd::app::cli::A2aAction::AgentCard { config }
                 | deskd::app::cli::A2aAction::Serve { config, .. } => config.clone(),
+                deskd::app::cli::A2aAction::Keygen {} => None,
             };
             let config_path = resolve_workspace_config(config_path)?;
             commands::a2a::handle(action, &config_path).await?;
