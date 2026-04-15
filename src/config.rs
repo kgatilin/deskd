@@ -38,6 +38,9 @@ fn default_budget_usd() -> f64 {
 pub struct WorkspaceConfig {
     #[serde(default)]
     pub agents: Vec<AgentDef>,
+    /// Named container profiles that agents can reference by name.
+    #[serde(default)]
+    pub containers: HashMap<String, ContainerConfig>,
     /// Named rooms — formal groupings of agents with shared context.
     /// When present, `room_list` returns these instead of treating each agent as a room.
     #[serde(default)]
@@ -195,13 +198,59 @@ fn default_command() -> Vec<String> {
 
 impl WorkspaceConfig {
     /// Load and parse a workspace config file, expanding ${ENV_VAR} references.
+    /// Resolves named container profile references (string → inline config).
     pub fn load(path: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read workspace config: {}", path))?;
         let expanded = expand_env_vars(&raw);
+        let expanded = Self::resolve_container_profiles(&expanded)?;
         let cfg: WorkspaceConfig =
             serde_yaml::from_str(&expanded).context("failed to parse workspace config")?;
         Ok(cfg)
+    }
+
+    /// Pre-process YAML: resolve string container references to inline objects.
+    ///
+    /// When an agent's `container:` field is a string (e.g. `container: personal`),
+    /// replace it with the corresponding entry from the top-level `containers:` map.
+    fn resolve_container_profiles(yaml_str: &str) -> Result<String> {
+        let mut doc: serde_yaml::Value =
+            serde_yaml::from_str(yaml_str).context("failed to pre-parse workspace config")?;
+
+        // Extract named container profiles.
+        let profiles = doc
+            .get("containers")
+            .and_then(|v| v.as_mapping())
+            .cloned()
+            .unwrap_or_default();
+
+        if profiles.is_empty() {
+            // No named profiles — nothing to resolve, return original.
+            return Ok(yaml_str.to_string());
+        }
+
+        // Resolve string references in agents[].container.
+        if let Some(agents) = doc.get_mut("agents").and_then(|v| v.as_sequence_mut()) {
+            for agent in agents.iter_mut() {
+                if let Some(container_val) = agent.get("container")
+                    && let Some(profile_name) = container_val.as_str()
+                {
+                    let key = serde_yaml::Value::String(profile_name.to_string());
+                    let resolved = profiles.get(&key).cloned().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "agent references unknown container profile '{}'",
+                            profile_name
+                        )
+                    })?;
+                    agent
+                        .as_mapping_mut()
+                        .unwrap()
+                        .insert(serde_yaml::Value::String("container".to_string()), resolved);
+                }
+            }
+        }
+
+        serde_yaml::to_string(&doc).context("failed to re-serialize workspace config")
     }
 }
 
@@ -981,5 +1030,124 @@ agents:
         // Defaults are None — worker.rs applies the actual defaults.
         assert!(cfg.agents[0].compact_threshold.is_none());
         assert!(cfg.agents[0].compact_strategy.is_none());
+    }
+
+    #[test]
+    fn test_resolve_container_profiles_string_ref() {
+        let yaml = r#"
+containers:
+  personal:
+    image: claude-code:latest
+    mounts:
+      - "/home/dev/.ssh:/home/dev/.ssh:ro"
+    env:
+      TOKEN: secret
+agents:
+  - name: dev
+    work_dir: /home/dev
+    container: personal
+"#;
+        let resolved = WorkspaceConfig::resolve_container_profiles(yaml).unwrap();
+        let cfg: WorkspaceConfig = serde_yaml::from_str(&resolved).unwrap();
+        let container = cfg.agents[0].container.as_ref().unwrap();
+        assert_eq!(container.image, "claude-code:latest");
+        assert_eq!(container.mounts, vec!["/home/dev/.ssh:/home/dev/.ssh:ro"]);
+        assert_eq!(container.env.get("TOKEN").unwrap(), "secret");
+    }
+
+    #[test]
+    fn test_resolve_container_profiles_inline_unchanged() {
+        let yaml = r#"
+containers:
+  personal:
+    image: ignored
+agents:
+  - name: dev
+    work_dir: /home/dev
+    container:
+      image: inline-image
+      env:
+        KEY: val
+"#;
+        let resolved = WorkspaceConfig::resolve_container_profiles(yaml).unwrap();
+        let cfg: WorkspaceConfig = serde_yaml::from_str(&resolved).unwrap();
+        let container = cfg.agents[0].container.as_ref().unwrap();
+        assert_eq!(container.image, "inline-image");
+    }
+
+    #[test]
+    fn test_resolve_container_profiles_unknown_errors() {
+        let yaml = r#"
+containers:
+  personal:
+    image: claude-code:latest
+agents:
+  - name: dev
+    work_dir: /home/dev
+    container: nonexistent
+"#;
+        let result = WorkspaceConfig::resolve_container_profiles(yaml);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown container profile")
+        );
+    }
+
+    #[test]
+    fn test_resolve_container_profiles_no_profiles_section() {
+        let yaml = r#"
+agents:
+  - name: dev
+    work_dir: /home/dev
+"#;
+        let resolved = WorkspaceConfig::resolve_container_profiles(yaml).unwrap();
+        let cfg: WorkspaceConfig = serde_yaml::from_str(&resolved).unwrap();
+        assert!(cfg.agents[0].container.is_none());
+    }
+
+    #[test]
+    fn test_resolve_container_profiles_multiple_agents() {
+        let yaml = r#"
+containers:
+  personal:
+    image: claude-personal
+  work:
+    image: claude-work
+    env:
+      API_KEY: work-key
+agents:
+  - name: dev
+    work_dir: /home/dev
+    container: personal
+  - name: ops
+    work_dir: /home/ops
+    container: work
+  - name: bare
+    work_dir: /home/bare
+"#;
+        let resolved = WorkspaceConfig::resolve_container_profiles(yaml).unwrap();
+        let cfg: WorkspaceConfig = serde_yaml::from_str(&resolved).unwrap();
+        assert_eq!(
+            cfg.agents[0].container.as_ref().unwrap().image,
+            "claude-personal"
+        );
+        assert_eq!(
+            cfg.agents[1].container.as_ref().unwrap().image,
+            "claude-work"
+        );
+        assert_eq!(
+            cfg.agents[1]
+                .container
+                .as_ref()
+                .unwrap()
+                .env
+                .get("API_KEY")
+                .unwrap(),
+            "work-key"
+        );
+        assert!(cfg.agents[2].container.is_none());
     }
 }

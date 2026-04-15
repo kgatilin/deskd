@@ -174,10 +174,12 @@ pub fn build_agent_card_with_configs(
 mod tests {
     use super::*;
     use crate::config::{A2aConfig, AgentDef, SkillDef};
+    use std::collections::HashMap;
 
     fn make_workspace(agents: Vec<AgentDef>, a2a: Option<A2aConfig>) -> WorkspaceConfig {
         WorkspaceConfig {
             agents,
+            containers: HashMap::new(),
             rooms: vec![],
             admin_telegram_ids: vec![],
             a2a,
