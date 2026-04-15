@@ -329,3 +329,70 @@ async fn test_memory_agent_receives_events_from_two_agents() {
 
     let _ = std::fs::remove_file(&socket);
 }
+
+/// Test: query/response pattern via reply_to + direct name routing.
+///
+/// Agent A sends a query to agent B with reply_to=A's name.
+/// Agent B receives the query, sends a response back to A's name.
+/// Agent A receives the response via direct name routing.
+#[tokio::test]
+async fn test_query_response_via_reply_to() {
+    let socket = temp_socket();
+
+    let sock = socket.clone();
+    tokio::spawn(async move {
+        deskd::app::bus::serve(&sock).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Agent A: the querier.
+    let (mut a_lines, mut a_writer) = connect_and_register(&socket, "agent-a-query", &[]).await;
+
+    // Agent B: the responder.
+    let (mut b_lines, mut b_writer) = connect_and_register(&socket, "agent-b", &["agent:b"]).await;
+
+    // A sends a query to B with reply_to pointing back to A.
+    let query_msg = serde_json::json!({
+        "type": "message",
+        "id": "query-123",
+        "source": "agent-a-query",
+        "target": "agent:b",
+        "payload": {"task": "What is the bus module?"},
+        "reply_to": "agent-a-query",
+        "metadata": {"priority": 5},
+    });
+    let mut line = serde_json::to_string(&query_msg).unwrap();
+    line.push('\n');
+    a_writer.write_all(line.as_bytes()).await.unwrap();
+
+    // B receives the query.
+    let query = read_one(&mut b_lines, 2000).await;
+    assert!(query.is_some(), "agent B should receive the query");
+    let q = query.unwrap();
+    assert_eq!(
+        q["payload"]["task"].as_str().unwrap(),
+        "What is the bus module?"
+    );
+    assert_eq!(q["reply_to"].as_str().unwrap(), "agent-a-query");
+
+    // B sends response back to A's name (reply_to target).
+    send_message(
+        &mut b_writer,
+        "agent-b",
+        "agent-a-query",
+        serde_json::json!({"text": "Bus routing is in bus.rs", "final": true}),
+    )
+    .await;
+
+    // A receives the response via direct name routing.
+    let response = read_one(&mut a_lines, 2000).await;
+    assert!(response.is_some(), "agent A should receive the response");
+    let r = response.unwrap();
+    assert_eq!(
+        r["payload"]["text"].as_str().unwrap(),
+        "Bus routing is in bus.rs"
+    );
+    assert!(r["payload"]["final"].as_bool().unwrap());
+
+    let _ = std::fs::remove_file(&socket);
+}
