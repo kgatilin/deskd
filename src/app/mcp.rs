@@ -590,6 +590,20 @@ fn handle_tools_list(
         }
     }));
 
+    tools.push(json!({
+        "name": "query_agent",
+        "description": "Synchronously query another agent and wait for the response. Sends a question to the target agent and blocks until the answer arrives or timeout is reached.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Bus target (e.g. agent:memory-arch, agent:dev)"},
+                "question": {"type": "string", "description": "Question to ask the target agent"},
+                "timeout_secs": {"type": "integer", "description": "Timeout in seconds (default: 30)", "default": 30}
+            },
+            "required": ["target", "question"]
+        }
+    }));
+
     Response::ok(id, json!({ "tools": tools }))
 }
 
@@ -642,6 +656,7 @@ async fn handle_tools_call(
         "publish_need" => mcp_tools::call_publish_need(args).await,
         "browse_needs" => mcp_tools::call_browse_needs(args).await,
         "propose_for_need" => mcp_tools::call_propose_for_need(args).await,
+        "query_agent" => mcp_tools::call_query_agent(args, agent_name, bus_socket).await,
         other => anyhow::bail!("Unknown tool: {}", other),
     }
 }
