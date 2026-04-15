@@ -551,6 +551,44 @@ fn handle_tools_list(
             "required": ["url"]
         }
     }));
+    tools.push(json!({
+        "name": "publish_need",
+        "description": "Dynamically publish a need to this agent's Agent Card. The need is persisted in deskd.yaml and visible to other agents via A2A discovery.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string", "description": "What you need done (e.g. 'Architecture review of bus module')"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for discovery (e.g. ['architecture', 'review'])"},
+                "priority": {"type": "string", "enum": ["low", "medium", "high"], "description": "Priority level (default: medium)"}
+            },
+            "required": ["description"]
+        }
+    }));
+    tools.push(json!({
+        "name": "browse_needs",
+        "description": "Browse a remote agent's published needs. Returns the needs section from their Agent Card.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Remote agent's base URL (e.g. https://archi.nassau.example.com)"}
+            },
+            "required": ["url"]
+        }
+    }));
+    tools.push(json!({
+        "name": "propose_for_need",
+        "description": "Send a proposal to fulfill a remote agent's published need via A2A. The proposal is delivered as a task to the remote agent.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Remote agent's base URL"},
+                "need_id": {"type": "string", "description": "Need ID from the remote agent's Agent Card (e.g. 'kira/want-restart')"},
+                "proposal": {"type": "string", "description": "Your proposal to fulfill the need"},
+                "api_key": {"type": "string", "description": "API key for the remote agent (optional)"}
+            },
+            "required": ["url", "need_id", "proposal"]
+        }
+    }));
 
     Response::ok(id, json!({ "tools": tools }))
 }
@@ -601,6 +639,9 @@ async fn handle_tools_call(
         "usage_stats" => mcp_tools::call_usage_stats(args).await,
         "a2a_send" => mcp_tools::call_a2a_send(args).await,
         "a2a_discover" => mcp_tools::call_a2a_discover(args).await,
+        "publish_need" => mcp_tools::call_publish_need(args).await,
+        "browse_needs" => mcp_tools::call_browse_needs(args).await,
+        "propose_for_need" => mcp_tools::call_propose_for_need(args).await,
         other => anyhow::bail!("Unknown tool: {}", other),
     }
 }

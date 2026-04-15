@@ -849,6 +849,192 @@ pub(crate) async fn call_a2a_discover(args: &Value) -> Result<Value> {
     Ok(card)
 }
 
+/// Dynamically add a need to the agent's own deskd.yaml.
+///
+/// MCP tool: `publish_need(description, tags?, priority?)`
+pub(crate) async fn call_publish_need(args: &Value) -> Result<Value> {
+    let description = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'description' parameter"))?;
+
+    let tags: Vec<String> = args
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let priority = args
+        .get("priority")
+        .and_then(|v| v.as_str())
+        .unwrap_or("medium");
+
+    // Generate a stable ID from the description.
+    let id = description
+        .to_lowercase()
+        .split_whitespace()
+        .take(4)
+        .collect::<Vec<_>>()
+        .join("-");
+
+    let config_path = std::env::var("DESKD_AGENT_CONFIG")
+        .context("DESKD_AGENT_CONFIG not set — cannot publish need")?;
+
+    // Load existing config, add need, write back.
+    let raw = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read config: {}", config_path))?;
+
+    let mut doc: serde_yaml::Value =
+        serde_yaml::from_str(&raw).context("failed to parse config YAML")?;
+
+    let need_val = serde_yaml::to_value(&crate::config::NeedDef {
+        id: id.clone(),
+        description: description.to_string(),
+        tags: tags.clone(),
+        priority: priority.to_string(),
+    })?;
+
+    // Ensure needs: array exists and append.
+    let needs = doc
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("config is not a YAML mapping"))?
+        .entry(serde_yaml::Value::String("needs".to_string()))
+        .or_insert_with(|| serde_yaml::Value::Sequence(vec![]));
+
+    needs
+        .as_sequence_mut()
+        .ok_or_else(|| anyhow::anyhow!("needs: is not a sequence"))?
+        .push(need_val);
+
+    let updated = serde_yaml::to_string(&doc)?;
+    std::fs::write(&config_path, updated)
+        .with_context(|| format!("failed to write config: {}", config_path))?;
+
+    Ok(json!({
+        "status": "published",
+        "need": {
+            "id": id,
+            "description": description,
+            "tags": tags,
+            "priority": priority,
+        }
+    }))
+}
+
+/// Fetch a remote agent's needs from their Agent Card.
+///
+/// MCP tool: `browse_needs(url)`
+pub(crate) async fn call_browse_needs(args: &Value) -> Result<Value> {
+    let url = args
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'url' parameter"))?;
+
+    let card_url = format!("{}/.well-known/agent-card.json", url.trim_end_matches('/'));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&card_url)
+        .send()
+        .await
+        .context("failed to fetch Agent Card")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("Agent Card request returned {}: {}", status, body);
+    }
+
+    let card: Value = resp
+        .json()
+        .await
+        .context("failed to parse Agent Card JSON")?;
+
+    let needs = card.get("needs").cloned().unwrap_or(json!([]));
+    let agent_name = card
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    Ok(json!({
+        "agent": agent_name,
+        "url": url,
+        "needs": needs,
+    }))
+}
+
+/// Send a proposal to fulfill a remote agent's need via A2A.
+///
+/// MCP tool: `propose_for_need(url, need_id, proposal, api_key?)`
+pub(crate) async fn call_propose_for_need(args: &Value) -> Result<Value> {
+    let url = args
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'url' parameter"))?;
+    let need_id = args
+        .get("need_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'need_id' parameter"))?;
+    let proposal = args
+        .get("proposal")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'proposal' parameter"))?;
+    let api_key = args.get("api_key").and_then(|v| v.as_str());
+
+    let rpc_body = json!({
+        "jsonrpc": "2.0",
+        "id": uuid::Uuid::new_v4().to_string(),
+        "method": "tasks/send",
+        "params": {
+            "skill": need_id,
+            "message": format!("Proposal for need '{}': {}", need_id, proposal),
+            "metadata": {
+                "type": "need_proposal",
+                "need_id": need_id,
+            }
+        }
+    });
+
+    let a2a_url = format!("{}/a2a", url.trim_end_matches('/'));
+
+    let client = reqwest::Client::new();
+    let mut req = client.post(&a2a_url).json(&rpc_body);
+    if let Some(key) = api_key {
+        req = req.header("x-api-key", key);
+    }
+
+    let resp = req.send().await.context("A2A proposal request failed")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("A2A proposal returned {}: {}", status, body);
+    }
+
+    let body: Value = resp.json().await.context("failed to parse A2A response")?;
+
+    if let Some(error) = body.get("error") {
+        bail!(
+            "A2A error {}: {}",
+            error.get("code").and_then(|c| c.as_i64()).unwrap_or(0),
+            error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown")
+        );
+    }
+
+    Ok(json!({
+        "status": "proposed",
+        "need_id": need_id,
+        "result": body.get("result").cloned().unwrap_or(Value::Null),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
