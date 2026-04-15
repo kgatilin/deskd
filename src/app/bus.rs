@@ -40,30 +40,3 @@ pub async fn send_message(
     bus.send(&msg).await?;
     Ok(())
 }
-
-/// Send a one-shot message with a fresh-session flag.
-///
-/// Like `send_message`, but sets `metadata.fresh = true` so the worker
-/// restarts the executor without `--resume`.
-pub async fn send_message_fresh(
-    socket_path: &str,
-    source: &str,
-    target: &str,
-    text: &str,
-) -> anyhow::Result<()> {
-    let bus = connect_bus(socket_path).await?;
-    bus.register(source, &[]).await?;
-    let msg = Message {
-        id: uuid::Uuid::new_v4().to_string(),
-        source: source.to_string(),
-        target: target.to_string(),
-        payload: serde_json::json!({"task": text}),
-        reply_to: None,
-        metadata: Metadata {
-            fresh: true,
-            ..Default::default()
-        },
-    };
-    bus.send(&msg).await?;
-    Ok(())
-}

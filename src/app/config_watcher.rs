@@ -1,15 +1,16 @@
-/// Config watcher — detects system_prompt changes and triggers fresh sessions.
+/// Config watcher — detects system_prompt changes and injects updates into the
+/// running session.
 ///
 /// Polls the agent's deskd.yaml file for system_prompt changes. When detected,
-/// updates the stored agent state and sends a fresh-session message via the bus
-/// so the worker picks up the new prompt without manual restart.
+/// updates the stored agent state and sends a bus message with the new prompt
+/// content so the worker injects it into the existing session (no restart).
 use tracing::{info, warn};
 
-/// Watch a config file for system_prompt changes and trigger fresh sessions.
+/// Watch a config file for system_prompt changes and inject updates.
 ///
 /// Polls every 30 seconds (same cadence as schedule watcher). When the
 /// system_prompt in deskd.yaml differs from the running agent's state,
-/// updates the state file and sends a `fresh: true` bus message.
+/// updates the state file and sends a bus message containing the new prompt.
 pub async fn watch_system_prompt(config_path: String, bus_socket: String, agent_name: String) {
     // Load initial system_prompt from config.
     let mut last_prompt = match crate::config::UserConfig::load(&config_path) {
@@ -46,7 +47,7 @@ pub async fn watch_system_prompt(config_path: String, bus_socket: String, agent_
 
         info!(
             agent = %agent_name,
-            "system_prompt changed, updating agent state and requesting fresh session"
+            "system_prompt changed, updating agent state and injecting into session"
         );
 
         // Update the stored agent state with the new system_prompt.
@@ -64,17 +65,17 @@ pub async fn watch_system_prompt(config_path: String, bus_socket: String, agent_
             }
         }
 
-        // Send a fresh-session message so the worker restarts with the new prompt.
+        // Send a normal bus message with the updated instructions injected as
+        // context. This preserves session history — no fresh restart needed.
         let target = format!("agent:{}", agent_name);
-        if let Err(e) = crate::app::bus::send_message_fresh(
-            &bus_socket,
-            "config-watcher",
-            &target,
-            "System prompt updated. New instructions are now active.",
-        )
-        .await
+        let task = format!(
+            "Your system prompt has been updated. New instructions:\n\n{}\n\nAcknowledge the update.",
+            cfg.system_prompt
+        );
+        if let Err(e) =
+            crate::app::bus::send_message(&bus_socket, "config-watcher", &target, &task).await
         {
-            warn!(agent = %agent_name, error = %e, "config_watcher: failed to send fresh-session message");
+            warn!(agent = %agent_name, error = %e, "config_watcher: failed to send prompt update message");
             continue;
         }
 
