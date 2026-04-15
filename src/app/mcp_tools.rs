@@ -1105,7 +1105,11 @@ pub(crate) async fn call_query_agent(
             }
 
             // Check if this is the final response.
-            let is_final = resp.payload.get("final").and_then(|v| v.as_bool()).unwrap_or(false);
+            let is_final = resp
+                .payload
+                .get("final")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             if is_final || !full_response.is_empty() {
                 return Ok::<String, anyhow::Error>(full_response);
