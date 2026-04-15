@@ -349,7 +349,10 @@ async fn test_query_response_via_reply_to() {
     let (mut a_lines, mut a_writer) = connect_and_register(&socket, "agent-a-query", &[]).await;
 
     // Agent B: the responder.
-    let (mut b_lines, mut b_writer) = connect_and_register(&socket, "agent-b", &["agent:b"]).await;
+    // Register with name "b" so that target "agent:b" routes to this client
+    // (bus strips "agent:" prefix and looks up client by name).
+    let (mut b_lines, mut b_writer) = connect_and_register(&socket, "b", &["agent:b"]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // A sends a query to B with reply_to pointing back to A.
     let query_msg = serde_json::json!({
@@ -378,7 +381,7 @@ async fn test_query_response_via_reply_to() {
     // B sends response back to A's name (reply_to target).
     send_message(
         &mut b_writer,
-        "agent-b",
+        "b",
         "agent-a-query",
         serde_json::json!({"text": "Bus routing is in bus.rs", "final": true}),
     )
