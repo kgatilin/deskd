@@ -40,25 +40,36 @@ pub async fn handle(action: A2aAction, config_path: &str) -> Result<()> {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("workspace.yaml has no `a2a:` section"))?;
 
-            // Load JWT key pair if auth mode is JWT.
-            let (jwt_public_key, mut card) = if a2a_cfg.auth == "jwt" {
+            let mut card = a2a::build_agent_card(&workspace)?;
+
+            // Load own key pair for JWKS publication if JWT mode.
+            if a2a_cfg.auth == "jwt" {
                 let key_path = a2a_cfg
                     .private_key
                     .as_deref()
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(default_key_path);
                 let kp = a2a_jwt::KeyPair::load(&key_path)?;
-                let jwks = a2a_jwt::Jwks::from_public_key(kp.public_key_bytes());
-                let pub_bytes = kp.public_key_bytes().to_vec();
-                let card = a2a::build_agent_card(&workspace)?;
-                (Some((pub_bytes, jwks)), card)
-            } else {
-                (None, a2a::build_agent_card(&workspace)?)
-            };
+                card.authentication.jwks =
+                    Some(a2a_jwt::Jwks::from_public_key(kp.public_key_bytes()));
+            }
 
-            // Inject JWKS into the Agent Card if using JWT.
-            if let Some((_, ref jwks)) = jwt_public_key {
-                card.authentication.jwks = Some(jwks.clone());
+            // Decode trusted public keys from config (base64url → raw bytes).
+            let trusted_keys: Vec<Vec<u8>> = a2a_cfg
+                .trusted_keys
+                .iter()
+                .filter_map(|b64| {
+                    use base64::Engine;
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(b64)
+                        .ok()
+                })
+                .collect();
+
+            if a2a_cfg.auth == "jwt" && trusted_keys.is_empty() {
+                tracing::warn!(
+                    "JWT auth enabled but no trusted_keys configured — all incoming requests will be rejected"
+                );
             }
 
             let listen_addr = listen.as_deref().unwrap_or(&a2a_cfg.listen);
@@ -74,7 +85,7 @@ pub async fn handle(action: A2aAction, config_path: &str) -> Result<()> {
                 api_key: a2a_cfg.api_key.clone(),
                 bus_socket,
                 auth_mode: a2a_cfg.auth.clone(),
-                jwt_public_key: jwt_public_key.map(|(bytes, _)| bytes),
+                trusted_keys,
             });
 
             a2a_server::serve(listen_addr, state).await

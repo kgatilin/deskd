@@ -75,6 +75,10 @@ pub struct A2aConfig {
     /// Default: ~/.deskd/a2a_key.pem
     #[serde(default)]
     pub private_key: Option<String>,
+    /// Trusted public keys for JWT verification (base64url-encoded Ed25519 keys).
+    /// Incoming JWTs are verified against these keys. Add remote agents' public keys here.
+    #[serde(default)]
+    pub trusted_keys: Vec<String>,
 }
 
 fn default_a2a_listen() -> String {

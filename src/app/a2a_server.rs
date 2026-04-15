@@ -28,8 +28,9 @@ pub struct A2aState {
     pub bus_socket: String,
     /// Authentication mode: "api_key", "jwt", or "none".
     pub auth_mode: String,
-    /// JWKS public key bytes for JWT verification. None if not using JWT.
-    pub jwt_public_key: Option<Vec<u8>>,
+    /// Trusted public keys for JWT verification (raw Ed25519 bytes).
+    /// Incoming JWTs are verified against each key until one matches.
+    pub trusted_keys: Vec<Vec<u8>>,
 }
 
 /// Start the A2A HTTP server.
@@ -257,7 +258,9 @@ fn check_auth(state: &A2aState, headers: &axum::http::HeaderMap) -> Option<Strin
     match state.auth_mode.as_str() {
         "none" => None,
         "jwt" => {
-            let public_key = state.jwt_public_key.as_ref()?;
+            if state.trusted_keys.is_empty() {
+                return Some("server misconfigured: no trusted keys for JWT verification".into());
+            }
             let token = headers
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
@@ -265,10 +268,15 @@ fn check_auth(state: &A2aState, headers: &axum::http::HeaderMap) -> Option<Strin
 
             match token {
                 None => Some("unauthorized: missing Bearer token".into()),
-                Some(t) => match crate::app::a2a_jwt::verify_jwt(t, public_key) {
-                    Ok(_claims) => None,
-                    Err(e) => Some(format!("unauthorized: invalid JWT — {e}")),
-                },
+                Some(t) => {
+                    // Try each trusted key — accept if any matches.
+                    for key in &state.trusted_keys {
+                        if crate::app::a2a_jwt::verify_jwt(t, key).is_ok() {
+                            return None;
+                        }
+                    }
+                    Some("unauthorized: JWT signature does not match any trusted key".into())
+                }
             }
         }
         _ => {
@@ -325,7 +333,7 @@ mod tests {
             } else {
                 "none".into()
             },
-            jwt_public_key: None,
+            trusted_keys: vec![],
         })
     }
 
@@ -419,8 +427,11 @@ mod tests {
         );
     }
 
+    /// Create a JWT-authenticated server state with a *sender* key pair.
+    /// The server trusts the sender's public key. The sender signs with its private key.
+    /// This mirrors real usage: sender and server have *different* identities.
     fn make_jwt_state() -> (Arc<A2aState>, crate::app::a2a_jwt::KeyPair) {
-        let kp = crate::app::a2a_jwt::KeyPair::generate().unwrap();
+        let sender_kp = crate::app::a2a_jwt::KeyPair::generate().unwrap();
         let state = Arc::new(A2aState {
             agent_card: crate::app::a2a::AgentCard {
                 name: "test".into(),
@@ -441,9 +452,9 @@ mod tests {
             api_key: None,
             bus_socket: "/tmp/test.sock".into(),
             auth_mode: "jwt".into(),
-            jwt_public_key: Some(kp.public_key_bytes().to_vec()),
+            trusted_keys: vec![sender_kp.public_key_bytes().to_vec()],
         });
-        (state, kp)
+        (state, sender_kp)
     }
 
     #[tokio::test]

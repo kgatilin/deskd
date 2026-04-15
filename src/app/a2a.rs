@@ -244,6 +244,7 @@ mod tests {
             description: Some("Dev workspace".into()),
             auth: "api_key".into(),
             private_key: None,
+            trusted_keys: vec![],
         }
     }
 
