@@ -757,9 +757,40 @@ pub(crate) async fn call_usage_stats(args: &Value) -> Result<Value> {
     Ok(serde_json::to_value(stats)?)
 }
 
+/// Apply authentication to an outgoing A2A HTTP request.
+///
+/// Supports two modes:
+/// - `api_key` param → `x-api-key` header
+/// - `jwt_key` param (path to private key PEM) → `Authorization: Bearer <jwt>`
+fn apply_a2a_auth(
+    mut req: reqwest::RequestBuilder,
+    args: &serde_json::Value,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    if let Some(jwt_key_path) = args.get("jwt_key").and_then(|v| v.as_str()) {
+        let path = std::path::Path::new(jwt_key_path);
+        match crate::app::a2a_jwt::KeyPair::load(path) {
+            Ok(kp) => match kp.sign_jwt(url, 60) {
+                Ok(token) => {
+                    req = req.header("authorization", format!("Bearer {}", token));
+                }
+                Err(e) => {
+                    tracing::warn!("failed to sign JWT: {}", e);
+                }
+            },
+            Err(e) => {
+                tracing::warn!("failed to load JWT key from {}: {}", jwt_key_path, e);
+            }
+        }
+    } else if let Some(key) = args.get("api_key").and_then(|v| v.as_str()) {
+        req = req.header("x-api-key", key);
+    }
+    req
+}
+
 /// Send an A2A task to a remote agent via HTTP.
 ///
-/// MCP tool: `a2a_send(url, skill, message, api_key?)`
+/// MCP tool: `a2a_send(url, skill, message, api_key?, jwt_key?)`
 pub(crate) async fn call_a2a_send(args: &Value) -> Result<Value> {
     let url = args
         .get("url")
@@ -773,7 +804,6 @@ pub(crate) async fn call_a2a_send(args: &Value) -> Result<Value> {
         .get("message")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'message' parameter"))?;
-    let api_key = args.get("api_key").and_then(|v| v.as_str());
 
     let rpc_body = json!({
         "jsonrpc": "2.0",
@@ -789,9 +819,7 @@ pub(crate) async fn call_a2a_send(args: &Value) -> Result<Value> {
 
     let client = reqwest::Client::new();
     let mut req = client.post(&a2a_url).json(&rpc_body);
-    if let Some(key) = api_key {
-        req = req.header("x-api-key", key);
-    }
+    req = apply_a2a_auth(req, args, url);
 
     let resp = req.send().await.context("A2A request failed")?;
 
@@ -983,7 +1011,6 @@ pub(crate) async fn call_propose_for_need(args: &Value) -> Result<Value> {
         .get("proposal")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'proposal' parameter"))?;
-    let api_key = args.get("api_key").and_then(|v| v.as_str());
 
     let rpc_body = json!({
         "jsonrpc": "2.0",
@@ -1003,9 +1030,7 @@ pub(crate) async fn call_propose_for_need(args: &Value) -> Result<Value> {
 
     let client = reqwest::Client::new();
     let mut req = client.post(&a2a_url).json(&rpc_body);
-    if let Some(key) = api_key {
-        req = req.header("x-api-key", key);
-    }
+    req = apply_a2a_auth(req, args, url);
 
     let resp = req.send().await.context("A2A proposal request failed")?;
 

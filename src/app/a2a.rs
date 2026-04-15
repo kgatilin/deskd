@@ -66,6 +66,9 @@ pub struct AgentNeed {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentAuthentication {
     pub schemes: Vec<String>,
+    /// JWKS key set for JWT verification. Present when auth scheme is "jwt".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwks: Option<crate::app::a2a_jwt::Jwks>,
 }
 
 /// Build an Agent Card from workspace config + all user configs.
@@ -112,10 +115,16 @@ pub fn build_agent_card(workspace: &WorkspaceConfig) -> Result<AgentCard> {
         }
     }
 
-    let auth_schemes = if a2a.api_key.is_some() {
-        vec!["apiKey".to_string()]
-    } else {
-        vec![]
+    let auth_schemes = match a2a.auth.as_str() {
+        "jwt" => vec!["jwt".to_string()],
+        "none" => vec![],
+        _ => {
+            if a2a.api_key.is_some() {
+                vec!["apiKey".to_string()]
+            } else {
+                vec![]
+            }
+        }
     };
 
     let name = a2a
@@ -137,6 +146,7 @@ pub fn build_agent_card(workspace: &WorkspaceConfig) -> Result<AgentCard> {
         needs,
         authentication: AgentAuthentication {
             schemes: auth_schemes,
+            jwks: None,
         },
     })
 }
@@ -174,10 +184,16 @@ pub fn build_agent_card_with_configs(
         }
     }
 
-    let auth_schemes = if a2a.api_key.is_some() {
-        vec!["apiKey".to_string()]
-    } else {
-        vec![]
+    let auth_schemes = match a2a.auth.as_str() {
+        "jwt" => vec!["jwt".to_string()],
+        "none" => vec![],
+        _ => {
+            if a2a.api_key.is_some() {
+                vec!["apiKey".to_string()]
+            } else {
+                vec![]
+            }
+        }
     };
 
     let name = a2a
@@ -199,6 +215,7 @@ pub fn build_agent_card_with_configs(
         needs,
         authentication: AgentAuthentication {
             schemes: auth_schemes,
+            jwks: None,
         },
     })
 }
@@ -225,6 +242,9 @@ mod tests {
             api_key: Some("test-key".into()),
             listen: "0.0.0.0:3000".into(),
             description: Some("Dev workspace".into()),
+            auth: "api_key".into(),
+            private_key: None,
+            trusted_keys: vec![],
         }
     }
 
