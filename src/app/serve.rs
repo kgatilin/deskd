@@ -3,7 +3,7 @@
 use anyhow::Result;
 use tracing::info;
 
-use crate::app::{adapters, agent, bus, bus_api, config_watcher, schedule, worker, workflow};
+use crate::app::{agent, bus, bus_api, config_reload, worker, workflow};
 use crate::config;
 
 /// Start per-agent buses and workers for all agents in workspace config.
@@ -57,6 +57,8 @@ pub async fn serve(config_path: String) -> Result<()> {
         let bus_dir = std::path::Path::new(&def.work_dir).join(".deskd");
         config::ensure_dir_owned(&bus_dir, def.unix_user.as_deref())?;
 
+        // ── Session-persistent components (NOT restarted on config change) ──
+
         // Start the agent's isolated bus.
         {
             let bus = bus_socket.clone();
@@ -68,53 +70,6 @@ pub async fn serve(config_path: String) -> Result<()> {
             });
         }
         info!(agent = %name, bus = %bus_socket, "started agent bus");
-
-        // Start configured adapters (Telegram, Discord, etc.).
-        for adapter in
-            adapters::build_adapters(def, user_cfg.as_ref(), &workspace.admin_telegram_ids)
-        {
-            let bus = bus_socket.clone();
-            let agent_name = name.clone();
-            let adapter_name = adapter.name().to_string();
-            tokio::spawn(async move {
-                if let Err(e) = adapter.run(bus, agent_name).await {
-                    tracing::error!(adapter = %adapter_name, error = %e, "adapter failed");
-                }
-            });
-        }
-
-        // Start schedule watcher — handles initial load + hot-reload on config changes.
-        {
-            let bus = bus_socket.clone();
-            let agent_name = name.clone();
-            let config = cfg_path.clone();
-            let home = def.work_dir.clone();
-            tokio::spawn(async move {
-                schedule::watch_and_reload(config, bus, agent_name, home).await;
-            });
-            info!(agent = %name, "started schedule watcher");
-        }
-
-        // Start config watcher — hot-reloads system_prompt on deskd.yaml changes.
-        {
-            let bus = bus_socket.clone();
-            let agent_name = name.clone();
-            let config = cfg_path.clone();
-            tokio::spawn(async move {
-                config_watcher::watch_system_prompt(config, bus, agent_name).await;
-            });
-            info!(agent = %name, "started config watcher");
-        }
-
-        // Start reminder runner — fires one-shot reminders from ~/.deskd/reminders/.
-        {
-            let bus = bus_socket.clone();
-            let agent_name = name.clone();
-            tokio::spawn(async move {
-                schedule::run_reminders(bus, agent_name).await;
-            });
-            info!(agent = %name, "started reminder runner");
-        }
 
         // Start bus API handler for TUI / external clients.
         {
@@ -140,81 +95,23 @@ pub async fn serve(config_path: String) -> Result<()> {
         }
 
         // Start worker on the agent's bus.
-        let bus = bus_socket.clone();
-        let worker_task_store = crate::app::task::TaskStore::default_for_home();
-        tokio::spawn(async move {
-            if let Err(e) =
-                worker::run(&name, &bus, Some(bus.clone()), None, &worker_task_store).await
-            {
-                tracing::error!(agent = %name, error = %e, "worker exited with error");
-            }
-        });
-
-        // Start sub-agent workers defined in the agent's deskd.yaml.
-        if let Some(ref ucfg) = user_cfg {
-            for sub in &ucfg.agents {
-                let mcp_json = serde_json::json!({
-                    "mcpServers": {
-                        "deskd": {
-                            "command": "deskd",
-                            "args": ["mcp", "--agent", &sub.name]
-                        }
-                    }
-                })
-                .to_string();
-
-                // Per-agent context config falls back to global UserConfig.context.
-                let context_cfg = sub.context.clone().or_else(|| ucfg.context.clone());
-
-                let sub_cfg = agent::AgentConfig {
-                    name: sub.name.clone(),
-                    model: sub.model.clone(),
-                    system_prompt: sub.system_prompt.clone(),
-                    work_dir: def.work_dir.clone(),
-                    max_turns: ucfg.max_turns,
-                    unix_user: def.unix_user.clone(),
-                    budget_usd: def.budget_usd,
-                    command: vec![
-                        "claude".into(),
-                        "--output-format".into(),
-                        "stream-json".into(),
-                        "--verbose".into(),
-                        "--dangerously-skip-permissions".into(),
-                        "--model".into(),
-                        sub.model.clone(),
-                        "--max-turns".into(),
-                        ucfg.max_turns.to_string(),
-                        "--mcp-config".into(),
-                        mcp_json,
-                    ],
-                    config_path: Some(cfg_path.clone()),
-                    container: def.container.clone(),
-                    session: sub.session.clone(),
-                    runtime: sub.runtime.clone(),
-                    context: context_cfg,
-                    compact_threshold: sub.compact_threshold,
-                };
-                agent::create_or_update_from_config(&sub_cfg).await?;
-
-                let sub_name = sub.name.clone();
-                let bus = bus_socket.clone();
-                let subs = sub.subscribe.clone();
-                let sub_task_store = crate::app::task::TaskStore::default_for_home();
-                tokio::spawn(async move {
-                    if let Err(e) = worker::run(
-                        &sub_name,
-                        &bus,
-                        Some(bus.clone()),
-                        Some(subs),
-                        &sub_task_store,
-                    )
-                    .await
-                    {
-                        tracing::error!(agent = %sub_name, error = %e, "sub-agent worker exited");
-                    }
-                });
-                info!(agent = %def.name, sub_agent = %sub.name, "started sub-agent worker");
-            }
+        {
+            let bus = bus_socket.clone();
+            let worker_name = name.clone();
+            let worker_task_store = crate::app::task::TaskStore::default_for_home();
+            tokio::spawn(async move {
+                if let Err(e) = worker::run(
+                    &worker_name,
+                    &bus,
+                    Some(bus.clone()),
+                    None,
+                    &worker_task_store,
+                )
+                .await
+                {
+                    tracing::error!(agent = %worker_name, error = %e, "worker exited with error");
+                }
+            });
         }
 
         // Start workflow engine if models are defined.
@@ -267,6 +164,43 @@ pub async fn serve(config_path: String) -> Result<()> {
                 }
             });
             info!(agent = %def.name, models = ucfg.models.len(), "started workflow engine");
+        }
+
+        // ── Restartable components (hot-reloaded on config change) ───────
+
+        // Spawn initial restartable components.
+        let components = config_reload::spawn_components(
+            def,
+            user_cfg.as_ref(),
+            &workspace.admin_telegram_ids,
+            &bus_socket,
+            &name,
+            &cfg_path,
+        )
+        .await?;
+
+        let initial_summary = components.summary();
+        info!(agent = %name, summary = %initial_summary, "started restartable components");
+
+        // Start the unified config reload watcher.
+        {
+            let reload_def = def.clone();
+            let reload_admin_ids = workspace.admin_telegram_ids.clone();
+            let reload_bus = bus_socket.clone();
+            let reload_name = name.clone();
+            let reload_cfg = cfg_path.clone();
+            tokio::spawn(async move {
+                config_reload::watch_and_reload(
+                    reload_def,
+                    components,
+                    reload_admin_ids,
+                    reload_bus,
+                    reload_name,
+                    reload_cfg,
+                )
+                .await;
+            });
+            info!(agent = %name, "started unified config reload watcher");
         }
     }
 
