@@ -10,12 +10,13 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{ChatAction, ParseMode};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -90,6 +91,7 @@ pub struct TelegramAdapter {
     routes: Vec<TelegramRoute>,
     admin_telegram_ids: Vec<i64>,
     agent_name: String,
+    config_path: Option<String>,
 }
 
 impl TelegramAdapter {
@@ -98,12 +100,14 @@ impl TelegramAdapter {
         routes: Vec<TelegramRoute>,
         admin_telegram_ids: Vec<i64>,
         agent_name: String,
+        config_path: Option<String>,
     ) -> Self {
         Self {
             token,
             routes,
             admin_telegram_ids,
             agent_name,
+            config_path,
         }
     }
 }
@@ -114,33 +118,16 @@ impl super::Adapter for TelegramAdapter {
     }
 
     fn run(self: Box<Self>, bus_socket: String, _agent_name: String) -> super::BoxFuture {
-        let allowed_chats = self.routes.iter().map(|r| r.chat_id).collect();
-        let mention_only = self
-            .routes
-            .iter()
-            .filter(|r| r.mention_only)
-            .map(|r| r.chat_id)
-            .collect();
-        let chat_names = self
-            .routes
-            .iter()
-            .filter_map(|r| r.name.as_ref().map(|n| (r.chat_id, n.clone())))
-            .collect();
-        let chat_route_to: std::collections::HashMap<i64, String> = self
-            .routes
-            .iter()
-            .filter_map(|r| r.route_to.as_ref().map(|t| (r.chat_id, t.clone())))
-            .collect();
+        let routes = Arc::new(RwLock::new(self.routes));
         let agent_name = self.agent_name;
+        let config_path = self.config_path;
         Box::pin(run(
             self.token,
             bus_socket,
             agent_name,
-            allowed_chats,
-            mention_only,
-            chat_names,
-            chat_route_to,
+            routes,
             self.admin_telegram_ids,
+            config_path,
         ))
     }
 }
@@ -154,22 +141,87 @@ enum OutboundCmd {
     ProgressDone(i64),
 }
 
+/// Derived route data used by the polling loop.
+/// Recomputed from the shared routes whenever they change.
+struct DerivedRoutes {
+    allowed_chats: std::collections::HashSet<i64>,
+    mention_only: std::collections::HashSet<i64>,
+    chat_names: std::collections::HashMap<i64, String>,
+    chat_route_to: std::collections::HashMap<i64, String>,
+}
+
+/// Compute derived route data from a list of TelegramRoute entries.
+fn derive_routes(routes: &[TelegramRoute]) -> DerivedRoutes {
+    let allowed_chats = routes.iter().map(|r| r.chat_id).collect();
+    let mention_only = routes
+        .iter()
+        .filter(|r| r.mention_only)
+        .map(|r| r.chat_id)
+        .collect();
+    let chat_names = routes
+        .iter()
+        .filter_map(|r| r.name.as_ref().map(|n| (r.chat_id, n.clone())))
+        .collect();
+    let chat_route_to = routes
+        .iter()
+        .filter_map(|r| r.route_to.as_ref().map(|t| (r.chat_id, t.clone())))
+        .collect();
+    DerivedRoutes {
+        allowed_chats,
+        mention_only,
+        chat_names,
+        chat_route_to,
+    }
+}
+
+/// Watch a config file for telegram route changes and update the shared routes.
+/// Polls file mtime every 30 seconds, similar to schedule.rs watch_and_reload.
+async fn watch_routes(
+    config_path: String,
+    routes: Arc<RwLock<Vec<TelegramRoute>>>,
+    agent_name: String,
+) {
+    let mut last_modified = file_mtime(&config_path);
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+        let current_mtime = file_mtime(&config_path);
+        if current_mtime == last_modified {
+            continue;
+        }
+        last_modified = current_mtime;
+
+        let new_routes = match crate::config::UserConfig::load(&config_path) {
+            Ok(cfg) => cfg.telegram.map(|t| t.routes).unwrap_or_default(),
+            Err(e) => {
+                warn!(agent = %agent_name, error = %e, "telegram route watcher: failed to reload config");
+                continue;
+            }
+        };
+
+        let old_count = routes.read().await.len();
+        let new_count = new_routes.len();
+        *routes.write().await = new_routes;
+        info!(agent = %agent_name, old = old_count, new = new_count, "telegram routes hot-reloaded");
+    }
+}
+
+fn file_mtime(path: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
 /// Run the Telegram adapter for a specific agent.
 /// `agent_name` is used to name the bus registration and for logging.
-/// `allowed_chats` is the whitelist of chat_ids to accept messages from — all others are ignored.
-/// `mention_only_chats` is a subset where only @mentions trigger the agent.
-/// `chat_names` maps chat_id to a human-readable name shown to the agent as context.
-/// `chat_route_to` maps chat_id to a bus target override (e.g. "agent:collab").
+/// Routes are stored in an `Arc<RwLock<>>` so they can be hot-reloaded by the watcher task.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     token: String,
     socket_path: String,
     agent_name: String,
-    allowed_chats: std::collections::HashSet<i64>,
-    mention_only_chats: Vec<i64>,
-    chat_names: std::collections::HashMap<i64, String>,
-    chat_route_to: std::collections::HashMap<i64, String>,
+    routes: Arc<RwLock<Vec<TelegramRoute>>>,
     admin_telegram_ids: Vec<i64>,
+    config_path: Option<String>,
 ) -> Result<()> {
     info!(agent = %agent_name, "starting Telegram adapter");
 
@@ -211,17 +263,14 @@ pub async fn run(
     let polling_task = {
         let socket = socket_path.clone();
         let name = agent_name.clone();
-        let mention_only: std::collections::HashSet<i64> = mention_only_chats.into_iter().collect();
+        let routes_ref = routes.clone();
         tokio::spawn(async move {
             if let Err(e) = polling_loop(
                 bot,
                 socket,
                 name,
                 bot_username,
-                allowed_chats,
-                mention_only,
-                chat_names,
-                chat_route_to,
+                routes_ref,
                 admin_telegram_ids,
             )
             .await
@@ -231,10 +280,25 @@ pub async fn run(
         })
     };
 
+    // Task 4 (optional): watch config file for route changes and hot-reload
+    let watcher_task = if let Some(cfg_path) = config_path {
+        let routes_ref = routes.clone();
+        let name = agent_name.clone();
+        info!(agent = %agent_name, "started telegram route watcher");
+        Some(tokio::spawn(async move {
+            watch_routes(cfg_path, routes_ref, name).await;
+        }))
+    } else {
+        None
+    };
+
     tokio::select! {
         _ = bus_task => warn!(agent = %agent_name, "telegram bus task exited"),
         _ = sender_task => warn!(agent = %agent_name, "telegram sender task exited"),
         _ = polling_task => warn!(agent = %agent_name, "telegram polling task exited"),
+        _ = async { if let Some(w) = watcher_task { w.await.ok(); } else { std::future::pending::<()>().await; } } => {
+            warn!(agent = %agent_name, "telegram route watcher exited");
+        },
     }
 
     Ok(())
@@ -490,16 +554,13 @@ async fn download_photo_base64(bot: &Bot, file_id: &str) -> Result<String> {
 }
 
 /// Poll Telegram for incoming messages and publish them to the bus as `telegram.in:<chat_id>`.
-#[allow(clippy::too_many_arguments)]
+/// Routes are read from the shared `Arc<RwLock<>>` on each message, enabling hot-reload.
 async fn polling_loop(
     bot: Bot,
     socket_path: String,
     agent_name: String,
     bot_username: String,
-    allowed_chats: std::collections::HashSet<i64>,
-    mention_only_chats: std::collections::HashSet<i64>,
-    chat_names: std::collections::HashMap<i64, String>,
-    chat_route_to: std::collections::HashMap<i64, String>,
+    routes: Arc<RwLock<Vec<TelegramRoute>>>,
     admin_telegram_ids: Vec<i64>,
 ) -> Result<()> {
     let admin_ids: std::collections::HashSet<i64> = admin_telegram_ids.into_iter().collect();
@@ -507,10 +568,7 @@ async fn polling_loop(
         let socket = socket_path.clone();
         let agent = agent_name.clone();
         let bot_user = bot_username.clone();
-        let allowed = allowed_chats.clone();
-        let mention_only = mention_only_chats.clone();
-        let names = chat_names.clone();
-        let route_to_map = chat_route_to.clone();
+        let routes_ref = routes.clone();
         let admins = admin_ids.clone();
         async move {
             // Skip messages from the bot itself to prevent reply loops.
@@ -553,6 +611,12 @@ async fn polling_loop(
             if let Some(text) = task_text {
                 let chat_id = msg.chat.id.0;
 
+                // Read current routes from shared state (hot-reloadable).
+                let derived = {
+                    let current_routes = routes_ref.read().await;
+                    derive_routes(&current_routes)
+                };
+
                 // ── /channel_info — runs BEFORE whitelist ──────────────
                 // This command must work in ANY chat (including unconfigured
                 // ones) so users can discover the chat_id to add to routes.
@@ -567,10 +631,10 @@ async fn polling_loop(
                         },
                         teloxide::types::ChatKind::Private(_) => "private",
                     };
-                    let in_whitelist = allowed.is_empty() || allowed.contains(&chat_id);
-                    let name = names.get(&chat_id).map(|s| s.as_str()).unwrap_or("(not configured)");
-                    let is_mention_only = mention_only.contains(&chat_id);
-                    let route = route_to_map.get(&chat_id).map(|s| s.as_str()).unwrap_or("default");
+                    let in_whitelist = derived.allowed_chats.is_empty() || derived.allowed_chats.contains(&chat_id);
+                    let name = derived.chat_names.get(&chat_id).map(|s| s.as_str()).unwrap_or("(not configured)");
+                    let is_mention_only = derived.mention_only.contains(&chat_id);
+                    let route = derived.chat_route_to.get(&chat_id).map(|s| s.as_str()).unwrap_or("default");
                     let reply = format!(
                         "📋 Channel Info\n─────────────\nChat ID: {}\nType: {}\nName: {}\nRouted: {}\nMention only: {}\nRoute to: {}\nAgent: {}",
                         chat_id, chat_type, name,
@@ -583,7 +647,7 @@ async fn polling_loop(
                 }
 
                 // Whitelist check — only process chats explicitly configured in routes.
-                if !allowed.is_empty() && !allowed.contains(&chat_id) {
+                if !derived.allowed_chats.is_empty() && !derived.allowed_chats.contains(&chat_id) {
                     debug!(agent = %agent, chat_id = chat_id, "ignoring message — chat not in whitelist");
                     return Ok(());
                 }
@@ -621,7 +685,7 @@ async fn polling_loop(
                     text: text.clone(),
                     metadata: serde_json::json!({
                         "chat_id": chat_id,
-                        "chat_name": names.get(&chat_id),
+                        "chat_name": derived.chat_names.get(&chat_id),
                         "message_id": msg.id.0,
                     }),
                 };
@@ -630,7 +694,7 @@ async fn polling_loop(
                 }
 
                 // If this chat requires a mention, skip unless @bot_user appears in text.
-                if mention_only.contains(&chat_id) {
+                if derived.mention_only.contains(&chat_id) {
                     let mention = format!("@{}", bot_user);
                     if !text.contains(&mention) {
                         debug!(agent = %agent, chat_id = chat_id, "skipping message — not a mention");
@@ -639,14 +703,14 @@ async fn polling_loop(
                 }
 
                 // Use route_to override if configured, otherwise default to telegram.in:<chat_id>.
-                let target = if let Some(rt) = route_to_map.get(&chat_id) {
+                let target = if let Some(rt) = derived.chat_route_to.get(&chat_id) {
                     rt.clone()
                 } else {
                     format!("telegram.in:{}", chat_id)
                 };
                 // reply_to always goes back to Telegram so agent responses reach the chat.
                 let reply_to = format!("telegram.out:{}", chat_id);
-                let chat_name = names.get(&chat_id).cloned();
+                let chat_name = derived.chat_names.get(&chat_id).cloned();
 
                 debug!(agent = %agent, chat_id = chat_id, "received Telegram message");
 

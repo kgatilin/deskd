@@ -34,6 +34,7 @@ pub fn build_adapters(
             routes,
             admin_telegram_ids.to_vec(),
             def.name.clone(),
+            Some(def.config_path()),
         )));
     }
 
