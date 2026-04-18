@@ -453,7 +453,7 @@ fn compute_metrics(graph: &ArchGraph) -> MetricsReport {
         .into_iter()
         .map(|(name, count)| ToolUsageEntry { name, count })
         .collect();
-    tool_usage.sort_by(|a, b| b.count.cmp(&a.count));
+    tool_usage.sort_by_key(|b| std::cmp::Reverse(b.count));
 
     // Fan-out: outgoing links per component
     let mut outgoing: HashMap<String, usize> = HashMap::new();
@@ -506,7 +506,7 @@ fn compute_metrics(graph: &ArchGraph) -> MetricsReport {
         .filter(|(_, count)| *count > 3)
         .map(|((from, to), count)| PatternEntry { from, to, count })
         .collect();
-    patterns.sort_by(|a, b| b.count.cmp(&a.count));
+    patterns.sort_by_key(|b| std::cmp::Reverse(b.count));
 
     // Session stats
     let user_messages = graph

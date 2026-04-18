@@ -256,7 +256,7 @@ pub async fn handle(action: AgentAction) -> Result<()> {
                     .collect()
             };
 
-            filtered.sort_by(|a, b| b.ts.cmp(&a.ts));
+            filtered.sort_by_key(|b| std::cmp::Reverse(b.ts));
             filtered.truncate(limit);
 
             if filtered.is_empty() {
