@@ -583,6 +583,27 @@ async fn polling_loop(
                     let _ = bot.send_message(msg.chat.id, reply).await;
                     return Ok(());
                 }
+                if cmd_base == "/channel_info" {
+                    let chat_type = match &msg.chat.kind {
+                        teloxide::types::ChatKind::Public(p) => match &p.kind {
+                            teloxide::types::PublicChatKind::Supergroup(_) => "supergroup",
+                            teloxide::types::PublicChatKind::Group(_) => "group",
+                            teloxide::types::PublicChatKind::Channel(_) => "channel",
+                        },
+                        teloxide::types::ChatKind::Private(_) => "private",
+                    };
+                    let name = names.get(&chat_id).map(|s| s.as_str()).unwrap_or("(not configured)");
+                    let is_mention_only = mention_only.contains(&chat_id);
+                    let route = route_to_map.get(&chat_id).map(|s| s.as_str()).unwrap_or("default");
+                    let reply = format!(
+                        "📋 Channel Info\n─────────────\nChat ID: {}\nType: {}\nName: {}\nMention only: {}\nRoute to: {}\nAgent: {}",
+                        chat_id, chat_type, name,
+                        if is_mention_only { "yes" } else { "no" },
+                        route, agent
+                    );
+                    let _ = bot.send_message(msg.chat.id, reply).await;
+                    return Ok(());
+                }
 
                 // Write ALL messages from allowed chats to unified inbox,
                 // regardless of mention_only filtering.
