@@ -553,6 +553,35 @@ async fn polling_loop(
             if let Some(text) = task_text {
                 let chat_id = msg.chat.id.0;
 
+                // ── /channel_info — runs BEFORE whitelist ──────────────
+                // This command must work in ANY chat (including unconfigured
+                // ones) so users can discover the chat_id to add to routes.
+                let cmd = text.trim();
+                let cmd_base = cmd.split('@').next().unwrap_or(cmd);
+                if cmd_base == "/channel_info" {
+                    let chat_type = match &msg.chat.kind {
+                        teloxide::types::ChatKind::Public(p) => match &p.kind {
+                            teloxide::types::PublicChatKind::Supergroup(_) => "supergroup",
+                            teloxide::types::PublicChatKind::Group(_) => "group",
+                            teloxide::types::PublicChatKind::Channel(_) => "channel",
+                        },
+                        teloxide::types::ChatKind::Private(_) => "private",
+                    };
+                    let in_whitelist = allowed.is_empty() || allowed.contains(&chat_id);
+                    let name = names.get(&chat_id).map(|s| s.as_str()).unwrap_or("(not configured)");
+                    let is_mention_only = mention_only.contains(&chat_id);
+                    let route = route_to_map.get(&chat_id).map(|s| s.as_str()).unwrap_or("default");
+                    let reply = format!(
+                        "📋 Channel Info\n─────────────\nChat ID: {}\nType: {}\nName: {}\nRouted: {}\nMention only: {}\nRoute to: {}\nAgent: {}",
+                        chat_id, chat_type, name,
+                        if in_whitelist { "yes" } else { "no ⚠️ add to deskd.yaml routes" },
+                        if is_mention_only { "yes" } else { "no" },
+                        route, agent
+                    );
+                    let _ = bot.send_message(msg.chat.id, reply).await;
+                    return Ok(());
+                }
+
                 // Whitelist check — only process chats explicitly configured in routes.
                 if !allowed.is_empty() && !allowed.contains(&chat_id) {
                     debug!(agent = %agent, chat_id = chat_id, "ignoring message — chat not in whitelist");
@@ -563,9 +592,6 @@ async fn polling_loop(
                 // Handle /status and /restart locally without forwarding to
                 // the agent.  This runs AFTER the whitelist check so that
                 // only authorised chats can invoke these commands.
-                let cmd = text.trim();
-                // Strip @botname suffix for group chats (e.g. "/status@my_bot")
-                let cmd_base = cmd.split('@').next().unwrap_or(cmd);
                 if cmd_base == "/status" {
                     let reply = format_status_reply(&agent);
                     let _ = bot.send_message(msg.chat.id, reply).await;
@@ -580,27 +606,6 @@ async fn polling_loop(
                         return Ok(());
                     }
                     let reply = handle_restart_command(&agent, &socket).await;
-                    let _ = bot.send_message(msg.chat.id, reply).await;
-                    return Ok(());
-                }
-                if cmd_base == "/channel_info" {
-                    let chat_type = match &msg.chat.kind {
-                        teloxide::types::ChatKind::Public(p) => match &p.kind {
-                            teloxide::types::PublicChatKind::Supergroup(_) => "supergroup",
-                            teloxide::types::PublicChatKind::Group(_) => "group",
-                            teloxide::types::PublicChatKind::Channel(_) => "channel",
-                        },
-                        teloxide::types::ChatKind::Private(_) => "private",
-                    };
-                    let name = names.get(&chat_id).map(|s| s.as_str()).unwrap_or("(not configured)");
-                    let is_mention_only = mention_only.contains(&chat_id);
-                    let route = route_to_map.get(&chat_id).map(|s| s.as_str()).unwrap_or("default");
-                    let reply = format!(
-                        "📋 Channel Info\n─────────────\nChat ID: {}\nType: {}\nName: {}\nMention only: {}\nRoute to: {}\nAgent: {}",
-                        chat_id, chat_type, name,
-                        if is_mention_only { "yes" } else { "no" },
-                        route, agent
-                    );
                     let _ = bot.send_message(msg.chat.id, reply).await;
                     return Ok(());
                 }
