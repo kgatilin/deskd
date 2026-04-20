@@ -518,7 +518,16 @@ pub struct SubAgentDef {
 /// Telegram channel routing config in the per-user deskd.yaml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramRoutesConfig {
+    #[serde(default)]
     pub routes: Vec<TelegramRoute>,
+    /// Optional MTProto user-account config (issue #376). Kept here in
+    /// addition to `WorkspaceConfig::TelegramConfig.mtproto` so the
+    /// per-agent MCP server — which only sees `UserConfig` — can read
+    /// it without reaching into workspace.yaml. In practice only one
+    /// of the two is populated; the workspace entry is for admin/ops,
+    /// the user entry is what the running agent consumes.
+    #[serde(default)]
+    pub mtproto: Option<MtProtoConfig>,
 }
 
 /// A single Telegram chat route.

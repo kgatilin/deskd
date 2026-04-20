@@ -1170,6 +1170,72 @@ pub(crate) async fn call_query_agent(
     }
 }
 
+// ─── telegram_history (issue #376) ───────────────────────────────────────────
+
+/// Handle the `telegram_history` MCP tool call.
+///
+/// Phase 1 (this PR): exposes the tool surface so agents can be
+/// exercised against the contract. The handler validates:
+///   1. The `mtproto` feature was compiled in.
+///   2. `user_config.telegram.mtproto` is populated.
+///   3. The calling agent is allowed to query the requested chat_id.
+///
+/// If all checks pass, it still errors with "not yet implemented"
+/// because the actual grammers integration is phase 2.
+pub(crate) async fn call_telegram_history(
+    args: &Value,
+    agent_name: &str,
+    user_config: Option<&UserConfig>,
+) -> Result<Value> {
+    // Parse arguments first so the error messages are consistent
+    // regardless of feature flags.
+    let chat_id = args
+        .get("chat_id")
+        .and_then(|v| v.as_i64())
+        .context("telegram_history: missing required integer 'chat_id'")?;
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
+    if limit == 0 || limit > 200 {
+        bail!("telegram_history: 'limit' must be in 1..=200 (got {})", limit);
+    }
+    let _offset_id: Option<i32> = args
+        .get("offset_id")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+
+    #[cfg(not(feature = "mtproto"))]
+    {
+        let _ = (chat_id, agent_name, user_config);
+        bail!(
+            "telegram_history requires the `mtproto` feature — rebuild deskd with `--features mtproto`"
+        );
+    }
+
+    #[cfg(feature = "mtproto")]
+    {
+        let cfg = user_config.context(
+            "telegram_history: no user config loaded — set DESKD_AGENT_CONFIG",
+        )?;
+        let mtproto = cfg
+            .telegram
+            .as_ref()
+            .and_then(|t| t.mtproto.as_ref())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "telegram_history: mtproto config missing — add telegram.mtproto to deskd.yaml"
+                )
+            })?;
+        if !mtproto.agent_can_query(agent_name, chat_id) {
+            bail!(
+                "telegram_history: agent {} not allowed to query chat {}",
+                agent_name,
+                chat_id
+            );
+        }
+        // Phase 2 will call MtProtoClient::connect + fetch_history here.
+        bail!("telegram_history: not yet implemented (issue #376 phase 2)");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1182,5 +1248,42 @@ mod tests {
         assert!(glob_match("agent:dev", "agent:dev"));
         assert!(!glob_match("agent:dev", "agent:researcher"));
         assert!(!glob_match("telegram.out:*", "telegram.in:-1234"));
+    }
+
+    #[tokio::test]
+    async fn telegram_history_rejects_missing_chat_id() {
+        let err = call_telegram_history(&json!({}), "kira", None)
+            .await
+            .unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("chat_id"),
+            "expected chat_id error, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_history_rejects_bad_limit() {
+        let err =
+            call_telegram_history(&json!({"chat_id": 1, "limit": 500}), "kira", None)
+                .await
+                .unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("limit"), "expected limit error, got: {}", msg);
+    }
+
+    #[cfg(not(feature = "mtproto"))]
+    #[tokio::test]
+    async fn telegram_history_requires_feature_when_disabled() {
+        let err = call_telegram_history(&json!({"chat_id": 42}), "kira", None)
+            .await
+            .unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("mtproto"),
+            "expected feature-flag hint, got: {}",
+            msg
+        );
     }
 }

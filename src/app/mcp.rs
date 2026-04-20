@@ -604,6 +604,24 @@ fn handle_tools_list(
         }
     }));
 
+    // telegram_history — MTProto chat-history retrieval (issue #376).
+    // Always advertised so agents can discover the contract; the
+    // handler returns a clean error when the `mtproto` feature is off
+    // or the config/ACL does not permit the call.
+    tools.push(json!({
+        "name": "telegram_history",
+        "description": "Fetch recent messages from a Telegram chat via MTProto (issue #376). Requires the `mtproto` build feature and a per-agent ACL entry under telegram.mtproto.allowed_chats in deskd.yaml. Phase 1 returns a contract-only error; phase 2 wires grammers-client.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "chat_id": {"type": "integer", "description": "Telegram chat id (positive for users/groups, negative for channels/supergroups)"},
+                "limit": {"type": "integer", "description": "How many messages to fetch (1..=200, default 50)", "default": 50},
+                "offset_id": {"type": "integer", "description": "Return only messages older than this message id (pagination)"}
+            },
+            "required": ["chat_id"]
+        }
+    }));
+
     Response::ok(id, json!({ "tools": tools }))
 }
 
@@ -657,6 +675,9 @@ async fn handle_tools_call(
         "browse_needs" => mcp_tools::call_browse_needs(args).await,
         "propose_for_need" => mcp_tools::call_propose_for_need(args).await,
         "query_agent" => mcp_tools::call_query_agent(args, agent_name, bus_socket).await,
+        "telegram_history" => {
+            mcp_tools::call_telegram_history(args, agent_name, user_config).await
+        }
         other => anyhow::bail!("Unknown tool: {}", other),
     }
 }
