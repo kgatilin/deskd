@@ -140,6 +140,33 @@ pub enum Commands {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// Interactively log in to Telegram via MTProto and persist a session
+    /// file (issue #376).
+    ///
+    /// Usage:
+    ///   deskd telegram-login \
+    ///       --api-id 12345 \
+    ///       --api-hash deadbeef \
+    ///       --phone +1234567890 \
+    ///       --session-path /var/lib/deskd/tg-session.bin
+    ///
+    /// Prompts for the SMS code (and 2FA password if enabled) on stdin,
+    /// then writes the grammers session file. Kept out of `deskd serve`
+    /// so no interactive input is ever required in the daemon path.
+    TelegramLogin {
+        /// Telegram API ID from https://my.telegram.org.
+        #[arg(long)]
+        api_id: Option<i32>,
+        /// Telegram API hash from https://my.telegram.org.
+        #[arg(long)]
+        api_hash: Option<String>,
+        /// Phone number in international format (e.g. +1234567890).
+        #[arg(long)]
+        phone: Option<String>,
+        /// Where to persist the grammers session file.
+        #[arg(long)]
+        session_path: Option<String>,
+    },
     /// Schedule a one-shot reminder for an agent.
     ///
     /// Writes a RemindDef JSON to ~/.deskd/reminders/<uuid>.json.

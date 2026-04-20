@@ -109,6 +109,50 @@ pub struct RoomDef {
 pub struct TelegramConfig {
     /// Bot token from @BotFather. Typically set via ${TELEGRAM_BOT_TOKEN}.
     pub token: String,
+    /// Optional MTProto user-account config for history retrieval
+    /// (issue #376). Parallel to the Bot API path — absent by default,
+    /// in which case only teloxide/Bot API is used.
+    #[serde(default)]
+    pub mtproto: Option<MtProtoConfig>,
+}
+
+/// MTProto user-account config. Used by the `telegram_history` MCP tool
+/// to fetch chat history in groups where bot privacy mode hides messages.
+///
+/// See `docs/TELEGRAM_MTPROTO.md` for the design.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MtProtoConfig {
+    /// Telegram API ID from https://my.telegram.org.
+    pub api_id: i32,
+    /// Telegram API hash from https://my.telegram.org.
+    pub api_hash: String,
+    /// Path to the persisted grammers session file. Contains full
+    /// account credentials — filesystem ACL must restrict it to the
+    /// agent's unix user (mode 0600).
+    pub session_path: PathBuf,
+    /// Phone number in international format (e.g. "+1234567890").
+    /// Only consulted by the `deskd telegram-login` command; the serve
+    /// runtime reads the session file directly.
+    #[serde(default)]
+    pub phone: Option<String>,
+    /// Per-agent chat ACL: `agent_name -> [chat_id, ...]`. The
+    /// `telegram_history` tool refuses to query a chat that is not
+    /// listed for the requesting agent. Default empty — deny all.
+    #[serde(default)]
+    pub allowed_chats: HashMap<String, Vec<i64>>,
+}
+
+impl MtProtoConfig {
+    /// Return true if `agent_name` is allowed to query `chat_id`.
+    ///
+    /// Pure function, no I/O — used by the MCP handler before any
+    /// grammers call. Unknown agents are always denied.
+    pub fn agent_can_query(&self, agent_name: &str, chat_id: i64) -> bool {
+        self.allowed_chats
+            .get(agent_name)
+            .map(|chats| chats.contains(&chat_id))
+            .unwrap_or(false)
+    }
 }
 
 /// Discord bot adapter config. Defined per-agent in workspace.yaml.
@@ -474,6 +518,7 @@ pub struct SubAgentDef {
 /// Telegram channel routing config in the per-user deskd.yaml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramRoutesConfig {
+    #[serde(default)]
     pub routes: Vec<TelegramRoute>,
 }
 
@@ -667,7 +712,93 @@ agents:
             cfg.agents[0].telegram.as_ref().unwrap().token,
             "bot-token-123"
         );
+        // Back-compat: no mtproto section present.
+        assert!(cfg.agents[0].telegram.as_ref().unwrap().mtproto.is_none());
         assert!(cfg.agents[1].telegram.is_none());
+    }
+
+    #[test]
+    fn test_workspace_config_with_telegram_mtproto() {
+        let yaml = r#"
+agents:
+  - name: kira
+    work_dir: /home/kira
+    unix_user: kira
+    telegram:
+      token: "bot-token-123"
+      mtproto:
+        api_id: 12345
+        api_hash: "deadbeef"
+        session_path: "/var/lib/deskd/tg-session.bin"
+        phone: "+1234567890"
+        allowed_chats:
+          kira: [123, 456]
+          dev: [789]
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let tg = cfg.agents[0].telegram.as_ref().unwrap();
+        let mtp = tg.mtproto.as_ref().expect("mtproto section present");
+        assert_eq!(mtp.api_id, 12345);
+        assert_eq!(mtp.api_hash, "deadbeef");
+        assert_eq!(
+            mtp.session_path,
+            std::path::PathBuf::from("/var/lib/deskd/tg-session.bin")
+        );
+        assert_eq!(mtp.phone.as_deref(), Some("+1234567890"));
+        assert_eq!(mtp.allowed_chats.get("kira").unwrap(), &vec![123i64, 456]);
+        assert_eq!(mtp.allowed_chats.get("dev").unwrap(), &vec![789i64]);
+    }
+
+    #[test]
+    fn test_workspace_config_telegram_without_mtproto() {
+        // Back-compat: existing yaml with only `token` must still parse
+        // and mtproto must default to None.
+        let yaml = r#"
+agents:
+  - name: kira
+    work_dir: /home/kira
+    telegram:
+      token: "bot-token-123"
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let tg = cfg.agents[0].telegram.as_ref().unwrap();
+        assert_eq!(tg.token, "bot-token-123");
+        assert!(tg.mtproto.is_none());
+    }
+
+    #[test]
+    fn test_mtproto_config_acl_allow_and_deny() {
+        let mut allowed = HashMap::new();
+        allowed.insert("kira".to_string(), vec![123i64, 456]);
+        let cfg = MtProtoConfig {
+            api_id: 1,
+            api_hash: "x".into(),
+            session_path: PathBuf::from("/tmp/session.bin"),
+            phone: None,
+            allowed_chats: allowed,
+        };
+        // Allowed: agent+chat pair present.
+        assert!(cfg.agent_can_query("kira", 123));
+        assert!(cfg.agent_can_query("kira", 456));
+        // Denied: chat not in kira's list.
+        assert!(!cfg.agent_can_query("kira", 999));
+        // Denied: agent not in the ACL map at all.
+        assert!(!cfg.agent_can_query("vasya", 123));
+        // Denied: unknown agent + unknown chat.
+        assert!(!cfg.agent_can_query("vasya", 999));
+    }
+
+    #[test]
+    fn test_mtproto_config_acl_empty_denies_all() {
+        let cfg = MtProtoConfig {
+            api_id: 1,
+            api_hash: "x".into(),
+            session_path: PathBuf::from("/tmp/session.bin"),
+            phone: None,
+            allowed_chats: HashMap::new(),
+        };
+        assert!(!cfg.agent_can_query("kira", 123));
+        assert!(!cfg.agent_can_query("anyone", 0));
     }
 
     #[test]

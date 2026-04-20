@@ -108,6 +108,49 @@ async fn main() -> anyhow::Result<()> {
         Commands::Upgrade { install_dir } => {
             commands::upgrade::handle(install_dir).await?;
         }
+        Commands::TelegramLogin {
+            api_id,
+            api_hash,
+            phone,
+            session_path,
+        } => {
+            #[cfg(feature = "mtproto")]
+            {
+                let api_id = api_id.ok_or_else(|| {
+                    anyhow::anyhow!("--api-id is required (from https://my.telegram.org)")
+                })?;
+                let api_hash = api_hash.ok_or_else(|| {
+                    anyhow::anyhow!("--api-hash is required (from https://my.telegram.org)")
+                })?;
+                let phone = phone.ok_or_else(|| {
+                    anyhow::anyhow!("--phone is required (international format, e.g. +1234567890)")
+                })?;
+                let session_path = session_path.unwrap_or_else(|| {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+                    format!("{}/.deskd/telegram.session", home)
+                });
+                // Ensure parent directory exists.
+                if let Some(parent) = std::path::Path::new(&session_path).parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                deskd::infra::telegram_mtproto::telegram_login(
+                    api_id,
+                    &api_hash,
+                    &phone,
+                    &session_path,
+                )
+                .await?;
+            }
+            #[cfg(not(feature = "mtproto"))]
+            {
+                let _ = (api_id, api_hash, phone, session_path);
+                eprintln!(
+                    "deskd telegram-login requires the `mtproto` feature — \
+                     rebuild with `cargo build --features mtproto`"
+                );
+                std::process::exit(1);
+            }
+        }
         Commands::Usage {
             period,
             agent,
