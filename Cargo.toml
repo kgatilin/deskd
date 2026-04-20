@@ -30,6 +30,10 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 jsonwebtoken = "9"
 ring = "0.17"
+# Optional MTProto client (issue #376). Pulled in only when the `mtproto`
+# feature is enabled so default builds stay lightweight and do not pay
+# the compile cost of the full grammers stack.
+grammers-client = { version = "0.9", optional = true }
 
 [lib]
 name = "deskd"
@@ -46,3 +50,6 @@ path = "src/bin/session2graph.rs"
 [features]
 default = []
 vendored-openssl = ["openssl"]
+# Enables the MTProto user-account path for Telegram history retrieval
+# (issue #376). Disabled by default; pulls in grammers-client.
+mtproto = ["grammers-client"]
