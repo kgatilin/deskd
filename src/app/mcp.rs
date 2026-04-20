@@ -619,7 +619,7 @@ fn handle_tools_list(
     // or the config/ACL does not permit the call.
     tools.push(json!({
         "name": "telegram_history",
-        "description": "Fetch recent messages from a Telegram chat via MTProto (issue #376). Requires the `mtproto` build feature and a per-agent ACL entry under telegram.mtproto.allowed_chats in workspace.yaml. Phase 1 returns a contract-only error; phase 2 wires grammers-client.",
+        "description": "Fetch recent messages from a Telegram chat via MTProto (issue #376). Requires the `mtproto` build feature, a session file (created by `deskd telegram-login`), and a per-agent ACL entry under telegram.mtproto.allowed_chats in workspace.yaml.",
         "inputSchema": {
             "type": "object",
             "properties": {

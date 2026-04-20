@@ -34,6 +34,8 @@ ring = "0.17"
 # feature is enabled so default builds stay lightweight and do not pay
 # the compile cost of the full grammers stack.
 grammers-client = { version = "0.9", optional = true }
+grammers-session = { version = "0.9", optional = true }
+grammers-mtsender = { version = "0.9", optional = true }
 
 [lib]
 name = "deskd"
@@ -52,4 +54,4 @@ default = []
 vendored-openssl = ["openssl"]
 # Enables the MTProto user-account path for Telegram history retrieval
 # (issue #376). Disabled by default; pulls in grammers-client.
-mtproto = ["grammers-client"]
+mtproto = ["grammers-client", "grammers-session", "grammers-mtsender"]

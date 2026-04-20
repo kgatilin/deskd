@@ -141,9 +141,9 @@ pub enum Commands {
         socket: Option<String>,
     },
     /// Interactively log in to Telegram via MTProto and persist a session
-    /// file (issue #376). Phase 1 stub — prints a not-implemented notice.
+    /// file (issue #376).
     ///
-    /// Intended phase 2 UX:
+    /// Usage:
     ///   deskd telegram-login \
     ///       --api-id 12345 \
     ///       --api-hash deadbeef \

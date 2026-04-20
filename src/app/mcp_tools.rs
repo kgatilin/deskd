@@ -1174,14 +1174,8 @@ pub(crate) async fn call_query_agent(
 
 /// Handle the `telegram_history` MCP tool call.
 ///
-/// Phase 1 (this PR): exposes the tool surface so agents can be
-/// exercised against the contract. The handler validates:
-///   1. The `mtproto` feature was compiled in.
-///   2. `mtproto_config` is provided (from workspace-level config).
-///   3. The calling agent is allowed to query the requested chat_id.
-///
-/// If all checks pass, it still errors with "not yet implemented"
-/// because the actual grammers integration is phase 2.
+/// Validates feature flag, config, and ACL, then connects to Telegram
+/// via grammers-client and fetches chat history.
 pub(crate) async fn call_telegram_history(
     args: &Value,
     agent_name: &str,
@@ -1215,6 +1209,8 @@ pub(crate) async fn call_telegram_history(
 
     #[cfg(feature = "mtproto")]
     {
+        use crate::infra::telegram_mtproto::MtProtoClient;
+
         let mtproto = mtproto_config.ok_or_else(|| {
             anyhow::anyhow!(
                 "telegram_history: mtproto config missing — add telegram.mtproto to workspace.yaml"
@@ -1227,8 +1223,20 @@ pub(crate) async fn call_telegram_history(
                 chat_id
             );
         }
-        // Phase 2 will call MtProtoClient::connect + fetch_history here.
-        bail!("telegram_history: not yet implemented (issue #376 phase 2)");
+
+        let client = MtProtoClient::connect(mtproto)
+            .await
+            .context("telegram_history: failed to connect MTProto client")?;
+        let messages = client
+            .fetch_history(chat_id, limit, _offset_id)
+            .await
+            .context("telegram_history: failed to fetch messages")?;
+
+        Ok(json!({
+            "chat_id": chat_id,
+            "count": messages.len(),
+            "messages": messages,
+        }))
     }
 }
 
