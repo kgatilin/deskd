@@ -1195,7 +1195,10 @@ pub(crate) async fn call_telegram_history(
         .context("telegram_history: missing required integer 'chat_id'")?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
     if limit == 0 || limit > 200 {
-        bail!("telegram_history: 'limit' must be in 1..=200 (got {})", limit);
+        bail!(
+            "telegram_history: 'limit' must be in 1..=200 (got {})",
+            limit
+        );
     }
     let _offset_id: Option<i32> = args
         .get("offset_id")
@@ -1212,9 +1215,8 @@ pub(crate) async fn call_telegram_history(
 
     #[cfg(feature = "mtproto")]
     {
-        let cfg = user_config.context(
-            "telegram_history: no user config loaded — set DESKD_AGENT_CONFIG",
-        )?;
+        let cfg = user_config
+            .context("telegram_history: no user config loaded — set DESKD_AGENT_CONFIG")?;
         let mtproto = cfg
             .telegram
             .as_ref()
@@ -1265,10 +1267,9 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_history_rejects_bad_limit() {
-        let err =
-            call_telegram_history(&json!({"chat_id": 1, "limit": 500}), "kira", None)
-                .await
-                .unwrap_err();
+        let err = call_telegram_history(&json!({"chat_id": 1, "limit": 500}), "kira", None)
+            .await
+            .unwrap_err();
         let msg = format!("{:#}", err);
         assert!(msg.contains("limit"), "expected limit error, got: {}", msg);
     }

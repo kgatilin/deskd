@@ -675,9 +675,7 @@ async fn handle_tools_call(
         "browse_needs" => mcp_tools::call_browse_needs(args).await,
         "propose_for_need" => mcp_tools::call_propose_for_need(args).await,
         "query_agent" => mcp_tools::call_query_agent(args, agent_name, bus_socket).await,
-        "telegram_history" => {
-            mcp_tools::call_telegram_history(args, agent_name, user_config).await
-        }
+        "telegram_history" => mcp_tools::call_telegram_history(args, agent_name, user_config).await,
         other => anyhow::bail!("Unknown tool: {}", other),
     }
 }
