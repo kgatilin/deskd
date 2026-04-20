@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::app::mcp_service;
-use crate::config::UserConfig;
+use crate::config::{MtProtoConfig, UserConfig};
 
 // ─── Embedded bus for sub-agent orchestration ────────────────────────────────
 
@@ -1177,7 +1177,7 @@ pub(crate) async fn call_query_agent(
 /// Phase 1 (this PR): exposes the tool surface so agents can be
 /// exercised against the contract. The handler validates:
 ///   1. The `mtproto` feature was compiled in.
-///   2. `user_config.telegram.mtproto` is populated.
+///   2. `mtproto_config` is provided (from workspace-level config).
 ///   3. The calling agent is allowed to query the requested chat_id.
 ///
 /// If all checks pass, it still errors with "not yet implemented"
@@ -1185,7 +1185,7 @@ pub(crate) async fn call_query_agent(
 pub(crate) async fn call_telegram_history(
     args: &Value,
     agent_name: &str,
-    user_config: Option<&UserConfig>,
+    mtproto_config: Option<&MtProtoConfig>,
 ) -> Result<Value> {
     // Parse arguments first so the error messages are consistent
     // regardless of feature flags.
@@ -1207,7 +1207,7 @@ pub(crate) async fn call_telegram_history(
 
     #[cfg(not(feature = "mtproto"))]
     {
-        let _ = (chat_id, agent_name, user_config);
+        let _ = (chat_id, agent_name, mtproto_config);
         bail!(
             "telegram_history requires the `mtproto` feature — rebuild deskd with `--features mtproto`"
         );
@@ -1215,17 +1215,11 @@ pub(crate) async fn call_telegram_history(
 
     #[cfg(feature = "mtproto")]
     {
-        let cfg = user_config
-            .context("telegram_history: no user config loaded — set DESKD_AGENT_CONFIG")?;
-        let mtproto = cfg
-            .telegram
-            .as_ref()
-            .and_then(|t| t.mtproto.as_ref())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "telegram_history: mtproto config missing — add telegram.mtproto to deskd.yaml"
-                )
-            })?;
+        let mtproto = mtproto_config.ok_or_else(|| {
+            anyhow::anyhow!(
+                "telegram_history: mtproto config missing — add telegram.mtproto to workspace.yaml"
+            )
+        })?;
         if !mtproto.agent_can_query(agent_name, chat_id) {
             bail!(
                 "telegram_history: agent {} not allowed to query chat {}",
