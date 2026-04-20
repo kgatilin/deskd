@@ -108,6 +108,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Upgrade { install_dir } => {
             commands::upgrade::handle(install_dir).await?;
         }
+        Commands::TelegramLogin { .. } => {
+            eprintln!(
+                "deskd telegram-login: Phase 2 — not yet implemented. See issue #376 \
+                 (https://github.com/kgatilin/deskd/issues/376)."
+            );
+        }
         Commands::Usage {
             period,
             agent,
