@@ -164,30 +164,27 @@ mod imp {
 
     /// Convert a Bot-API-style chat_id to a grammers `PeerId`.
     ///
-    /// Bot API conventions:
-    /// - Positive IDs → user
-    /// - Negative IDs starting with -100 → channel/supergroup
-    /// - Other negative IDs → small group chat
+    /// `PeerId` uses the same Bot-API Dialog ID encoding internally,
+    /// so we construct via the appropriate typed constructor using the
+    /// bare (positive) id extracted from the Bot-API convention:
+    /// - Positive → user
+    /// - -100XXXXXXXXXX → channel/supergroup (bare = strip -100 prefix)
+    /// - Other negative → small group (bare = abs)
     fn bot_api_to_peer_id(chat_id: i64) -> Result<PeerId> {
         if chat_id > 0 {
             PeerId::user(chat_id).context("invalid user id")
         } else if chat_id < -1_000_000_000_000 {
-            let channel_id = -(chat_id + 1_000_000_000_000);
-            PeerId::channel(channel_id).context("invalid channel id")
+            let bare = -(chat_id + 1_000_000_000_000);
+            PeerId::channel(bare).context("invalid channel id")
         } else {
-            let group_id = -chat_id;
-            PeerId::chat(group_id).context("invalid group id")
+            let bare = -chat_id;
+            PeerId::chat(bare).context("invalid group id")
         }
     }
 
-    /// Convert a grammers `PeerId` back to a plain i64.
+    /// Extract the bare (positive) user/chat/channel id from a `PeerId`.
     fn peer_id_to_i64(pid: &PeerId) -> i64 {
-        // PeerId's Debug format is "User(123)" / "Chat(456)" / "Channel(789)".
-        let s = format!("{:?}", pid);
-        s.trim_start_matches(|c: char| c.is_alphabetic() || c == '(')
-            .trim_end_matches(')')
-            .parse::<i64>()
-            .unwrap_or(0)
+        pid.bare_id()
     }
 
     // ─── Interactive login flow ─────────────────────────────────────────────
