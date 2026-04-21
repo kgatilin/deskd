@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::app::mcp_service;
-use crate::config::{MtProtoConfig, UserConfig};
+use crate::config::UserConfig;
 
 // ─── Embedded bus for sub-agent orchestration ────────────────────────────────
 
@@ -1170,74 +1170,34 @@ pub(crate) async fn call_query_agent(
     }
 }
 
-// ─── telegram_history (issue #376) ───────────────────────────────────────────
+// ─── telegram_history ────────────────────────────────────────────────────────
 
 /// Handle the `telegram_history` MCP tool call.
 ///
-/// Validates feature flag, config, and ACL, then connects to Telegram
-/// via grammers-client and fetches chat history.
-pub(crate) async fn call_telegram_history(
-    args: &Value,
-    agent_name: &str,
-    mtproto_config: Option<&MtProtoConfig>,
-) -> Result<Value> {
-    // Parse arguments first so the error messages are consistent
-    // regardless of feature flags.
+/// Reads from the locally accumulated unified inbox at
+/// `~/.deskd/inboxes/telegram/{chat_id}.jsonl`. Messages are written
+/// there by the teloxide adapter on every incoming Telegram message.
+pub(crate) async fn call_telegram_history(args: &Value) -> Result<Value> {
     let chat_id = args
         .get("chat_id")
         .and_then(|v| v.as_i64())
         .context("telegram_history: missing required integer 'chat_id'")?;
-    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
     if limit == 0 || limit > 200 {
         bail!(
             "telegram_history: 'limit' must be in 1..=200 (got {})",
             limit
         );
     }
-    let _offset_id: Option<i32> = args
-        .get("offset_id")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32);
 
-    #[cfg(not(feature = "mtproto"))]
-    {
-        let _ = (chat_id, agent_name, mtproto_config);
-        bail!(
-            "telegram_history requires the `mtproto` feature — rebuild deskd with `--features mtproto`"
-        );
-    }
+    let inbox_name = format!("telegram/{}", chat_id);
+    let messages = mcp_service::read_inbox(&inbox_name, limit, None)?;
 
-    #[cfg(feature = "mtproto")]
-    {
-        use crate::infra::telegram_mtproto::MtProtoClient;
-
-        let mtproto = mtproto_config.ok_or_else(|| {
-            anyhow::anyhow!(
-                "telegram_history: mtproto config missing — add telegram.mtproto to workspace.yaml"
-            )
-        })?;
-        if !mtproto.agent_can_query(agent_name, chat_id) {
-            bail!(
-                "telegram_history: agent {} not allowed to query chat {}",
-                agent_name,
-                chat_id
-            );
-        }
-
-        let client = MtProtoClient::connect(mtproto)
-            .await
-            .context("telegram_history: failed to connect MTProto client")?;
-        let messages = client
-            .fetch_history(chat_id, limit, _offset_id)
-            .await
-            .context("telegram_history: failed to fetch messages")?;
-
-        Ok(json!({
-            "chat_id": chat_id,
-            "count": messages.len(),
-            "messages": messages,
-        }))
-    }
+    Ok(json!({
+        "chat_id": chat_id,
+        "count": messages.len(),
+        "messages": messages,
+    }))
 }
 
 #[cfg(test)]
@@ -1256,9 +1216,7 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_history_rejects_missing_chat_id() {
-        let err = call_telegram_history(&json!({}), "kira", None)
-            .await
-            .unwrap_err();
+        let err = call_telegram_history(&json!({})).await.unwrap_err();
         let msg = format!("{:#}", err);
         assert!(
             msg.contains("chat_id"),
@@ -1269,24 +1227,10 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_history_rejects_bad_limit() {
-        let err = call_telegram_history(&json!({"chat_id": 1, "limit": 500}), "kira", None)
+        let err = call_telegram_history(&json!({"chat_id": 1, "limit": 500}))
             .await
             .unwrap_err();
         let msg = format!("{:#}", err);
         assert!(msg.contains("limit"), "expected limit error, got: {}", msg);
-    }
-
-    #[cfg(not(feature = "mtproto"))]
-    #[tokio::test]
-    async fn telegram_history_requires_feature_when_disabled() {
-        let err = call_telegram_history(&json!({"chat_id": 42}), "kira", None)
-            .await
-            .unwrap_err();
-        let msg = format!("{:#}", err);
-        assert!(
-            msg.contains("mtproto"),
-            "expected feature-flag hint, got: {}",
-            msg
-        );
     }
 }

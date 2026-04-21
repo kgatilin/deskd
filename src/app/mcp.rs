@@ -19,7 +19,7 @@ use crate::app::mcp_protocol::{
     write_response,
 };
 use crate::app::mcp_tools::{self, InternalBus, build_send_message_description};
-use crate::config::{MtProtoConfig, ServeState, UserConfig, WorkspaceConfig};
+use crate::config::UserConfig;
 use crate::ports::bus_wire::BusMessage;
 
 // ─── Main entry point ────────────────────────────────────────────────────────
@@ -34,11 +34,6 @@ pub async fn run(agent_name: &str) -> Result<()> {
     let user_config = config_path
         .as_deref()
         .and_then(|p| UserConfig::load(p).ok());
-
-    // Load mtproto config from workspace config (via serve state).
-    // The mtproto config lives on the workspace-level TelegramConfig,
-    // not on the per-user TelegramRoutesConfig.
-    let mtproto_config: Option<MtProtoConfig> = load_mtproto_config(agent_name);
 
     // Lazy-initialized internal bus for sub-agent orchestration.
     let internal_bus: Arc<Mutex<Option<InternalBus>>> = Arc::new(Mutex::new(None));
@@ -112,7 +107,6 @@ pub async fn run(agent_name: &str) -> Result<()> {
                     agent_name,
                     &bus_socket,
                     user_config.as_ref(),
-                    mtproto_config.as_ref(),
                     &internal_bus,
                     &task_store,
                     &sm_store,
@@ -174,7 +168,6 @@ async fn handle_request(
     agent_name: &str,
     bus_socket: &str,
     user_config: Option<&UserConfig>,
-    mtproto_config: Option<&MtProtoConfig>,
     internal_bus: &Arc<Mutex<Option<InternalBus>>>,
     task_store: &dyn crate::ports::store::TaskRepository,
     sm_store: &dyn crate::ports::store::StateMachineRepository,
@@ -190,7 +183,6 @@ async fn handle_request(
                 agent_name,
                 bus_socket,
                 user_config,
-                mtproto_config,
                 internal_bus,
                 task_store,
                 sm_store,
@@ -613,13 +605,10 @@ fn handle_tools_list(
         }
     }));
 
-    // telegram_history — MTProto chat-history retrieval (issue #376).
-    // Always advertised so agents can discover the contract; the
-    // handler returns a clean error when the `mtproto` feature is off
-    // or the config/ACL does not permit the call.
+    // telegram_history — read locally accumulated Telegram messages.
     tools.push(json!({
         "name": "telegram_history",
-        "description": "Fetch recent messages from a Telegram chat via MTProto (issue #376). Requires the `mtproto` build feature, a session file (created by `deskd telegram-login`), and a per-agent ACL entry under telegram.mtproto.allowed_chats in workspace.yaml.",
+        "description": "Fetch recent messages from a Telegram chat. Reads from the local message store accumulated by the Telegram bot adapter.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -636,13 +625,11 @@ fn handle_tools_list(
 
 // ─── Tool dispatch ───────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_tools_call(
     params: &Value,
     agent_name: &str,
     bus_socket: &str,
     user_config: Option<&UserConfig>,
-    mtproto_config: Option<&MtProtoConfig>,
     internal_bus: &Arc<Mutex<Option<InternalBus>>>,
     task_store: &dyn crate::ports::store::TaskRepository,
     sm_store: &dyn crate::ports::store::StateMachineRepository,
@@ -686,29 +673,7 @@ async fn handle_tools_call(
         "browse_needs" => mcp_tools::call_browse_needs(args).await,
         "propose_for_need" => mcp_tools::call_propose_for_need(args).await,
         "query_agent" => mcp_tools::call_query_agent(args, agent_name, bus_socket).await,
-        "telegram_history" => {
-            mcp_tools::call_telegram_history(args, agent_name, mtproto_config).await
-        }
+        "telegram_history" => mcp_tools::call_telegram_history(args).await,
         other => anyhow::bail!("Unknown tool: {}", other),
     }
-}
-
-// ─── MTProto config loader ──────────────────────────────────────────────────
-
-/// Load the MTProto config from the workspace config for the given agent.
-///
-/// Reads the serve state file to find the workspace config path, then loads
-/// the workspace config and extracts `telegram.mtproto` for the agent.
-/// Returns `None` if any step fails (no serve state, no workspace config,
-/// no telegram section, no mtproto section).
-fn load_mtproto_config(agent_name: &str) -> Option<MtProtoConfig> {
-    let serve_state = ServeState::load()?;
-    let ws = WorkspaceConfig::load(&serve_state.workspace_config).ok()?;
-    ws.agents
-        .iter()
-        .find(|a| a.name == agent_name)?
-        .telegram
-        .as_ref()?
-        .mtproto
-        .clone()
 }
