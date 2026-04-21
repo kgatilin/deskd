@@ -438,6 +438,17 @@ pub struct ChannelDef {
 // Re-export domain types for backward compatibility.
 pub use crate::domain::agent::{AgentRuntime, SessionMode};
 
+/// Scope type for sub-agents: controls isolation level.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScopeType {
+    /// Sub-agent inherits parent's full scope — sees siblings, same FS access.
+    #[default]
+    Inherit,
+    /// Sub-agent gets isolated sub-scope — sees only its own children.
+    Narrow,
+}
+
 /// A sub-agent running within a parent agent's bus scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubAgentDef {
@@ -456,6 +467,19 @@ pub struct SubAgentDef {
     /// Example: `["kira", "collab-*"]` allows reading the `kira` inbox and
     /// any inbox starting with `collab-`.
     pub inbox_read: Option<Vec<String>>,
+    /// Scope type: inherit (default) or narrow.
+    /// Inherit = shares parent scope; narrow = isolated sub-scope.
+    #[serde(default)]
+    pub scope: ScopeType,
+    /// Optional allow-list of targets this agent can send messages to.
+    /// If None, the agent can message any target (unrestricted).
+    /// Example: `["agent:parent", "agent:sibling"]`.
+    pub can_message: Option<Vec<String>>,
+    /// Optional working directory override. Must be under parent's work_dir.
+    pub work_dir: Option<String>,
+    /// Optional environment variables for this agent. Isolated from parent env.
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
     /// Session mode: persistent (default) or ephemeral.
     /// Ephemeral agents start a fresh session for each task.
     #[serde(default)]
@@ -474,6 +498,33 @@ pub struct SubAgentDef {
     /// Only used when runtime is `memory`.
     #[serde(default)]
     pub compact_strategy: Option<String>,
+}
+
+impl SubAgentDef {
+    /// Returns the full scoped name for this agent under the given parent.
+    pub fn scoped_name(&self, parent: &str) -> String {
+        format!("{}/{}", parent, self.name)
+    }
+
+    /// Validate that work_dir is within parent's work_dir (scope containment).
+    pub fn validate_work_dir(&self, parent_work_dir: &str) -> anyhow::Result<()> {
+        if let Some(ref wd) = self.work_dir {
+            let child = std::path::Path::new(wd)
+                .canonicalize()
+                .unwrap_or_else(|_| wd.into());
+            let parent = std::path::Path::new(parent_work_dir)
+                .canonicalize()
+                .unwrap_or_else(|_| parent_work_dir.into());
+            if !child.starts_with(&parent) {
+                anyhow::bail!(
+                    "sub-agent work_dir '{}' is outside parent scope '{}'",
+                    wd,
+                    parent_work_dir
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Telegram channel routing config in the per-user deskd.yaml.
@@ -1193,5 +1244,169 @@ agents:
             "work-key"
         );
         assert!(cfg.agents[2].container.is_none());
+    }
+
+    // ─── Scope tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_scope_type_defaults_to_inherit() {
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Test"
+agents:
+  - name: worker
+    model: claude-haiku-4-5
+    system_prompt: "Worker"
+    subscribe: ["agent:worker"]
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.agents[0].scope, ScopeType::Inherit);
+    }
+
+    #[test]
+    fn test_scope_type_narrow() {
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Test"
+agents:
+  - name: worker
+    model: claude-haiku-4-5
+    system_prompt: "Worker"
+    subscribe: ["agent:worker"]
+    scope: narrow
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.agents[0].scope, ScopeType::Narrow);
+    }
+
+    #[test]
+    fn test_can_message_config() {
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Test"
+agents:
+  - name: worker
+    model: claude-haiku-4-5
+    system_prompt: "Worker"
+    subscribe: ["agent:worker"]
+    can_message: ["agent:parent", "telegram.out:*"]
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        let cm = cfg.agents[0].can_message.as_ref().unwrap();
+        assert_eq!(cm, &["agent:parent", "telegram.out:*"]);
+    }
+
+    #[test]
+    fn test_can_message_default_unrestricted() {
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Test"
+agents:
+  - name: worker
+    model: claude-haiku-4-5
+    system_prompt: "Worker"
+    subscribe: ["agent:worker"]
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.agents[0].can_message.is_none());
+    }
+
+    #[test]
+    fn test_sub_agent_work_dir_config() {
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Test"
+agents:
+  - name: worker
+    model: claude-haiku-4-5
+    system_prompt: "Worker"
+    subscribe: ["agent:worker"]
+    work_dir: /home/dev/tasks/abc
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.agents[0].work_dir.as_deref(),
+            Some("/home/dev/tasks/abc")
+        );
+    }
+
+    #[test]
+    fn test_sub_agent_env_config() {
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Test"
+agents:
+  - name: worker
+    model: claude-haiku-4-5
+    system_prompt: "Worker"
+    subscribe: ["agent:worker"]
+    env:
+      ANTHROPIC_API_KEY: sk-worker-key
+      CUSTOM_VAR: hello
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        let env = cfg.agents[0].env.as_ref().unwrap();
+        assert_eq!(env.get("ANTHROPIC_API_KEY").unwrap(), "sk-worker-key");
+        assert_eq!(env.get("CUSTOM_VAR").unwrap(), "hello");
+        assert_eq!(env.len(), 2);
+    }
+
+    #[test]
+    fn test_scoped_name() {
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Test"
+agents:
+  - name: worker
+    model: claude-haiku-4-5
+    system_prompt: "Worker"
+    subscribe: ["agent:worker"]
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.agents[0].scoped_name("dev"), "dev/worker");
+    }
+
+    #[test]
+    fn test_validate_work_dir_within_parent() {
+        let sub = SubAgentDef {
+            name: "worker".into(),
+            model: "haiku".into(),
+            system_prompt: String::new(),
+            subscribe: vec![],
+            publish: None,
+            inbox_read: None,
+            scope: ScopeType::Narrow,
+            can_message: None,
+            work_dir: Some("/tmp/parent/child".into()),
+            env: None,
+            session: ConfigSessionMode::default(),
+            runtime: ConfigAgentRuntime::default(),
+            context: None,
+            compact_threshold: None,
+            compact_strategy: None,
+        };
+        assert!(sub.validate_work_dir("/tmp/parent").is_ok());
+    }
+
+    #[test]
+    fn test_validate_work_dir_outside_parent_fails() {
+        let sub = SubAgentDef {
+            name: "worker".into(),
+            model: "haiku".into(),
+            system_prompt: String::new(),
+            subscribe: vec![],
+            publish: None,
+            inbox_read: None,
+            scope: ScopeType::Narrow,
+            can_message: None,
+            work_dir: Some("/etc/evil".into()),
+            env: None,
+            session: ConfigSessionMode::default(),
+            runtime: ConfigAgentRuntime::default(),
+            context: None,
+            compact_threshold: None,
+            compact_strategy: None,
+        };
+        assert!(sub.validate_work_dir("/tmp/parent").is_err());
     }
 }

@@ -27,6 +27,7 @@ pub mod mcp_tools;
 pub mod message;
 pub mod process_builder;
 pub mod schedule;
+pub mod scope;
 pub mod serve;
 pub mod statemachine;
 pub mod task;

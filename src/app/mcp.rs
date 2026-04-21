@@ -279,12 +279,40 @@ fn handle_tools_list(
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Bus targets to subscribe to (e.g. [\"agent:helper\", \"queue:tasks\"])"
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["inherit", "narrow"],
+                        "description": "Scope type: 'inherit' = shares parent scope (default), 'narrow' = isolated sub-scope"
+                    },
+                    "work_dir": {
+                        "type": "string",
+                        "description": "Working directory for the agent. Must be under parent's work_dir."
+                    },
+                    "env": {
+                        "type": "object",
+                        "description": "Environment variables for the agent. Isolated from parent — child only gets what is explicitly passed here."
+                    },
+                    "can_message": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Allow-list of bus targets this agent can send to. Supports glob patterns. If omitted, unrestricted."
                     }
                 },
                 "required": ["name", "model", "system_prompt", "subscribe"]
             }
         }),
     ];
+
+    // Scope introspection
+    tools.push(json!({
+        "name": "get_scope",
+        "description": "Introspect own agent scope: parent, children, work_dir, can_message ACL, env keys, bus topics.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    }));
 
     tools.push(json!({
         "name": "create_reminder",
@@ -657,8 +685,9 @@ async fn handle_tools_call(
         "task_create" => mcp_tools::call_task_create(args, agent_name, task_store).await,
         "task_list" => mcp_tools::call_task_list(args, task_store).await,
         "task_cancel" => mcp_tools::call_task_cancel(args, task_store).await,
-        "list_agents" => mcp_tools::call_list_agents(internal_bus).await,
+        "list_agents" => mcp_tools::call_list_agents(agent_name, internal_bus).await,
         "remove_agent" => mcp_tools::call_remove_agent(args, agent_name, internal_bus).await,
+        "get_scope" => mcp_tools::call_get_scope(agent_name, user_config, internal_bus).await,
         "sm_create" => {
             mcp_tools::call_sm_create(args, agent_name, bus_socket, user_config, sm_store).await
         }

@@ -78,6 +78,15 @@ pub struct AgentState {
     /// Name of the parent agent that spawned this sub-agent, if any.
     #[serde(default)]
     pub parent: Option<String>,
+    /// Scope type: "inherit" or "narrow". Set at creation by parent.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Allow-list of targets this agent can message. None = unrestricted.
+    #[serde(default)]
+    pub can_message: Option<Vec<String>>,
+    /// Names of env var keys provided to this agent (values not stored for security).
+    #[serde(default)]
+    pub env_keys: Option<Vec<String>>,
     /// Timestamp (RFC 3339) of when the current Claude session started.
     /// Updated whenever session_id changes (new session or resume).
     #[serde(default)]
@@ -166,6 +175,9 @@ pub async fn create(cfg: &AgentConfig) -> Result<AgentState> {
         status: "idle".to_string(),
         current_task: String::new(),
         parent: None,
+        scope: None,
+        can_message: None,
+        env_keys: None,
         session_start: None,
         session_cost: 0.0,
         session_turns: 0,
@@ -198,6 +210,9 @@ pub async fn create_or_update_from_config(cfg: &AgentConfig) -> Result<AgentStat
         status: "idle".to_string(),
         current_task: String::new(),
         parent: None,
+        scope: None,
+        can_message: None,
+        env_keys: None,
         session_start: None,
         session_cost: 0.0,
         session_turns: 0,
@@ -262,6 +277,9 @@ pub async fn create_or_recover(
         status: "idle".to_string(),
         current_task: String::new(),
         parent: None,
+        scope: None,
+        can_message: None,
+        env_keys: None,
         session_start: None,
         session_cost: 0.0,
         session_turns: 0,
@@ -725,6 +743,9 @@ created_at: "2024-01-01T00:00:00Z"
             status: "idle".to_string(),
             current_task: String::new(),
             parent: None,
+            scope: None,
+            can_message: None,
+            env_keys: None,
             session_start: Some(Utc::now().to_rfc3339()),
             session_cost: 0.0,
             session_turns: 0,
@@ -785,6 +806,9 @@ created_at: "2024-01-01T00:00:00Z"
             status: "idle".to_string(),
             current_task: String::new(),
             parent: Some("parent-agent".to_string()),
+            scope: Some("narrow".to_string()),
+            can_message: Some(vec!["agent:parent".to_string()]),
+            env_keys: Some(vec!["API_KEY".to_string()]),
             session_start: Some("2026-01-01T00:00:00Z".to_string()),
             session_cost: 0.5,
             session_turns: 3,
