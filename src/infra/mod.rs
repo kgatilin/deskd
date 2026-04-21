@@ -8,5 +8,4 @@ pub mod memory_store;
 pub mod paths;
 pub mod sm_store;
 pub mod task_store;
-pub mod telegram_mtproto;
 pub mod unix_bus;
