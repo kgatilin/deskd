@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -160,6 +160,21 @@ pub(crate) async fn call_send_message(
         }
     }
 
+    // Enforce can_message ACL if set on the calling agent's config.
+    if let Some(cfg) = user_config
+        && let Some(sub) = cfg.agents.iter().find(|a| a.name == agent_name)
+        && let Some(ref allow) = sub.can_message
+    {
+        let allowed = allow.iter().any(|pattern| glob_match(pattern, target));
+        if !allowed {
+            bail!(
+                "agent '{}' cannot message '{}' — not in can_message allow-list",
+                agent_name,
+                target
+            );
+        }
+    }
+
     // Route to internal bus if target is a sub-agent, otherwise use parent bus.
     let effective_socket = {
         let ibus = internal_bus.lock().await;
@@ -288,11 +303,65 @@ pub(crate) async fn call_add_persistent_agent(
         })
         .unwrap_or_else(|| vec![format!("agent:{}", name)]);
 
+    // Scope type: "inherit" (default) or "narrow".
+    let scope_type = args
+        .get("scope")
+        .and_then(|s| s.as_str())
+        .unwrap_or("inherit");
+    let _scope = match scope_type {
+        "narrow" => crate::config::ScopeType::Narrow,
+        _ => crate::config::ScopeType::Inherit,
+    };
+
     // Get the deskd binary path (we are running as a subprocess of claude, so $0 is deskd).
     let deskd_bin = std::env::var("DESKD_BIN").unwrap_or_else(|_| "deskd".to_string());
 
-    // Work dir: same as parent (best effort from env or cwd).
-    let work_dir = std::env::var("PWD").unwrap_or_else(|_| "/tmp".to_string());
+    // Work dir: caller-specified or same as parent.
+    let parent_work_dir = std::env::var("PWD").unwrap_or_else(|_| "/tmp".to_string());
+    let work_dir = args
+        .get("work_dir")
+        .and_then(|w| w.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| parent_work_dir.clone());
+
+    // Validate work_dir containment: child must be within parent's scope.
+    {
+        let child_path = std::path::Path::new(&work_dir)
+            .canonicalize()
+            .unwrap_or_else(|_| work_dir.clone().into());
+        let parent_path = std::path::Path::new(&parent_work_dir)
+            .canonicalize()
+            .unwrap_or_else(|_| parent_work_dir.clone().into());
+        if !child_path.starts_with(&parent_path) {
+            bail!(
+                "work_dir '{}' is outside parent scope '{}'",
+                work_dir,
+                parent_work_dir
+            );
+        }
+    }
+
+    // Environment variables: child gets only explicitly passed env, not parent's.
+    let child_env: HashMap<String, String> = args
+        .get("env")
+        .and_then(|e| e.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // can_message: optional allow-list for outgoing messages.
+    let can_message: Option<Vec<String>> =
+        args.get("can_message")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_string)
+                    .collect()
+            });
 
     // Lazy-init internal bus on first sub-agent creation.
     let bus_socket = {
@@ -336,9 +405,16 @@ pub(crate) async fn call_add_persistent_agent(
         }
     }
 
-    // Set parent field on the created agent state.
+    // Set parent + scope fields on the created agent state.
     if let Ok(mut state) = crate::app::agent::load_state(name) {
         state.parent = Some(parent_name.to_string());
+        state.scope = Some(scope_type.to_string());
+        if let Some(ref cm) = can_message {
+            state.can_message = Some(cm.clone());
+        }
+        if !child_env.is_empty() {
+            state.env_keys = Some(child_env.keys().cloned().collect());
+        }
         crate::app::agent::save_state_pub(&state).ok();
     }
 
@@ -359,10 +435,15 @@ pub(crate) async fn call_add_persistent_agent(
         run_args.push("--subscribe".to_string());
         run_args.push(sub.clone());
     }
-    let mut child = tokio::process::Command::new(&deskd_bin)
-        .args(&run_args)
+    let mut cmd = tokio::process::Command::new(&deskd_bin);
+    cmd.args(&run_args)
         .env("DESKD_BUS_SOCKET", &bus_socket)
-        .env("DESKD_AGENT_NAME", name)
+        .env("DESKD_AGENT_NAME", name);
+    // Inject child-specific env vars (isolated from parent).
+    for (k, v) in &child_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn worker for agent '{}'", name))?;
 
@@ -689,6 +770,7 @@ pub(crate) async fn call_task_cancel(
 // ─── Sub-agent management ────────────────────────────────────────────────────
 
 pub(crate) async fn call_list_agents(
+    caller: &str,
     internal_bus: &Arc<Mutex<Option<InternalBus>>>,
 ) -> Result<Value> {
     let ibus_guard = internal_bus.lock().await;
@@ -697,6 +779,17 @@ pub(crate) async fn call_list_agents(
         Some(ibus) => {
             let mut list = Vec::new();
             for name in &ibus.sub_agents {
+                // Scoped visibility: only show agents that the caller is parent of.
+                if let Ok(state) = crate::app::agent::load_state(name) {
+                    let is_visible = match &state.parent {
+                        Some(parent) => parent == caller,
+                        None => true,
+                    };
+                    if !is_visible {
+                        continue;
+                    }
+                }
+
                 let is_finished = ibus
                     .worker_handles
                     .iter()
@@ -754,6 +847,70 @@ pub(crate) async fn call_remove_agent(
 
     Ok(json!({
         "content": [{"type": "text", "text": format!("Agent '{}' removed", name)}],
+        "isError": false
+    }))
+}
+
+// ─── Scope introspection ────────────────────────────────────────────────────
+
+pub(crate) async fn call_get_scope(
+    agent_name: &str,
+    user_config: Option<&UserConfig>,
+    internal_bus: &Arc<Mutex<Option<InternalBus>>>,
+) -> Result<Value> {
+    // Load agent state for scope info.
+    let state = crate::app::agent::load_state(agent_name).ok();
+
+    let scope = state
+        .as_ref()
+        .and_then(|s| s.scope.clone())
+        .unwrap_or_else(|| "inherit".into());
+    let parent = state.as_ref().and_then(|s| s.parent.clone());
+    let work_dir = state
+        .as_ref()
+        .map(|s| s.config.work_dir.clone())
+        .unwrap_or_else(|| std::env::var("PWD").unwrap_or_default());
+    let env_keys = state
+        .as_ref()
+        .and_then(|s| s.env_keys.clone())
+        .unwrap_or_default();
+    let can_message_state = state.as_ref().and_then(|s| s.can_message.clone());
+
+    // Merge can_message from config if available.
+    let can_message = can_message_state.or_else(|| {
+        user_config
+            .and_then(|cfg| cfg.agents.iter().find(|a| a.name == agent_name))
+            .and_then(|sub| sub.can_message.clone())
+    });
+
+    // Collect children from internal bus.
+    let children: Vec<String> = {
+        let ibus_guard = internal_bus.lock().await;
+        match &*ibus_guard {
+            None => Vec::new(),
+            Some(ibus) => ibus.sub_agents.iter().cloned().collect(),
+        }
+    };
+
+    // Get bus topics from config.
+    let bus_topics: Vec<String> = user_config
+        .and_then(|cfg| cfg.agents.iter().find(|a| a.name == agent_name))
+        .map(|sub| sub.subscribe.clone())
+        .unwrap_or_default();
+
+    let scope_info = json!({
+        "agent": agent_name,
+        "scope": scope,
+        "parent": parent,
+        "work_dir": work_dir,
+        "can_message": can_message,
+        "bus_topics": bus_topics,
+        "env_keys": env_keys,
+        "children": children,
+    });
+
+    Ok(json!({
+        "content": [{"type": "text", "text": serde_json::to_string_pretty(&scope_info)?}],
         "isError": false
     }))
 }
@@ -1383,5 +1540,87 @@ mod tests {
     fn inbox_acl_no_config_unrestricted() {
         // No user_config at all → unrestricted.
         assert!(inbox_access_allowed("agent", "any-inbox", None));
+    }
+
+    // ─── can_message ACL tests ──────────────────────────────────────────────
+
+    fn make_config_with_can_message(name: &str, can_message: Option<Vec<String>>) -> UserConfig {
+        let cm_yaml = match &can_message {
+            Some(targets) => {
+                let items: Vec<String> = targets.iter().map(|t| format!("\"{}\"", t)).collect();
+                format!("    can_message: [{}]\n", items.join(", "))
+            }
+            None => String::new(),
+        };
+        let yaml = format!(
+            "agents:\n  - name: {}\n    model: haiku\n    subscribe: []\n{}",
+            name, cm_yaml
+        );
+        serde_yaml::from_str(&yaml).expect("test config should parse")
+    }
+
+    #[test]
+    fn can_message_unrestricted_by_default() {
+        // No can_message → agent can message anyone (publish ACL may still apply).
+        let cfg = make_config_with_can_message("worker", None);
+        // The can_message check in call_send_message only fires if can_message is Some.
+        let sub = cfg.agents.iter().find(|a| a.name == "worker").unwrap();
+        assert!(sub.can_message.is_none());
+    }
+
+    #[test]
+    fn can_message_allows_listed_target() {
+        let cfg = make_config_with_can_message(
+            "worker",
+            Some(vec!["agent:parent".into(), "telegram.out:*".into()]),
+        );
+        let sub = cfg.agents.iter().find(|a| a.name == "worker").unwrap();
+        let allow = sub.can_message.as_ref().unwrap();
+        assert!(allow.iter().any(|p| glob_match(p, "agent:parent")));
+        assert!(allow.iter().any(|p| glob_match(p, "telegram.out:-123")));
+        assert!(!allow.iter().any(|p| glob_match(p, "agent:sibling")));
+    }
+
+    #[test]
+    fn can_message_denies_unlisted_target() {
+        let cfg = make_config_with_can_message("worker", Some(vec!["agent:parent".into()]));
+        let sub = cfg.agents.iter().find(|a| a.name == "worker").unwrap();
+        let allow = sub.can_message.as_ref().unwrap();
+        assert!(!allow.iter().any(|p| glob_match(p, "agent:sibling")));
+        assert!(!allow.iter().any(|p| glob_match(p, "telegram.out:-123")));
+    }
+
+    // ─── scope config tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn scope_config_parses_narrow() {
+        let yaml = r#"
+agents:
+  - name: worker
+    model: haiku
+    subscribe: []
+    scope: narrow
+    can_message: ["agent:parent"]
+    work_dir: /home/dev/tasks
+    env:
+      API_KEY: sk-test
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).expect("parse");
+        let sub = &cfg.agents[0];
+        assert_eq!(sub.scope, crate::config::ScopeType::Narrow);
+        assert_eq!(sub.can_message.as_ref().unwrap(), &["agent:parent"]);
+        assert_eq!(sub.work_dir.as_deref(), Some("/home/dev/tasks"));
+        assert_eq!(sub.env.as_ref().unwrap().get("API_KEY").unwrap(), "sk-test");
+    }
+
+    #[test]
+    fn scope_config_defaults() {
+        let yaml = "agents:\n  - name: w\n    model: h\n    subscribe: []\n";
+        let cfg: UserConfig = serde_yaml::from_str(yaml).expect("parse");
+        let sub = &cfg.agents[0];
+        assert_eq!(sub.scope, crate::config::ScopeType::Inherit);
+        assert!(sub.can_message.is_none());
+        assert!(sub.work_dir.is_none());
+        assert!(sub.env.is_none());
     }
 }
