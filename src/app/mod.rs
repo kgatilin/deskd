@@ -18,6 +18,7 @@ pub mod commands;
 pub mod config_reload;
 pub mod config_watcher;
 pub mod context;
+pub mod context_size;
 pub mod graph;
 pub mod jsonrpc;
 pub mod mcp;

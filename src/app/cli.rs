@@ -127,6 +127,20 @@ pub enum Commands {
         #[arg(long, default_value = "table")]
         format: String,
     },
+    /// Show live context-window usage for every active agent session.
+    ///
+    /// Mirrors the Telegram `/context` slash command (#393). Lists each
+    /// running agent with an active session, the current effective context
+    /// size (input + cache reads), and the model's window limit.
+    ///
+    /// Examples:
+    ///   deskd context              # human-readable table
+    ///   deskd context --format json
+    Context {
+        /// Output format: "table" (default) or "json".
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
     /// Launch the Ink/React TUI (connects to running deskd serve).
     ///
     /// Spawns `npx tsx tui/src/index.tsx` (or `bun run`) and forwards
