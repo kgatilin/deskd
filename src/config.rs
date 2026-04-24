@@ -1109,6 +1109,56 @@ agents:
     }
 
     #[test]
+    fn test_workspace_agent_acp_runtime() {
+        // Issue #93: top-level AgentDef must accept `runtime: acp`.
+        let yaml = r#"
+agents:
+  - name: dev
+    unix_user: dev
+    work_dir: /home/dev
+    runtime: acp
+    command:
+      - gemini
+      - --acp
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.agents[0].runtime, ConfigAgentRuntime::Acp);
+        assert_eq!(cfg.agents[0].command, vec!["gemini", "--acp"]);
+    }
+
+    #[test]
+    fn test_workspace_agent_runtime_defaults_to_claude() {
+        // When `runtime` is unset, behavior must be identical to today.
+        let yaml = r#"
+agents:
+  - name: classic
+    unix_user: dev
+    work_dir: /home/dev
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.agents[0].runtime, ConfigAgentRuntime::Claude);
+    }
+
+    #[test]
+    fn test_sub_agent_acp_runtime() {
+        // Sub-agents (in deskd.yaml) also accept runtime: acp.
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "parent"
+
+agents:
+  - name: acp-child
+    model: ignored
+    system_prompt: "ACP sub-agent"
+    subscribe:
+      - "agent:acp-child"
+    runtime: acp
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.agents[0].runtime, ConfigAgentRuntime::Acp);
+    }
+
+    #[test]
     fn test_sub_agent_memory_defaults() {
         let yaml = r#"
 model: claude-sonnet-4-6
