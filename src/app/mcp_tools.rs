@@ -888,6 +888,90 @@ pub(crate) async fn call_list_agents(
     }))
 }
 
+/// Read recent log lines captured from a sub-agent's stderr or stream-json
+/// stdout. Access is restricted to sub-agents of the caller (or the caller's
+/// own logs) so an agent cannot peek at a sibling's diagnostics.
+pub(crate) async fn call_agent_logs(args: &Value, caller: &str) -> Result<Value> {
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .context("agent_logs: missing required 'name'")?;
+
+    let tail = args.get("tail").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+    if tail == 0 || tail > 1000 {
+        bail!("agent_logs: 'tail' must be in 1..=1000 (got {})", tail);
+    }
+
+    let source = args
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("stderr");
+    if source != "stderr" && source != "stream" {
+        bail!(
+            "agent_logs: 'source' must be 'stderr' or 'stream' (got {:?})",
+            source
+        );
+    }
+
+    // Access control: caller may read its own logs or its sub-agents' logs.
+    // Matches the visibility rules of list_agents/remove_agent.
+    if name != caller {
+        let state = crate::app::agent::load_state(name)
+            .with_context(|| format!("agent '{}' not found", name))?;
+        match &state.parent {
+            Some(p) if p == caller => {}
+            _ => bail!(
+                "agent '{}' is not a sub-agent of '{}' — log access denied",
+                name,
+                caller
+            ),
+        }
+    }
+
+    let path = match source {
+        "stream" => crate::app::agent::stream_log_path(name),
+        _ => crate::app::agent::stderr_log_path(name),
+    };
+
+    if !path.exists() {
+        return Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string_pretty(&json!({
+                    "name": name,
+                    "source": source,
+                    "path": path.display().to_string(),
+                    "exists": false,
+                    "lines": Vec::<String>::new(),
+                }))?
+            }],
+            "isError": false
+        }));
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("agent_logs: failed to read {}", path.display()))?;
+    let all_lines: Vec<&str> = content.lines().collect();
+    let start = all_lines.len().saturating_sub(tail);
+    let returned: Vec<String> = all_lines[start..].iter().map(|s| s.to_string()).collect();
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&json!({
+                "name": name,
+                "source": source,
+                "path": path.display().to_string(),
+                "exists": true,
+                "total_lines": all_lines.len(),
+                "returned_lines": returned.len(),
+                "lines": returned,
+            }))?
+        }],
+        "isError": false
+    }))
+}
+
 pub(crate) async fn call_remove_agent(
     args: &Value,
     caller: &str,
@@ -1540,6 +1624,53 @@ mod tests {
         assert!(glob_match("agent:dev", "agent:dev"));
         assert!(!glob_match("agent:dev", "agent:researcher"));
         assert!(!glob_match("telegram.out:*", "telegram.in:-1234"));
+    }
+
+    #[tokio::test]
+    async fn agent_logs_rejects_missing_name() {
+        let err = call_agent_logs(&json!({}), "caller").await.unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("name"), "expected name error, got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn agent_logs_rejects_bad_tail() {
+        for bad in [0u64, 5000] {
+            let err = call_agent_logs(&json!({"name": "x", "tail": bad}), "x")
+                .await
+                .unwrap_err();
+            let msg = format!("{:#}", err);
+            assert!(msg.contains("tail"), "expected tail error, got: {}", msg);
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_logs_rejects_bad_source() {
+        let err = call_agent_logs(&json!({"name": "x", "source": "garbage"}), "x")
+            .await
+            .unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("source"),
+            "expected source error, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_logs_self_read_nonexistent_returns_exists_false() {
+        // Requesting own logs when the log file does not exist must not error —
+        // it returns `exists: false` so callers can distinguish "no logs yet"
+        // from "access denied" or "bad arg".
+        let unique = format!("__agent_logs_test_{}", Uuid::new_v4());
+        let resp = call_agent_logs(&json!({"name": unique, "tail": 10}), &unique)
+            .await
+            .expect("self-read must not error on missing file");
+        let text = resp["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["exists"], false);
+        assert_eq!(parsed["source"], "stderr");
+        assert!(parsed["lines"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
