@@ -162,8 +162,25 @@ enum AcpEvent {
     PermissionRequest(u64),
     /// Session completed.
     SessionComplete,
-    /// Process exited (stdout closed).
-    ProcessExited,
+    /// Process exited (stdout closed) with diagnostic context for debugging.
+    /// Mirrors the shape used by the Claude stream-json executor
+    /// (`StdoutEvent::ProcessExited`) so operators get the same signal
+    /// regardless of runtime.
+    ProcessExited {
+        exit_code: Option<i32>,
+        stderr_tail: String,
+        lifetime_secs: u64,
+    },
+}
+
+/// Truncate stderr output for display in error messages (max 200 chars, tail).
+fn truncate_stderr(s: &str) -> &str {
+    let trimmed = s.trim();
+    if trimmed.len() <= 200 {
+        trimmed
+    } else {
+        &trimmed[trimmed.len() - 200..]
+    }
 }
 
 /// A long-lived ACP agent process that communicates via JSON-RPC 2.0.
@@ -172,8 +189,9 @@ pub struct AcpProcess {
     stdin_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// Receive parsed ACP events from stdout.
     event_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<AcpEvent>>,
-    /// Child process handle for shutdown.
-    child: tokio::sync::Mutex<Option<tokio::process::Child>>,
+    /// Child process handle for shutdown. Shared with the stdout reader so it
+    /// can reap the exit code when stdout closes.
+    child: std::sync::Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
     /// Agent name.
     name: String,
     /// Current ACP session ID.
@@ -211,18 +229,37 @@ impl AcpProcess {
         cmd.stdin(std::process::Stdio::piped());
         let mut child = cmd.spawn().context("Failed to spawn ACP agent process")?;
 
+        let spawn_instant = std::time::Instant::now();
+
         let child_stdin = child.stdin.take().expect("stdin is piped");
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
 
-        // Drain stderr in background.
+        // Drain stderr in background, keeping a bounded tail for diagnostics.
+        const STDERR_CAP: usize = 2048;
+        let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let stderr_buf_writer = stderr_buf.clone();
         let agent_name = name.to_string();
         tokio::spawn(async move {
-            let mut buf = String::new();
             let mut reader = tokio::io::BufReader::new(stderr);
-            let _ = tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut buf).await;
-            if !buf.is_empty() {
-                warn!(agent = %agent_name, stderr = %buf.trim(), "ACP process stderr");
+            let mut line = String::new();
+            while let Ok(n) = reader.read_line(&mut line).await {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut shared) = stderr_buf_writer.lock() {
+                    shared.push_str(&line);
+                    if shared.len() > STDERR_CAP {
+                        let excess = shared.len() - STDERR_CAP;
+                        shared.drain(..excess);
+                    }
+                }
+                line.clear();
+            }
+            if let Ok(shared) = stderr_buf_writer.lock()
+                && !shared.is_empty()
+            {
+                warn!(agent = %agent_name, stderr = %shared.trim(), "ACP process stderr drained");
             }
         });
 
@@ -236,6 +273,11 @@ impl AcpProcess {
                 }
             }
         });
+
+        // Wrap child in Arc so the stdout reader can reap it on exit.
+        let child_arc = std::sync::Arc::new(tokio::sync::Mutex::new(Some(child)));
+        let child_for_reader = child_arc.clone();
+        let stderr_buf_reader = stderr_buf;
 
         // Stdout reader task — parses JSON-RPC messages.
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<AcpEvent>();
@@ -304,14 +346,33 @@ impl AcpProcess {
                     }
                 }
             }
-            let _ = event_tx.send(AcpEvent::ProcessExited);
+            // Reap exit code and snapshot stderr tail so the error surfaced
+            // to the caller includes process lifetime and last stderr output.
+            let lifetime_secs = spawn_instant.elapsed().as_secs();
+            let exit_code = if let Some(mut ch) = child_for_reader.lock().await.take() {
+                ch.wait().await.ok().and_then(|s| s.code())
+            } else {
+                None
+            };
+            // Small delay so any trailing stderr lines are captured.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let stderr_tail = stderr_buf_reader
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or_default();
+
+            let _ = event_tx.send(AcpEvent::ProcessExited {
+                exit_code,
+                stderr_tail,
+                lifetime_secs,
+            });
             debug!(agent = %agent_name2, "ACP process stdout closed");
         });
 
         let process = Self {
             stdin_tx,
             event_rx: tokio::sync::Mutex::new(event_rx),
-            child: tokio::sync::Mutex::new(Some(child)),
+            child: child_arc,
             name: name.to_string(),
             session_id: tokio::sync::Mutex::new(None),
             next_id: tokio::sync::Mutex::new(1),
@@ -384,8 +445,23 @@ impl AcpProcess {
                 Some(AcpEvent::SessionComplete) => {
                     // Session completed while waiting for response — keep waiting.
                 }
-                Some(AcpEvent::ProcessExited) | None => {
-                    bail!("ACP process exited while waiting for response");
+                Some(AcpEvent::ProcessExited {
+                    exit_code,
+                    stderr_tail,
+                    lifetime_secs,
+                }) => {
+                    bail!(
+                        "ACP process exited while waiting for response \
+                         (exit_code={}, lifetime={}s, stderr={:?})",
+                        exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signal".into()),
+                        lifetime_secs,
+                        truncate_stderr(&stderr_tail),
+                    );
+                }
+                None => {
+                    bail!("ACP process exited while waiting for response (event channel closed)");
                 }
             }
         }
@@ -517,8 +593,23 @@ impl AcpProcess {
                     // Session complete notification — task is done.
                     break;
                 }
-                Some(AcpEvent::ProcessExited) | None => {
-                    bail!("ACP process exited mid-task");
+                Some(AcpEvent::ProcessExited {
+                    exit_code,
+                    stderr_tail,
+                    lifetime_secs,
+                }) => {
+                    bail!(
+                        "ACP process exited mid-task \
+                         (exit_code={}, lifetime={}s, stderr={:?})",
+                        exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signal".into()),
+                        lifetime_secs,
+                        truncate_stderr(&stderr_tail),
+                    );
+                }
+                None => {
+                    bail!("ACP process exited mid-task (event channel closed)");
                 }
             }
         }
@@ -764,6 +855,35 @@ mod tests {
         assert_eq!(req.method, "session/cancel");
         let params = req.params.unwrap();
         assert_eq!(params["sessionId"], "sess-123");
+    }
+
+    #[test]
+    fn test_truncate_stderr_short_passthrough() {
+        assert_eq!(truncate_stderr("short error"), "short error");
+        assert_eq!(truncate_stderr("  padded  "), "padded");
+        assert_eq!(truncate_stderr(""), "");
+    }
+
+    #[test]
+    fn test_truncate_stderr_keeps_tail_when_long() {
+        let long = "A".repeat(500);
+        let truncated = truncate_stderr(&long);
+        assert_eq!(truncated.len(), 200);
+        // Must be the *tail*, not the head — the most recent output is what
+        // points at the failure.
+        assert!(truncated.chars().all(|c| c == 'A'));
+    }
+
+    #[test]
+    fn test_truncate_stderr_preserves_end_of_multiline() {
+        let mut s = String::new();
+        for i in 0..50 {
+            s.push_str(&format!("line {i}: some output here\n"));
+        }
+        let tail = truncate_stderr(&s);
+        // Tail includes the *last* line number, not the first.
+        assert!(tail.contains("line 49"));
+        assert!(!tail.contains("line 0:"));
     }
 
     #[test]
