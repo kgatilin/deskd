@@ -500,6 +500,28 @@ fn handle_tools_list(
             "required": ["name"]
         }
     }));
+    tools.push(json!({
+        "name": "agent_logs",
+        "description": "Read recent log lines captured from a sub-agent's stderr or stream-json stdout. Useful for diagnosing what a worker is doing or why it died. Caller may only read logs of its own sub-agents (or itself).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Agent name"
+                },
+                "source": {
+                    "type": "string",
+                    "description": "'stderr' (default) for plain stderr log, or 'stream' for the Claude stream-json stdout log"
+                },
+                "tail": {
+                    "type": "integer",
+                    "description": "Number of trailing lines to return (1..=1000, default 100)"
+                }
+            },
+            "required": ["name"]
+        }
+    }));
 
     tools.push(json!({
         "name": "usage_stats",
@@ -695,6 +717,7 @@ async fn handle_tools_call(
         "task_cancel" => mcp_tools::call_task_cancel(args, task_store).await,
         "list_agents" => mcp_tools::call_list_agents(agent_name, internal_bus).await,
         "remove_agent" => mcp_tools::call_remove_agent(args, agent_name, internal_bus).await,
+        "agent_logs" => mcp_tools::call_agent_logs(args, agent_name).await,
         "get_scope" => mcp_tools::call_get_scope(agent_name, user_config, internal_bus).await,
         "sm_create" => {
             mcp_tools::call_sm_create(args, agent_name, bus_socket, user_config, sm_store).await
