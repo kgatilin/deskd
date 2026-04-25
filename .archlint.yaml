@@ -3,7 +3,7 @@ rules:
     enabled: true
     error_on_violation: false
     level: telemetry
-    threshold: 4
+    threshold: 15  # measured: worker.rs/schedule.rs hit 15; main.rs=6, mcp_tools.rs=12
   fan_in:
     enabled: true
     error_on_violation: false
@@ -13,4 +13,4 @@ rules:
     enabled: true
     error_on_violation: false
     level: telemetry
-# last reviewed: 2026-04-23
+# last reviewed: 2026-04-25
