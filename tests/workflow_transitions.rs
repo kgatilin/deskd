@@ -1,9 +1,4 @@
-#![allow(
-    unused_variables,
-    unused_mut,
-    clippy::collapsible_if,
-    dead_code
-)]
+#![allow(unused_variables, unused_mut, clippy::collapsible_if, dead_code)]
 
 //! Functional test: workflow state transition → dispatch (#122).
 //!
