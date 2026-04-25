@@ -40,6 +40,7 @@ pub async fn handle(action: AgentAction) -> Result<()> {
                 runtime: crate::domain::config_types::ConfigAgentRuntime::default(),
                 context: None,
                 compact_threshold: None,
+                auto_compact_threshold_tokens: None,
             };
             let state = agent::create(&cfg).await?;
             println!("Agent {} created", state.config.name);

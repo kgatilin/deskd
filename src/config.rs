@@ -395,6 +395,11 @@ pub struct UserConfig {
     /// Example: `inbox_acl: ["dev", "collab-*"]`.
     #[serde(default)]
     pub inbox_acl: Option<Vec<String>>,
+    /// Auto-compact threshold in absolute tokens (top-level / global default for
+    /// this deskd.yaml). Sub-agents inherit this when their own SubAgentDef does
+    /// not set one. Built-in fallback is `DEFAULT_AUTO_COMPACT_THRESHOLD` (300k).
+    #[serde(default)]
+    pub auto_compact_threshold_tokens: Option<u64>,
 }
 
 /// An A2A skill advertised in the Agent Card (per A2A spec).
@@ -508,6 +513,11 @@ pub struct SubAgentDef {
     /// Only used when runtime is `memory`.
     #[serde(default)]
     pub compact_strategy: Option<String>,
+    /// Auto-compact threshold in absolute tokens for this sub-agent.
+    /// Falls back to the parent UserConfig's `auto_compact_threshold_tokens`,
+    /// then to the built-in default (300k).
+    #[serde(default)]
+    pub auto_compact_threshold_tokens: Option<u64>,
 }
 
 impl SubAgentDef {
@@ -600,7 +610,24 @@ impl UserConfig {
         let expanded = expand_env_vars(&raw);
         let cfg: UserConfig =
             serde_yaml::from_str(&expanded).context("failed to parse user config")?;
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Validate config invariants that serde can't express on its own.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(0) = self.auto_compact_threshold_tokens {
+            anyhow::bail!("auto_compact_threshold_tokens must be > 0");
+        }
+        for sub in &self.agents {
+            if let Some(0) = sub.auto_compact_threshold_tokens {
+                anyhow::bail!(
+                    "agent '{}': auto_compact_threshold_tokens must be > 0",
+                    sub.name
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1444,6 +1471,7 @@ agents:
             context: None,
             compact_threshold: None,
             compact_strategy: None,
+            auto_compact_threshold_tokens: None,
         };
         assert!(sub.validate_work_dir("/tmp/parent").is_ok());
     }
@@ -1466,6 +1494,7 @@ agents:
             context: None,
             compact_threshold: None,
             compact_strategy: None,
+            auto_compact_threshold_tokens: None,
         };
         assert!(sub.validate_work_dir("/tmp/parent").is_err());
     }

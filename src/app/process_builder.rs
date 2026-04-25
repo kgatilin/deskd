@@ -9,6 +9,29 @@ use tokio::process::Command;
 use crate::config::ContainerConfig;
 
 use super::agent_registry::AgentConfig;
+use super::context_size;
+
+/// Compute the `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` env tuple for an agent.
+/// Always emitted so the built-in 300k default is honoured even when the
+/// user did not set a per-agent override. Logs a warning when the chosen
+/// threshold would be silently clamped by Claude Code.
+fn auto_compact_env_for(cfg: &AgentConfig) -> Option<(&'static str, String)> {
+    let threshold = context_size::resolve_auto_compact_threshold(cfg.auto_compact_threshold_tokens);
+    let window = context_size::context_window_for_model(&cfg.model);
+    let pct = context_size::auto_compact_override_pct(threshold, window)?;
+    if context_size::threshold_would_clamp(threshold, window) {
+        tracing::warn!(
+            agent = %cfg.name,
+            model = %cfg.model,
+            threshold_tokens = threshold,
+            window_tokens = window,
+            ceiling_pct = context_size::AUTO_COMPACT_PCT_CEILING,
+            "auto_compact_threshold_tokens >= {}% of model window — Claude Code will clamp the override; effective compaction will fire earlier than configured",
+            context_size::AUTO_COMPACT_PCT_CEILING,
+        );
+    }
+    Some(("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", pct.to_string()))
+}
 
 /// Build the tokio Command for running the agent process.
 /// Inject flags required for persistent stream-json operation.
@@ -17,8 +40,10 @@ use super::agent_registry::AgentConfig;
 /// explicitly set in workspace.yaml. Sub-agents created via MCP typically
 /// have `command: ["claude"]` with no flags, so all are injected.
 pub fn build_command(cfg: &AgentConfig, args: &[String], extra_env: &[(&str, &str)]) -> Command {
+    let auto_compact = auto_compact_env_for(cfg);
+
     if let Some(ref container) = cfg.container {
-        return build_container_command(cfg, container, args, extra_env);
+        return build_container_command(cfg, container, args, extra_env, &auto_compact);
     }
 
     let (bin, prefix) = split_command(&cfg.command);
@@ -27,6 +52,9 @@ pub fn build_command(cfg: &AgentConfig, args: &[String], extra_env: &[(&str, &st
             let mut c = Command::new("sudo");
             c.args(["-u", user, "-H", "--", "env"]);
             for (k, v) in extra_env {
+                c.arg(format!("{}={}", k, v));
+            }
+            if let Some((k, v)) = &auto_compact {
                 c.arg(format!("{}={}", k, v));
             }
             c.arg(bin);
@@ -45,6 +73,9 @@ pub fn build_command(cfg: &AgentConfig, args: &[String], extra_env: &[(&str, &st
     };
     if cfg.unix_user.is_none() {
         for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        if let Some((k, v)) = &auto_compact {
             cmd.env(k, v);
         }
     }
@@ -66,6 +97,7 @@ fn build_container_command(
     container: &ContainerConfig,
     args: &[String],
     extra_env: &[(&str, &str)],
+    auto_compact_env: &Option<(&'static str, String)>,
 ) -> Command {
     let runtime = &container.runtime;
     let mut cmd = Command::new(runtime);
@@ -95,6 +127,12 @@ fn build_container_command(
 
     // Extra env vars (DESKD_BUS_SOCKET, DESKD_AGENT_NAME, DESKD_AGENT_CONFIG).
     for (k, v) in extra_env {
+        cmd.args(["-e", &format!("{}={}", k, v)]);
+    }
+
+    // CLAUDE_AUTOCOMPACT_PCT_OVERRIDE — Claude Code's per-process knob for
+    // when auto-compaction kicks in (percentage of context window).
+    if let Some((k, v)) = auto_compact_env {
         cmd.args(["-e", &format!("{}={}", k, v)]);
     }
 
@@ -352,6 +390,7 @@ mod tests {
             runtime: ConfigAgentRuntime::default(),
             context: None,
             compact_threshold: None,
+            auto_compact_threshold_tokens: None,
         };
 
         let extra_env = [("DESKD_BUS_SOCKET", "/home/test/.deskd/bus.sock")];
@@ -402,6 +441,7 @@ mod tests {
             runtime: ConfigAgentRuntime::default(),
             context: None,
             compact_threshold: None,
+            auto_compact_threshold_tokens: None,
         };
         let cmd = build_command(&cfg, &[], &[]);
         let program = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -425,6 +465,7 @@ mod tests {
             runtime: ConfigAgentRuntime::default(),
             context: None,
             compact_threshold: None,
+            auto_compact_threshold_tokens: None,
         };
         let extra_env = [("DESKD_BUS_SOCKET", "/tmp/bus.sock")];
         let cmd = build_command(&cfg, &[], &extra_env);
@@ -439,5 +480,115 @@ mod tests {
         assert!(args.contains(&"-u".to_string()));
         assert!(args.contains(&"agent-user".to_string()));
         assert!(args.contains(&"DESKD_BUS_SOCKET=/tmp/bus.sock".to_string()));
+    }
+
+    #[test]
+    fn auto_compact_env_for_4x_model_uses_default_300k_as_30pct() {
+        // Default threshold (300k) on a 1M-window 4.x model → 30%.
+        let cfg = AgentConfig {
+            name: "test".into(),
+            model: "claude-opus-4-7".into(),
+            system_prompt: String::new(),
+            work_dir: "/tmp".into(),
+            max_turns: 100,
+            unix_user: None,
+            budget_usd: 50.0,
+            command: vec!["claude".into()],
+            config_path: None,
+            container: None,
+            session: ConfigSessionMode::default(),
+            runtime: ConfigAgentRuntime::default(),
+            context: None,
+            compact_threshold: None,
+            auto_compact_threshold_tokens: None,
+        };
+        let env = auto_compact_env_for(&cfg).expect("env tuple");
+        assert_eq!(env.0, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE");
+        assert_eq!(env.1, "30");
+    }
+
+    #[test]
+    fn auto_compact_env_for_per_agent_override_wins() {
+        let cfg = AgentConfig {
+            name: "test".into(),
+            model: "claude-opus-4-7".into(),
+            system_prompt: String::new(),
+            work_dir: "/tmp".into(),
+            max_turns: 100,
+            unix_user: None,
+            budget_usd: 50.0,
+            command: vec!["claude".into()],
+            config_path: None,
+            container: None,
+            session: ConfigSessionMode::default(),
+            runtime: ConfigAgentRuntime::default(),
+            context: None,
+            compact_threshold: None,
+            auto_compact_threshold_tokens: Some(500_000),
+        };
+        let env = auto_compact_env_for(&cfg).expect("env tuple");
+        // 500k of 1M = 50%.
+        assert_eq!(env.1, "50");
+    }
+
+    #[test]
+    fn auto_compact_env_clamps_above_ceiling_for_3x_model() {
+        // 300k threshold on a 200k-window model would be 150% → clamped to 83.
+        let cfg = AgentConfig {
+            name: "test".into(),
+            model: "claude-3-5-sonnet".into(),
+            system_prompt: String::new(),
+            work_dir: "/tmp".into(),
+            max_turns: 100,
+            unix_user: None,
+            budget_usd: 50.0,
+            command: vec!["claude".into()],
+            config_path: None,
+            container: None,
+            session: ConfigSessionMode::default(),
+            runtime: ConfigAgentRuntime::default(),
+            context: None,
+            compact_threshold: None,
+            auto_compact_threshold_tokens: None,
+        };
+        let env = auto_compact_env_for(&cfg).expect("env tuple");
+        assert_eq!(env.1, "83");
+    }
+
+    #[test]
+    fn build_command_injects_auto_compact_env() {
+        let cfg = AgentConfig {
+            name: "test".into(),
+            model: "claude-opus-4-7".into(),
+            system_prompt: String::new(),
+            work_dir: "/tmp".into(),
+            max_turns: 100,
+            unix_user: None,
+            budget_usd: 50.0,
+            command: vec!["claude".into()],
+            config_path: None,
+            container: None,
+            session: ConfigSessionMode::default(),
+            runtime: ConfigAgentRuntime::default(),
+            context: None,
+            compact_threshold: None,
+            auto_compact_threshold_tokens: Some(400_000),
+        };
+        let cmd = build_command(&cfg, &[], &[]);
+        let envs: Vec<(String, String)> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                let key = k.to_string_lossy().to_string();
+                let val = v?.to_string_lossy().to_string();
+                Some((key, val))
+            })
+            .collect();
+        let auto = envs
+            .iter()
+            .find(|(k, _)| k == "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")
+            .expect("auto-compact env injected");
+        // 400k / 1M = 40%.
+        assert_eq!(auto.1, "40");
     }
 }

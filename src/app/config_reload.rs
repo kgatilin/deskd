@@ -170,6 +170,9 @@ pub async fn spawn_components(
                 runtime: sub.runtime.clone(),
                 context: context_cfg,
                 compact_threshold: sub.compact_threshold,
+                auto_compact_threshold_tokens: sub
+                    .auto_compact_threshold_tokens
+                    .or(ucfg.auto_compact_threshold_tokens),
             };
             crate::app::agent::create_or_update_from_config(&sub_cfg).await?;
 

@@ -51,6 +51,12 @@ pub struct AgentConfig {
     /// Default: 0.8.
     #[serde(default)]
     pub compact_threshold: Option<f64>,
+    /// Auto-compact threshold in absolute tokens. When the live context size
+    /// crosses this value, `/context` surfaces a warning. Resolution order in
+    /// configs: per-agent (SubAgentDef) > global (UserConfig) > built-in default
+    /// (`context_size::DEFAULT_AUTO_COMPACT_THRESHOLD`, 300k).
+    #[serde(default)]
+    pub auto_compact_threshold_tokens: Option<u64>,
 }
 
 fn default_budget_usd() -> f64 {
@@ -256,6 +262,7 @@ pub async fn create_or_recover(
         runtime: def.runtime.clone(),
         context: user_cfg.and_then(|c| c.context.clone()),
         compact_threshold: None,
+        auto_compact_threshold_tokens: user_cfg.and_then(|c| c.auto_compact_threshold_tokens),
     };
 
     let path = state_path(&def.name);
@@ -677,6 +684,7 @@ pub async fn spawn_ephemeral(
         runtime: ConfigAgentRuntime::default(),
         context: None,
         compact_threshold: None,
+        auto_compact_threshold_tokens: None,
     };
 
     create(&cfg).await?;
@@ -732,6 +740,7 @@ created_at: "2024-01-01T00:00:00Z"
             runtime: ConfigAgentRuntime::default(),
             context: None,
             compact_threshold: None,
+            auto_compact_threshold_tokens: None,
         };
         let state = AgentState {
             config: cfg,
@@ -795,6 +804,7 @@ created_at: "2024-01-01T00:00:00Z"
             runtime: ConfigAgentRuntime::default(),
             context: None,
             compact_threshold: None,
+            auto_compact_threshold_tokens: None,
         };
         let state = AgentState {
             config: cfg,
