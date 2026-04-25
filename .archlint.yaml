@@ -3,12 +3,12 @@ rules:
     enabled: true
     error_on_violation: false
     level: telemetry
-    threshold: 15  # measured: worker.rs/schedule.rs hit 15; main.rs=6, mcp_tools.rs=12
+    threshold: 10  # measured: max fan-out ~9 (worker.rs) after app/domain/infra/ports refactor
   fan_in:
     enabled: true
     error_on_violation: false
     level: telemetry
-    threshold: 6
+    threshold: 14  # measured: domain types naturally high (statemachine=13, message=11, config=11)
   dip:
     enabled: true
     error_on_violation: false
