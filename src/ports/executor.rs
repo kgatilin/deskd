@@ -42,12 +42,15 @@ pub struct TaskLimits {
 }
 
 /// Result of a single executor turn (task completion).
+#[derive(Debug, Default, Clone)]
 pub struct TurnResult {
     pub response_text: String,
     pub session_id: String,
     pub cost_usd: f64,
     pub num_turns: u32,
     pub token_usage: TokenUsage,
+    /// Number of tool_use blocks emitted by the model during this task.
+    pub tool_use_count: u32,
 }
 
 /// Abstraction over LLM execution backends.

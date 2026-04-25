@@ -371,6 +371,7 @@ pub async fn run(
             None => {
                 debug!(agent = %name, "message has no task payload, skipping");
                 // Log empty message with minimal context.
+                let parent_agent = agent::load_state(name).ok().and_then(|s| s.parent);
                 let empty_log = tasklog::TaskLog {
                     ts: chrono::Utc::now().to_rfc3339(),
                     source: msg.source.clone(),
@@ -391,6 +392,9 @@ pub async fn run(
                     output_tokens: None,
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: None,
+                    session_count: None,
+                    tool_use_count: None,
+                    parent_agent,
                 };
                 if let Err(e) = tasklog::log_task(name, &empty_log) {
                     warn!(agent = %name, error = %e, "failed to write task log");
@@ -926,6 +930,7 @@ fn budget_enforced(budget_usd: f64) -> bool {
 
 /// Log a skipped task (budget exceeded or empty payload).
 fn log_skip(name: &str, msg: &Message, ctx: &TaskContext, status: &str, error: Option<&str>) {
+    let parent_agent = agent::load_state(name).ok().and_then(|s| s.parent);
     let log_entry = tasklog::TaskLog {
         ts: chrono::Utc::now().to_rfc3339(),
         source: msg.source.clone(),
@@ -942,6 +947,9 @@ fn log_skip(name: &str, msg: &Message, ctx: &TaskContext, status: &str, error: O
         output_tokens: None,
         cache_creation_input_tokens: None,
         cache_read_input_tokens: None,
+        session_count: None,
+        tool_use_count: None,
+        parent_agent,
     };
     if let Err(e) = tasklog::log_task(name, &log_entry) {
         warn!(agent = %name, error = %e, "failed to write task log");
@@ -1028,6 +1036,7 @@ async fn handle_task_success(
         ctx.github_pr,
     );
 
+    let parent_agent = agent::load_state(name).ok().and_then(|s| s.parent);
     let log_entry = tasklog::TaskLog {
         ts: chrono::Utc::now().to_rfc3339(),
         source: msg.source.clone(),
@@ -1044,6 +1053,9 @@ async fn handle_task_success(
         output_tokens: Some(turn.token_usage.output_tokens),
         cache_creation_input_tokens: Some(turn.token_usage.cache_creation_input_tokens),
         cache_read_input_tokens: Some(turn.token_usage.cache_read_input_tokens),
+        session_count: Some(1),
+        tool_use_count: Some(turn.tool_use_count),
+        parent_agent,
     };
     if let Err(e) = tasklog::log_task(name, &log_entry) {
         warn!(agent = %name, error = %e, "failed to write task log");
@@ -1121,6 +1133,7 @@ async fn handle_task_failure(
     let err_str = format!("{}", error);
     warn!(agent = %name, error = %err_str, "task failed");
 
+    let parent_agent = agent::load_state(name).ok().and_then(|s| s.parent);
     let log_entry = tasklog::TaskLog {
         ts: chrono::Utc::now().to_rfc3339(),
         source: msg.source.clone(),
@@ -1137,6 +1150,9 @@ async fn handle_task_failure(
         output_tokens: None,
         cache_creation_input_tokens: None,
         cache_read_input_tokens: None,
+        session_count: None,
+        tool_use_count: None,
+        parent_agent,
     };
     if let Err(le) = tasklog::log_task(name, &log_entry) {
         warn!(agent = %name, error = %le, "failed to write task log");

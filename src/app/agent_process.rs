@@ -20,8 +20,9 @@ use super::process_builder::{build_command, inject_required_flags};
 
 /// Events emitted by the stdout reader task.
 enum StdoutEvent {
-    /// A text block from an `assistant` message, with optional usage data.
-    TextBlock(String, Option<TokenUsage>),
+    /// A text block from an `assistant` message, with optional usage data and
+    /// the number of `tool_use` blocks observed in the same message.
+    TextBlock(String, Option<TokenUsage>, u32),
     /// The `result` event marking end of a turn.
     Result(TurnResult),
     /// Process exited (stdout closed) with diagnostic context.
@@ -456,17 +457,25 @@ impl AgentProcess {
                     match v.get("type").and_then(|t| t.as_str()) {
                         Some("assistant") => {
                             let mut block_text = String::new();
+                            let mut tool_uses: u32 = 0;
                             if let Some(blocks) = v
                                 .get("message")
                                 .and_then(|m| m.get("content"))
                                 .and_then(|c| c.as_array())
                             {
                                 for block in blocks {
-                                    if block.get("type").and_then(|t| t.as_str()) == Some("text")
-                                        && let Some(text) =
-                                            block.get("text").and_then(|t| t.as_str())
-                                    {
-                                        block_text.push_str(text);
+                                    match block.get("type").and_then(|t| t.as_str()) {
+                                        Some("text") => {
+                                            if let Some(text) =
+                                                block.get("text").and_then(|t| t.as_str())
+                                            {
+                                                block_text.push_str(text);
+                                            }
+                                        }
+                                        Some("tool_use") => {
+                                            tool_uses = tool_uses.saturating_add(1);
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -474,9 +483,9 @@ impl AgentProcess {
                                 .get("message")
                                 .and_then(|m| m.get("usage"))
                                 .map(TokenUsage::from);
-                            if (!block_text.is_empty() || usage.is_some())
+                            if (!block_text.is_empty() || usage.is_some() || tool_uses > 0)
                                 && event_tx
-                                    .send(StdoutEvent::TextBlock(block_text, usage))
+                                    .send(StdoutEvent::TextBlock(block_text, usage, tool_uses))
                                     .is_err()
                             {
                                 break;
@@ -501,6 +510,7 @@ impl AgentProcess {
                                     cost_usd,
                                     num_turns,
                                     token_usage: TokenUsage::default(),
+                                    tool_use_count: 0,
                                 }))
                                 .is_err()
                             {
@@ -656,13 +666,15 @@ impl AgentProcess {
         let mut response_text = String::new();
         let mut assistant_turns = 0u32;
         let mut accumulated_usage = TokenUsage::default();
+        let mut accumulated_tool_uses: u32 = 0;
 
         loop {
             match event_rx.recv().await {
-                Some(StdoutEvent::TextBlock(text, usage)) => {
+                Some(StdoutEvent::TextBlock(text, usage, tool_uses)) => {
                     if let Some(u) = &usage {
                         accumulated_usage.merge(u);
                     }
+                    accumulated_tool_uses = accumulated_tool_uses.saturating_add(tool_uses);
 
                     if !text.is_empty() {
                         assistant_turns += 1;
@@ -691,7 +703,9 @@ impl AgentProcess {
                     }
                 }
                 Some(StdoutEvent::Result(mut result)) => {
-                    while let Ok(StdoutEvent::TextBlock(trailing, _)) = event_rx.try_recv() {
+                    while let Ok(StdoutEvent::TextBlock(trailing, _, trailing_tools)) =
+                        event_rx.try_recv()
+                    {
                         debug!(
                             agent = %self.name,
                             len = trailing.len(),
@@ -701,10 +715,13 @@ impl AgentProcess {
                             sink(trailing.clone());
                         }
                         response_text.push_str(&trailing);
+                        accumulated_tool_uses =
+                            accumulated_tool_uses.saturating_add(trailing_tools);
                     }
 
                     result.response_text = response_text;
                     result.token_usage = accumulated_usage;
+                    result.tool_use_count = accumulated_tool_uses;
 
                     let mut last_cost = self.last_reported_cost.lock().await;
                     let mut last_turns = self.last_reported_turns.lock().await;

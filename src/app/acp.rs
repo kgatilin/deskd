@@ -650,6 +650,7 @@ impl AcpProcess {
             cost_usd: 0.0, // ACP doesn't report cost.
             num_turns: assistant_turns,
             token_usage: TokenUsage::default(),
+            tool_use_count: 0,
         })
     }
 
