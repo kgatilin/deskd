@@ -46,6 +46,11 @@ pub struct SessionContext {
     /// Resolved auto-compact threshold for this agent (per-agent override,
     /// global default, or built-in fallback).
     pub auto_compact_threshold: u64,
+    /// True when `context_tokens` came from a task log entry recorded
+    /// before the current session began (e.g. surviving a daemon reload).
+    /// Display layers should mark these visually so the user knows the
+    /// number is last-known rather than fresh.
+    pub stale: bool,
 }
 
 impl SessionContext {
@@ -162,10 +167,41 @@ fn is_live(state: &AgentState) -> bool {
     state.pid == 0 || is_pid_alive(state.pid)
 }
 
+/// Pure-logic helper for the stale-fallback decision: given the entries
+/// matching the current-session window and the entries from the full log,
+/// return `(entry, is_stale)` per the rules described on
+/// [`latest_session_entry`]. Extracted so the policy can be unit-tested
+/// without touching the filesystem.
+fn pick_entry_with_staleness(
+    session_window: Vec<TaskLog>,
+    full_log: impl FnOnce() -> Vec<TaskLog>,
+    had_session_cutoff: bool,
+) -> Option<(TaskLog, bool)> {
+    if let Some(entry) = session_window.into_iter().last() {
+        return Some((entry, false));
+    }
+    if !had_session_cutoff {
+        // Without a cutoff, the session-window read already saw everything;
+        // empty here means the log itself is empty.
+        return None;
+    }
+    full_log().into_iter().last().map(|e| (e, true))
+}
+
 /// Find the most recent task log entry that belongs to the agent's current
-/// session, falling back to the latest entry overall when `session_start`
-/// is unavailable.
-fn latest_session_entry(state: &AgentState) -> Option<TaskLog> {
+/// session, falling back to the latest entry overall when nothing matches
+/// the session window. Returns `(entry, is_stale)`:
+///   * `is_stale = false` — entry was recorded after `session_start` (or
+///     `session_start` is missing, in which case we can't tell and assume
+///     fresh).
+///   * `is_stale = true` — current-session lookup found nothing, but the
+///     log file has older entries; we surface the most recent one so the
+///     user sees a last-known value instead of `n/a`. This matters after
+///     a daemon reload, when `session_start` resets but the underlying
+///     Claude session is still pinned to its previous context.
+///   * `None` — `tasks.jsonl` doesn't exist or is empty, so the size is
+///     genuinely unknown.
+fn latest_session_entry(state: &AgentState) -> Option<(TaskLog, bool)> {
     let since = state
         .session_start
         .as_deref()
@@ -174,8 +210,13 @@ fn latest_session_entry(state: &AgentState) -> Option<TaskLog> {
 
     // Read with a generous limit so the latest entry is included even when
     // the file is large.
-    let entries = tasklog::read_logs(&state.config.name, usize::MAX, None, since).ok()?;
-    entries.into_iter().last()
+    let session_window = tasklog::read_logs(&state.config.name, usize::MAX, None, since).ok()?;
+    let agent_name = state.config.name.clone();
+    pick_entry_with_staleness(
+        session_window,
+        || tasklog::read_logs(&agent_name, usize::MAX, None, None).unwrap_or_default(),
+        since.is_some(),
+    )
 }
 
 /// Compute live context tokens from a task log entry: the input total plus
@@ -194,9 +235,10 @@ fn snapshot_for(state: &AgentState) -> Option<SessionContext> {
         return None;
     }
 
-    let context_tokens = latest_session_entry(state)
-        .as_ref()
-        .and_then(entry_context_tokens);
+    let (context_tokens, stale) = match latest_session_entry(state) {
+        Some((entry, is_stale)) => (entry_context_tokens(&entry), is_stale),
+        None => (None, false),
+    };
 
     Some(SessionContext {
         agent: state.config.name.clone(),
@@ -207,6 +249,7 @@ fn snapshot_for(state: &AgentState) -> Option<SessionContext> {
         auto_compact_threshold: resolve_auto_compact_threshold(
             state.config.auto_compact_threshold_tokens,
         ),
+        stale,
     })
 }
 
@@ -252,37 +295,24 @@ pub fn format_reply(snapshot: &[SessionContext]) -> String {
 
     for s in snapshot {
         let limit = format_tokens_compact(s.context_limit);
-        let threshold = format_tokens_compact(s.auto_compact_threshold);
         // Show the percentage Claude Code will actually see (matches the
         // CLAUDE_AUTOCOMPACT_PCT_OVERRIDE we inject) so the displayed
         // threshold and the runtime behaviour stay in sync.
         let pct_str = match auto_compact_override_pct(s.auto_compact_threshold, s.context_limit) {
-            Some(p) => format!(" = {}%", p),
+            Some(p) => format!("  {}%", p),
             None => String::new(),
         };
         let line = match s.context_tokens {
             Some(tokens) => {
                 let used = format_tokens_compact(tokens);
-                let warn = if s.is_warning() { "  ⚠️" } else { "" };
+                let stale = if s.stale { " (stale)" } else { "" };
+                let warn = if s.is_warning() { " ⚠️" } else { "" };
                 format!(
-                    "{} (session {})  ~{} / {}  (auto-compact at {}{}){}",
-                    s.agent,
-                    s.session_short(),
-                    used,
-                    limit,
-                    threshold,
-                    pct_str,
-                    warn
+                    "{}  ~{}{} / {}{}{}",
+                    s.agent, used, stale, limit, pct_str, warn
                 )
             }
-            None => format!(
-                "{} (session {})  n/a / {}  (auto-compact at {}{})",
-                s.agent,
-                s.session_short(),
-                limit,
-                threshold,
-                pct_str
-            ),
+            None => format!("{}  n/a / {}{}", s.agent, limit, pct_str),
         };
         lines.push(line);
     }
@@ -339,6 +369,7 @@ mod tests {
             context_tokens: Some(100),
             context_limit: 200_000,
             auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
+            stale: false,
         };
         assert_eq!(s.session_short(), "abcdef01");
     }
@@ -352,6 +383,7 @@ mod tests {
             context_tokens: None,
             context_limit: 200_000,
             auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
+            stale: false,
         };
         assert_eq!(s.session_short(), "abc");
         s.session_id = "   ".into();
@@ -369,6 +401,7 @@ mod tests {
             context_tokens: Some(240_000),
             context_limit: CONTEXT_WINDOW_4X,
             auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
+            stale: false,
         };
         assert!(s.is_warning());
         s.context_tokens = Some(239_999);
@@ -387,6 +420,7 @@ mod tests {
             context_tokens: Some(600_000),
             context_limit: CONTEXT_WINDOW_4X,
             auto_compact_threshold: 500_000,
+            stale: false,
         };
         assert!(s.is_warning());
     }
@@ -410,7 +444,8 @@ mod tests {
     fn format_reply_renders_lines_with_warning() {
         // Mix of 4.x (1M window) and unknown (200k window) agents, with the
         // default 300k auto-compact threshold used throughout. The middle
-        // entry crosses 80% of 300k = 240k, so it should show ⚠️.
+        // entry crosses 80% of 300k = 240k, so it should show ⚠️. The last
+        // entry has stale data and should be marked accordingly.
         let snap = vec![
             SessionContext {
                 agent: "agent-a".into(),
@@ -419,38 +454,67 @@ mod tests {
                 context_tokens: Some(45_000),
                 context_limit: CONTEXT_WINDOW_4X,
                 auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
+                stale: false,
             },
             SessionContext {
-                agent: "agent-a".into(),
+                agent: "agent-b".into(),
                 model: "claude-opus-4-7".into(),
                 session_id: "def45678yy".into(),
                 context_tokens: Some(260_000),
                 context_limit: CONTEXT_WINDOW_4X,
                 auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
+                stale: false,
             },
             SessionContext {
-                agent: "agent-b".into(),
+                agent: "agent-c".into(),
                 model: "claude-sonnet".into(),
                 session_id: "ghi78901zz".into(),
                 context_tokens: None,
                 context_limit: 200_000,
                 auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
+                stale: false,
+            },
+            SessionContext {
+                agent: "agent-d".into(),
+                model: "claude-opus-4-7".into(),
+                session_id: "jkl01234aa".into(),
+                context_tokens: Some(120_000),
+                context_limit: CONTEXT_WINDOW_4X,
+                auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
+                stale: true,
             },
         ];
         let reply = format_reply(&snap);
         assert!(reply.starts_with("/context\n"));
-        // 300k of 1M = 30%.
-        assert!(
-            reply
-                .contains("agent-a (session abc12345)  ~45k / 1000k  (auto-compact at 300k = 30%)")
-        );
-        assert!(reply.contains(
-            "agent-a (session def45678)  ~260k / 1000k  (auto-compact at 300k = 30%)  ⚠️"
-        ));
+        // No session IDs anywhere in the output.
+        assert!(!reply.contains("session "));
+        assert!(!reply.contains("abc12345"));
+        // 300k of 1M = 30%; healthy line, no warning.
+        assert!(reply.contains("agent-a  ~45k / 1000k  30%"));
+        assert!(!reply.contains("agent-a  ~45k / 1000k  30% ⚠️"));
+        // Warning line: 260k > 80% of 300k threshold.
+        assert!(reply.contains("agent-b  ~260k / 1000k  30% ⚠️"));
         // 300k of 200k clamps to 83%.
-        assert!(
-            reply.contains("agent-b (session ghi78901)  n/a / 200k  (auto-compact at 300k = 83%)")
-        );
+        assert!(reply.contains("agent-c  n/a / 200k  83%"));
+        // Stale marker shows after the token count, before the limit.
+        assert!(reply.contains("agent-d  ~120k (stale) / 1000k  30%"));
+    }
+
+    #[test]
+    fn format_reply_drops_session_id() {
+        // Regression for #406: session IDs should not appear in /context.
+        let snap = vec![SessionContext {
+            agent: "kira".into(),
+            model: "claude-opus-4-7".into(),
+            session_id: "deadbeefcafebabe".into(),
+            context_tokens: Some(100_000),
+            context_limit: CONTEXT_WINDOW_4X,
+            auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
+            stale: false,
+        }];
+        let reply = format_reply(&snap);
+        assert!(!reply.contains("deadbeef"));
+        assert!(!reply.contains("session"));
     }
 
     #[test]
@@ -582,6 +646,47 @@ mod tests {
         // Sub-agent path: pid > 0 and process exists.
         let state = mk_state(std::process::id(), "abcdef0123456789");
         assert!(is_live(&state));
+    }
+
+    #[test]
+    fn pick_entry_returns_session_entry_when_present() {
+        let session_entry = mk_entry(100, 0, 0);
+        let full_entry = mk_entry(50, 0, 0);
+        let result = pick_entry_with_staleness(
+            vec![session_entry.clone()],
+            || vec![full_entry, session_entry.clone()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.0.input_tokens, Some(100));
+        assert!(!result.1, "current-session entry should not be stale");
+    }
+
+    #[test]
+    fn pick_entry_falls_back_to_full_log_when_session_empty() {
+        // session_start is set (had_session_cutoff = true), but no entries
+        // match — daemon was reloaded and current session has no completed
+        // tasks yet.
+        let older = mk_entry(42, 0, 0);
+        let result = pick_entry_with_staleness(vec![], || vec![older], true).unwrap();
+        assert_eq!(result.0.input_tokens, Some(42));
+        assert!(result.1, "fallback entry must be marked stale");
+    }
+
+    #[test]
+    fn pick_entry_returns_none_when_no_log_at_all() {
+        // Empty session window AND empty full log → genuinely n/a.
+        let result = pick_entry_with_staleness(vec![], || vec![], true);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn pick_entry_returns_none_when_no_cutoff_and_empty() {
+        // Without a session cutoff the first read already saw everything;
+        // an empty result means the log itself is empty, so no stale
+        // fallback is possible.
+        let result = pick_entry_with_staleness(vec![], || panic!("must not re-read"), false);
+        assert!(result.is_none());
     }
 
     #[test]
