@@ -621,6 +621,11 @@ async fn polling_loop(
                     let _ = bot.send_message(msg.chat.id, reply).await;
                     return Ok(());
                 }
+                if cmd_base == "/context" {
+                    let reply = handle_context_command().await;
+                    let _ = bot.send_message(msg.chat.id, reply).await;
+                    return Ok(());
+                }
 
                 // Write ALL messages from allowed chats to unified inbox,
                 // regardless of mention_only filtering.
@@ -723,6 +728,15 @@ fn format_status_reply(agent_name: &str) -> String {
         Err(e) => {
             format!("Agent '{}': state unavailable ({})", agent_name, e)
         }
+    }
+}
+
+/// Handle /context command: render a snapshot of live session sizes across
+/// all agents on the host.
+async fn handle_context_command() -> String {
+    match crate::app::context_size::gather().await {
+        Ok(snapshot) => crate::app::context_size::format_reply(&snapshot),
+        Err(e) => format!("Failed to gather context sizes: {}", e),
     }
 }
 

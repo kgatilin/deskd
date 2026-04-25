@@ -115,6 +115,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             commands::usage::run(&period, agent.as_deref(), &format).await?;
         }
+        Commands::Context { format } => {
+            commands::context::run(&format).await?;
+        }
     }
 
     Ok(())
