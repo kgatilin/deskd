@@ -83,11 +83,20 @@ fn is_pid_alive(pid: u32) -> bool {
 }
 
 /// Whether a given agent state should be considered "live" for the purposes
-/// of `/context`. We require both:
-///   * a non-empty `session_id` (otherwise there is no session to report on)
-///   * the agent process to be running (PID alive)
+/// of `/context`. We require a non-empty `session_id` (otherwise there is no
+/// session to report on). Process liveness is opportunistic:
+///   * `state.pid == 0` — top-level agents started by `deskd serve` don't
+///     record a PID (only sub-agents spawned via MCP do). Treat as live.
+///   * `state.pid > 0` — sub-agent path; verify the worker process exists.
+///
+/// This trades a small risk of reporting stale data for a top-level agent
+/// that crashed mid-session against the much worse failure mode of showing
+/// "No active sessions" when sessions clearly exist.
 fn is_live(state: &AgentState) -> bool {
-    !state.session_id.is_empty() && is_pid_alive(state.pid)
+    if state.session_id.is_empty() {
+        return false;
+    }
+    state.pid == 0 || is_pid_alive(state.pid)
 }
 
 /// Find the most recent task log entry that belongs to the agent's current
@@ -335,5 +344,75 @@ mod tests {
         assert_eq!(context_window_for_model("claude-opus-4"), 200_000);
         assert_eq!(context_window_for_model("claude-sonnet-4-6"), 200_000);
         assert_eq!(context_window_for_model("anything-else"), 200_000);
+    }
+
+    fn mk_state(pid: u32, session_id: &str) -> AgentState {
+        use crate::app::agent_registry::AgentConfig;
+        AgentState {
+            config: AgentConfig {
+                name: "kira".into(),
+                model: "claude-opus-4".into(),
+                system_prompt: String::new(),
+                work_dir: "/tmp".into(),
+                max_turns: 100,
+                unix_user: None,
+                budget_usd: 50.0,
+                command: vec!["claude".into()],
+                config_path: None,
+                container: None,
+                session: Default::default(),
+                runtime: Default::default(),
+                context: None,
+                compact_threshold: None,
+            },
+            pid,
+            session_id: session_id.into(),
+            total_turns: 0,
+            total_cost: 0.0,
+            created_at: String::new(),
+            status: "idle".into(),
+            current_task: String::new(),
+            parent: None,
+            scope: None,
+            can_message: None,
+            env_keys: None,
+            session_start: None,
+            session_cost: 0.0,
+            session_turns: 0,
+        }
+    }
+
+    #[test]
+    fn is_live_treats_top_level_agent_with_zero_pid_as_live() {
+        // Regression: top-level agents started via `deskd serve` never have
+        // their state.pid updated from the default 0 (only MCP-spawned
+        // sub-agents do). They must still appear in `/context`.
+        let state = mk_state(0, "abcdef0123456789");
+        assert!(is_live(&state));
+    }
+
+    #[test]
+    fn is_live_rejects_empty_session_id() {
+        // No session means nothing to report on, regardless of pid.
+        let state = mk_state(0, "");
+        assert!(!is_live(&state));
+        let state = mk_state(std::process::id(), "");
+        assert!(!is_live(&state));
+    }
+
+    #[test]
+    fn is_live_accepts_subagent_with_running_pid() {
+        // Sub-agent path: pid > 0 and process exists.
+        let state = mk_state(std::process::id(), "abcdef0123456789");
+        assert!(is_live(&state));
+    }
+
+    #[test]
+    fn is_live_rejects_subagent_with_dead_pid() {
+        // Sub-agent path: pid > 0 but process is gone.
+        // PID 1 is the init/systemd process and always alive on Linux, so
+        // pick a deliberately implausible pid that won't exist.
+        let state = mk_state(u32::MAX - 1, "abcdef0123456789");
+        assert!(!is_live(&state));
     }
 }
