@@ -51,6 +51,12 @@ pub struct AgentConfig {
     /// Default: 0.8.
     #[serde(default)]
     pub compact_threshold: Option<f64>,
+    /// Auto-compact threshold in absolute tokens. When set, deskd converts this
+    /// to a percentage of the model's context window and injects it as
+    /// `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` into the agent process environment.
+    /// Resolution order: per-agent > global (UserConfig) > built-in 300_000.
+    #[serde(default)]
+    pub auto_compact_threshold_tokens: Option<u64>,
 }
 
 fn default_budget_usd() -> f64 {
@@ -256,6 +262,8 @@ pub async fn create_or_recover(
         runtime: def.runtime.clone(),
         context: user_cfg.and_then(|c| c.context.clone()),
         compact_threshold: None,
+        // Top-level agents inherit the global threshold from their deskd.yaml.
+        auto_compact_threshold_tokens: user_cfg.and_then(|c| c.auto_compact_threshold_tokens),
     };
 
     let path = state_path(&def.name);
@@ -384,8 +392,27 @@ async fn send_inner(
         .unwrap_or_else(|| config::agent_bus_socket(&state.config.work_dir));
 
     let config_path_str = state.config.config_path.clone().unwrap_or_default();
-    let mut extra_env: Vec<(&str, &str)> =
-        vec![("DESKD_AGENT_NAME", name), ("DESKD_BUS_SOCKET", &bus_path)];
+
+    // Inject CLAUDE_AUTOCOMPACT_PCT_OVERRIDE so the ephemeral process respects
+    // the same threshold as the persistent worker.
+    let autocompact_pct_str: String = {
+        use crate::app::context_size::{
+            DEFAULT_AUTO_COMPACT_THRESHOLD, autocompact_pct, context_window_for_model,
+        };
+        let threshold = state
+            .config
+            .auto_compact_threshold_tokens
+            .unwrap_or(DEFAULT_AUTO_COMPACT_THRESHOLD);
+        let window = context_window_for_model(&state.config.model);
+        let (pct, _) = autocompact_pct(threshold, window);
+        pct.to_string()
+    };
+
+    let mut extra_env: Vec<(&str, &str)> = vec![
+        ("DESKD_AGENT_NAME", name),
+        ("DESKD_BUS_SOCKET", &bus_path),
+        ("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", &autocompact_pct_str),
+    ];
     if !config_path_str.is_empty() {
         extra_env.push(("DESKD_AGENT_CONFIG", &config_path_str));
     }
@@ -677,6 +704,7 @@ pub async fn spawn_ephemeral(
         runtime: ConfigAgentRuntime::default(),
         context: None,
         compact_threshold: None,
+        auto_compact_threshold_tokens: None,
     };
 
     create(&cfg).await?;
@@ -732,6 +760,7 @@ created_at: "2024-01-01T00:00:00Z"
             runtime: ConfigAgentRuntime::default(),
             context: None,
             compact_threshold: None,
+            auto_compact_threshold_tokens: None,
         };
         let state = AgentState {
             config: cfg,
@@ -795,6 +824,7 @@ created_at: "2024-01-01T00:00:00Z"
             runtime: ConfigAgentRuntime::default(),
             context: None,
             compact_threshold: None,
+            auto_compact_threshold_tokens: None,
         };
         let state = AgentState {
             config: cfg,

@@ -344,8 +344,39 @@ impl AgentProcess {
 
         let bus_path = bus_socket.to_string();
         let config_path_str = state.config.config_path.clone().unwrap_or_default();
-        let mut extra_env: Vec<(&str, &str)> =
-            vec![("DESKD_AGENT_NAME", name), ("DESKD_BUS_SOCKET", &bus_path)];
+
+        // Compute auto-compact percentage and prepare the env var value string
+        // before building extra_env (borrows must outlive the vec).
+        let autocompact_pct_str: String = {
+            use crate::app::context_size::{
+                AUTO_COMPACT_PCT_MAX, DEFAULT_AUTO_COMPACT_THRESHOLD, autocompact_pct,
+                context_window_for_model,
+            };
+            let threshold = state
+                .config
+                .auto_compact_threshold_tokens
+                .unwrap_or(DEFAULT_AUTO_COMPACT_THRESHOLD);
+            let window = context_window_for_model(&state.config.model);
+            let (pct, would_clamp) = autocompact_pct(threshold, window);
+            if would_clamp {
+                warn!(
+                    agent = %name,
+                    model = %state.config.model,
+                    threshold_tokens = threshold,
+                    window_tokens = window,
+                    pct_max = AUTO_COMPACT_PCT_MAX,
+                    "auto_compact_threshold_tokens exceeds ~83% of the model window — \
+                     CLAUDE_AUTOCOMPACT_PCT_OVERRIDE will be clamped; override is ineffective"
+                );
+            }
+            pct.to_string()
+        };
+
+        let mut extra_env: Vec<(&str, &str)> = vec![
+            ("DESKD_AGENT_NAME", name),
+            ("DESKD_BUS_SOCKET", &bus_path),
+            ("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", &autocompact_pct_str),
+        ];
         if !config_path_str.is_empty() {
             extra_env.push(("DESKD_AGENT_CONFIG", &config_path_str));
         }

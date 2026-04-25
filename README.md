@@ -137,7 +137,27 @@ telegram:
 agents: []      # sub-agents
 schedules: []   # cron jobs
 channels: []    # named bus targets
+
+# Global auto-compact threshold in absolute tokens (default: 300 000).
+# deskd converts this to a percentage of the model window and injects
+# CLAUDE_AUTOCOMPACT_PCT_OVERRIDE into the agent process environment.
+# Values above ~83% of the model window are clamped (Claude Code limitation).
+auto_compact_threshold_tokens: 300000
 ```
+
+Per-agent override (inside `agents:`):
+```yaml
+agents:
+  - name: heavy
+    model: claude-opus-4-7
+    # Override for this agent only. Falls back to global, then built-in 300 000.
+    auto_compact_threshold_tokens: 600000
+    subscribe: [...]
+```
+
+Model windows for reference:
+- `claude-opus-4-*` / `claude-sonnet-4-*` / `claude-haiku-4-*` — **1 000 000** tokens
+- `claude-3-*` and unknown models — **200 000** tokens (safe default)
 
 ### Key paths
 

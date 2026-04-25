@@ -395,6 +395,13 @@ pub struct UserConfig {
     /// Example: `inbox_acl: ["dev", "collab-*"]`.
     #[serde(default)]
     pub inbox_acl: Option<Vec<String>>,
+    /// Global default auto-compact threshold in tokens. Overridden per-agent.
+    /// When neither this nor the per-agent override is set, deskd uses the
+    /// built-in default (300_000). Must be > 0 if present.
+    /// deskd converts this to a percentage of the model's context window and
+    /// injects `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` into the agent process.
+    #[serde(default)]
+    pub auto_compact_threshold_tokens: Option<u64>,
 }
 
 /// An A2A skill advertised in the Agent Card (per A2A spec).
@@ -508,6 +515,11 @@ pub struct SubAgentDef {
     /// Only used when runtime is `memory`.
     #[serde(default)]
     pub compact_strategy: Option<String>,
+    /// Per-agent auto-compact threshold in tokens. Overrides the global
+    /// `auto_compact_threshold_tokens` in `deskd.yaml` for this agent.
+    /// Must be > 0 if present.
+    #[serde(default)]
+    pub auto_compact_threshold_tokens: Option<u64>,
 }
 
 impl SubAgentDef {
@@ -600,7 +612,25 @@ impl UserConfig {
         let expanded = expand_env_vars(&raw);
         let cfg: UserConfig =
             serde_yaml::from_str(&expanded).context("failed to parse user config")?;
+        cfg.validate().with_context(|| format!("invalid config: {}", path))?;
         Ok(cfg)
+    }
+
+    /// Validate config values that cannot be expressed in the type system.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(t) = self.auto_compact_threshold_tokens {
+            anyhow::ensure!(t > 0, "auto_compact_threshold_tokens must be > 0");
+        }
+        for agent in &self.agents {
+            if let Some(t) = agent.auto_compact_threshold_tokens {
+                anyhow::ensure!(
+                    t > 0,
+                    "agent '{}': auto_compact_threshold_tokens must be > 0",
+                    agent.name
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1444,6 +1474,7 @@ agents:
             context: None,
             compact_threshold: None,
             compact_strategy: None,
+            auto_compact_threshold_tokens: None,
         };
         assert!(sub.validate_work_dir("/tmp/parent").is_ok());
     }
@@ -1466,7 +1497,69 @@ agents:
             context: None,
             compact_threshold: None,
             compact_strategy: None,
+            auto_compact_threshold_tokens: None,
         };
         assert!(sub.validate_work_dir("/tmp/parent").is_err());
+    }
+
+    #[test]
+    fn test_auto_compact_threshold_tokens_parses_global() {
+        let yaml = r#"
+model: claude-opus-4-7
+system_prompt: "Test"
+auto_compact_threshold_tokens: 500000
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.auto_compact_threshold_tokens, Some(500_000));
+    }
+
+    #[test]
+    fn test_auto_compact_threshold_tokens_parses_per_agent() {
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Test"
+auto_compact_threshold_tokens: 300000
+agents:
+  - name: heavy
+    model: claude-opus-4-7
+    system_prompt: "Heavy worker"
+    subscribe: ["agent:heavy"]
+    auto_compact_threshold_tokens: 600000
+  - name: light
+    model: claude-haiku-4-5
+    system_prompt: "Light worker"
+    subscribe: ["agent:light"]
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.auto_compact_threshold_tokens, Some(300_000));
+        assert_eq!(cfg.agents[0].auto_compact_threshold_tokens, Some(600_000));
+        assert!(cfg.agents[1].auto_compact_threshold_tokens.is_none());
+    }
+
+    #[test]
+    fn test_auto_compact_threshold_tokens_zero_rejected() {
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Test"
+auto_compact_threshold_tokens: 0
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_auto_compact_threshold_tokens_per_agent_zero_rejected() {
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Test"
+agents:
+  - name: worker
+    model: claude-haiku-4-5
+    system_prompt: "Worker"
+    subscribe: ["agent:worker"]
+    auto_compact_threshold_tokens: 0
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
     }
 }

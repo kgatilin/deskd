@@ -15,12 +15,22 @@ use chrono::DateTime;
 use crate::app::agent_registry::AgentState;
 use crate::app::tasklog::{self, TaskLog};
 
-/// Default context window for Claude models (Opus 4.x / Sonnet / Haiku all
-/// share a 200k token window today).
+/// Default context window for Claude 3.x models and unknown model ids.
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 
-/// Threshold (fraction of context window) at which we surface a warning
-/// indicator. Matches the conventional 80% compaction trigger.
+/// Context window for Claude 4.x family (Opus, Sonnet, Haiku).
+pub const CONTEXT_WINDOW_CLAUDE_4: u64 = 1_000_000;
+
+/// Built-in default auto-compact threshold in tokens (300k).
+/// Applied when neither a per-agent nor a global override is configured.
+pub const DEFAULT_AUTO_COMPACT_THRESHOLD: u64 = 300_000;
+
+/// Maximum percentage value accepted by `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`.
+/// Values above this are silently clamped by Claude Code (anthropics/claude-code#31806).
+pub const AUTO_COMPACT_PCT_MAX: u64 = 83;
+
+/// Threshold (fraction of threshold) at which we surface a warning indicator.
+/// 80% of the configured auto-compact threshold — not of the model window.
 pub const WARN_THRESHOLD: f64 = 0.80;
 
 /// One row in the `/context` snapshot — a single agent's current session.
@@ -35,6 +45,8 @@ pub struct SessionContext {
     pub context_tokens: Option<u64>,
     /// Context window for the model in use.
     pub context_limit: u64,
+    /// Resolved auto-compact threshold for this agent (absolute tokens).
+    pub auto_compact_threshold: u64,
 }
 
 impl SessionContext {
@@ -59,18 +71,59 @@ impl SessionContext {
         }
     }
 
+    /// Whether the auto-compact threshold warning should fire.
+    /// Triggers at 80% of the configured threshold — not the model window.
     pub fn is_warning(&self) -> bool {
-        self.utilization() >= WARN_THRESHOLD
+        match self.context_tokens {
+            Some(t) if self.auto_compact_threshold > 0 => {
+                t as f64 >= self.auto_compact_threshold as f64 * WARN_THRESHOLD
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the threshold would clamp (i.e. threshold >= window * 0.83).
+    /// Used to surface a warning marker in /context output.
+    pub fn threshold_would_clamp(&self) -> bool {
+        self.context_limit > 0
+            && self.auto_compact_threshold as f64
+                >= self.context_limit as f64 * (AUTO_COMPACT_PCT_MAX as f64 / 100.0)
     }
 }
 
 /// Pick the context window size for a given Claude model name.
 ///
-/// All current Claude families (Opus, Sonnet, Haiku, including the 4.x
-/// generation) ship with a 200k window, so we just default to that. The
-/// helper exists so future per-model overrides have one obvious place to live.
-pub fn context_window_for_model(_model: &str) -> u64 {
+/// - `claude-(opus|sonnet|haiku)-4-*` — 1M token window (Claude 4.x family).
+/// - `claude-3-*` — 200k token window.
+/// - Any unrecognised id — 200k (safe default).
+///
+/// Single source of truth; no caller should hardcode 200k or 1M literals.
+pub fn context_window_for_model(model: &str) -> u64 {
+    // Claude 4.x: claude-opus-4-*, claude-sonnet-4-*, claude-haiku-4-*
+    let is_claude_4 = model.starts_with("claude-opus-4-")
+        || model.starts_with("claude-sonnet-4-")
+        || model.starts_with("claude-haiku-4-");
+    if is_claude_4 {
+        return CONTEXT_WINDOW_CLAUDE_4;
+    }
+    // Claude 3.x and all unrecognised ids.
     DEFAULT_CONTEXT_WINDOW
+}
+
+/// Compute the `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` value from a resolved
+/// threshold and model window.
+///
+/// Formula: `(threshold / window * 100).round().clamp(1, 83)`.
+/// Returns `(pct, clamped)` where `clamped` is true if the raw value exceeded
+/// `AUTO_COMPACT_PCT_MAX` (signals that the user override is ineffective).
+pub fn autocompact_pct(threshold_tokens: u64, window_tokens: u64) -> (u64, bool) {
+    if window_tokens == 0 {
+        return (AUTO_COMPACT_PCT_MAX, false);
+    }
+    let raw = (threshold_tokens as f64 / window_tokens as f64 * 100.0).round() as u64;
+    let clamped = raw > AUTO_COMPACT_PCT_MAX;
+    let pct = raw.clamp(1, AUTO_COMPACT_PCT_MAX);
+    (pct, clamped)
 }
 
 /// Determine whether an agent's process is currently running.
@@ -135,12 +188,19 @@ fn snapshot_for(state: &AgentState) -> Option<SessionContext> {
         .as_ref()
         .and_then(entry_context_tokens);
 
+    let context_limit = context_window_for_model(&state.config.model);
+    let auto_compact_threshold = state
+        .config
+        .auto_compact_threshold_tokens
+        .unwrap_or(DEFAULT_AUTO_COMPACT_THRESHOLD);
+
     Some(SessionContext {
         agent: state.config.name.clone(),
         model: state.config.model.clone(),
         session_id: state.session_id.clone(),
         context_tokens,
-        context_limit: context_window_for_model(&state.config.model),
+        context_limit,
+        auto_compact_threshold,
     })
 }
 
@@ -186,24 +246,33 @@ pub fn format_reply(snapshot: &[SessionContext]) -> String {
 
     for s in snapshot {
         let limit = format_tokens_compact(s.context_limit);
+        let threshold = format_tokens_compact(s.auto_compact_threshold);
+        let (pct, would_clamp) = autocompact_pct(s.auto_compact_threshold, s.context_limit);
+        let clamp_marker = if would_clamp { " ⚠️" } else { "" };
         let line = match s.context_tokens {
             Some(tokens) => {
                 let used = format_tokens_compact(tokens);
                 let warn = if s.is_warning() { "  ⚠️" } else { "" };
                 format!(
-                    "{} (session {})  ~{} / {}{}",
+                    "{} (session {})  ~{} / {}  (auto-compact at {} = {}%{}){}",
                     s.agent,
                     s.session_short(),
                     used,
                     limit,
+                    threshold,
+                    pct,
+                    clamp_marker,
                     warn
                 )
             }
             None => format!(
-                "{} (session {})  n/a / {}",
+                "{} (session {})  n/a / {}  (auto-compact at {} = {}%{})",
                 s.agent,
                 s.session_short(),
-                limit
+                limit,
+                threshold,
+                pct,
+                clamp_marker
             ),
         };
         lines.push(line);
@@ -252,15 +321,26 @@ mod tests {
         assert_eq!(entry_context_tokens(&e), None);
     }
 
+    fn mk_session(
+        agent: &str,
+        model: &str,
+        context_tokens: Option<u64>,
+        auto_compact_threshold: u64,
+    ) -> SessionContext {
+        let context_limit = context_window_for_model(model);
+        SessionContext {
+            agent: agent.into(),
+            model: model.into(),
+            session_id: "abcdef0123456789".into(),
+            context_tokens,
+            context_limit,
+            auto_compact_threshold,
+        }
+    }
+
     #[test]
     fn session_short_takes_first_eight_chars() {
-        let s = SessionContext {
-            agent: "kira".into(),
-            model: "claude-opus-4".into(),
-            session_id: "abcdef0123456789".into(),
-            context_tokens: Some(100),
-            context_limit: 200_000,
-        };
+        let s = mk_session("kira", "claude-opus-4", Some(100), DEFAULT_AUTO_COMPACT_THRESHOLD);
         assert_eq!(s.session_short(), "abcdef01");
     }
 
@@ -271,7 +351,8 @@ mod tests {
             model: "claude-opus-4".into(),
             session_id: "abc".into(),
             context_tokens: None,
-            context_limit: 200_000,
+            context_limit: context_window_for_model("claude-opus-4"),
+            auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
         };
         assert_eq!(s.session_short(), "abc");
         s.session_id = "   ".into();
@@ -279,16 +360,20 @@ mod tests {
     }
 
     #[test]
-    fn warning_triggers_above_eighty_percent() {
+    fn warning_triggers_at_eighty_percent_of_threshold() {
+        // threshold=300k, 80% = 240k
+        let threshold = 300_000u64;
+        let warn_at = (threshold as f64 * 0.80) as u64; // 240000
         let mut s = SessionContext {
             agent: "a".into(),
-            model: "claude-opus-4".into(),
+            model: "claude-opus-4-7".into(),
             session_id: "xxxxxxxx".into(),
-            context_tokens: Some(160_000),
-            context_limit: 200_000,
+            context_tokens: Some(warn_at),
+            context_limit: context_window_for_model("claude-opus-4-7"),
+            auto_compact_threshold: threshold,
         };
         assert!(s.is_warning());
-        s.context_tokens = Some(159_999);
+        s.context_tokens = Some(warn_at - 1);
         assert!(!s.is_warning());
     }
 
@@ -309,41 +394,108 @@ mod tests {
 
     #[test]
     fn format_reply_renders_lines_with_warning() {
+        // agent-a/session1: 45k used, threshold=300k on 200k window → clamps → ⚠️ marker on threshold
+        // agent-a/session2: 250k used, threshold=300k → 250k >= 300k*0.8=240k → warn ⚠️
+        // agent-b: no tokens, threshold=300k on 200k window (clamp)
+        let threshold = DEFAULT_AUTO_COMPACT_THRESHOLD;
         let snap = vec![
             SessionContext {
                 agent: "agent-a".into(),
                 model: "claude-opus-4".into(),
                 session_id: "abc12345xx".into(),
                 context_tokens: Some(45_000),
-                context_limit: 200_000,
+                context_limit: context_window_for_model("claude-opus-4"),
+                auto_compact_threshold: threshold,
             },
             SessionContext {
                 agent: "agent-a".into(),
-                model: "claude-opus-4".into(),
+                model: "claude-opus-4-7".into(),
                 session_id: "def45678yy".into(),
-                context_tokens: Some(180_000),
-                context_limit: 200_000,
+                context_tokens: Some(250_000),
+                context_limit: context_window_for_model("claude-opus-4-7"),
+                auto_compact_threshold: threshold,
             },
             SessionContext {
                 agent: "agent-b".into(),
                 model: "claude-sonnet".into(),
                 session_id: "ghi78901zz".into(),
                 context_tokens: None,
-                context_limit: 200_000,
+                context_limit: context_window_for_model("claude-sonnet"),
+                auto_compact_threshold: threshold,
             },
         ];
         let reply = format_reply(&snap);
         assert!(reply.starts_with("/context\n"));
+        // session1: 200k window, 300k threshold → clamp marker ⚠️ on threshold portion
         assert!(reply.contains("agent-a (session abc12345)  ~45k / 200k"));
-        assert!(reply.contains("agent-a (session def45678)  ~180k / 200k  ⚠️"));
+        assert!(reply.contains("auto-compact at 300k = 83%"));
+        // session2: 1M window, 300k threshold = 30%, 250k >= 240k → warn ⚠️
+        assert!(reply.contains("agent-a (session def45678)  ~250k / 1000k"));
+        assert!(reply.contains("auto-compact at 300k = 30%"));
+        assert!(reply.contains("⚠️")); // warning on session2
+        // agent-b: n/a
         assert!(reply.contains("agent-b (session ghi78901)  n/a / 200k"));
     }
 
     #[test]
-    fn context_window_defaults_to_two_hundred_k() {
-        assert_eq!(context_window_for_model("claude-opus-4"), 200_000);
-        assert_eq!(context_window_for_model("claude-sonnet-4-6"), 200_000);
-        assert_eq!(context_window_for_model("anything-else"), 200_000);
+    fn context_window_for_model_returns_correct_windows() {
+        // Claude 4.x family → 1M
+        assert_eq!(context_window_for_model("claude-opus-4-7"), CONTEXT_WINDOW_CLAUDE_4);
+        assert_eq!(context_window_for_model("claude-opus-4-6"), CONTEXT_WINDOW_CLAUDE_4);
+        assert_eq!(context_window_for_model("claude-sonnet-4-6"), CONTEXT_WINDOW_CLAUDE_4);
+        assert_eq!(context_window_for_model("claude-haiku-4-5"), CONTEXT_WINDOW_CLAUDE_4);
+        // Claude 3.x → 200k
+        assert_eq!(context_window_for_model("claude-opus-3"), DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(context_window_for_model("claude-sonnet-3-5"), DEFAULT_CONTEXT_WINDOW);
+        // Unknown → 200k safe default
+        assert_eq!(context_window_for_model("anything-else"), DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(context_window_for_model(""), DEFAULT_CONTEXT_WINDOW);
+        // claude-opus-4 (no version suffix) → NOT matched by claude-opus-4- prefix → 200k
+        assert_eq!(context_window_for_model("claude-opus-4"), DEFAULT_CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn autocompact_pct_normal_cases() {
+        // 300k on 1M window = 30%
+        let (pct, clamped) = autocompact_pct(300_000, 1_000_000);
+        assert_eq!(pct, 30);
+        assert!(!clamped);
+
+        // 300k on 200k window → 150% → clamps to 83
+        let (pct, clamped) = autocompact_pct(300_000, 200_000);
+        assert_eq!(pct, AUTO_COMPACT_PCT_MAX);
+        assert!(clamped);
+
+        // 800k on 1M window = 80% < 83 → no clamp
+        let (pct, clamped) = autocompact_pct(800_000, 1_000_000);
+        assert_eq!(pct, 80);
+        assert!(!clamped);
+
+        // 1 token on 1M → rounds to 0 → clamped to 1
+        let (pct, clamped) = autocompact_pct(1, 1_000_000);
+        assert_eq!(pct, 1);
+        assert!(!clamped);
+    }
+
+    #[test]
+    fn threshold_would_clamp_reflects_clamping() {
+        // 300k threshold on 200k window → threshold >= 200k * 0.83 = 166k → clamps
+        let s = SessionContext {
+            agent: "x".into(),
+            model: "claude-opus-4".into(),
+            session_id: "s".into(),
+            context_tokens: None,
+            context_limit: DEFAULT_CONTEXT_WINDOW,
+            auto_compact_threshold: DEFAULT_AUTO_COMPACT_THRESHOLD,
+        };
+        assert!(s.threshold_would_clamp());
+
+        // 300k threshold on 1M window → threshold < 1M * 0.83 = 830k → no clamp
+        let s2 = SessionContext {
+            context_limit: CONTEXT_WINDOW_CLAUDE_4,
+            ..s
+        };
+        assert!(!s2.threshold_would_clamp());
     }
 
     fn mk_state(pid: u32, session_id: &str) -> AgentState {
@@ -364,6 +516,7 @@ mod tests {
                 runtime: Default::default(),
                 context: None,
                 compact_threshold: None,
+                auto_compact_threshold_tokens: None,
             },
             pid,
             session_id: session_id.into(),
