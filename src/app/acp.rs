@@ -150,6 +150,57 @@ pub fn extract_session_id(result: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Resolve MCP servers for an ACP session.
+///
+/// Reads the agent's `deskd.yaml` (if `config_path` is set) to extract
+/// `mcp_config` → `mcpServers`. Always injects a default `deskd` entry
+/// that points at `deskd mcp --agent <name>` so ACP agents get the same
+/// bus access Claude agents do.
+///
+/// Returns `None` only if no servers at all could be resolved (agent name
+/// is empty and no config). In practice a non-empty agent name means we
+/// always return at least the default deskd entry.
+pub fn resolve_mcp_servers(
+    agent_name: &str,
+    config_path: Option<&str>,
+) -> Option<HashMap<String, serde_json::Value>> {
+    let mut servers: HashMap<String, serde_json::Value> = HashMap::new();
+
+    // Pull user-defined mcpServers from the agent's deskd.yaml, if any.
+    if let Some(path) = config_path
+        && !path.is_empty()
+        && let Ok(content) = std::fs::read_to_string(path)
+    {
+        // Parse as a loose YAML Value so we don't couple to UserConfig here.
+        if let Ok(yaml) = serde_yaml::from_str::<serde_json::Value>(&content)
+            && let Some(mcp_str) = yaml.get("mcp_config").and_then(|v| v.as_str())
+            && let Ok(mcp_json) = serde_json::from_str::<serde_json::Value>(mcp_str)
+            && let Some(map) = mcp_json.get("mcpServers").and_then(|v| v.as_object())
+        {
+            for (k, v) in map {
+                servers.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    // Always inject a default deskd MCP server so ACP agents get bus tools.
+    if !agent_name.is_empty() {
+        servers.entry("deskd".to_string()).or_insert_with(|| {
+            let deskd_bin = std::env::var("DESKD_BIN").unwrap_or_else(|_| "deskd".to_string());
+            serde_json::json!({
+                "command": deskd_bin,
+                "args": ["mcp", "--agent", agent_name]
+            })
+        });
+    }
+
+    if servers.is_empty() {
+        None
+    } else {
+        Some(servers)
+    }
+}
+
 // ─── AcpProcess: long-lived ACP agent process ───────────────────────────────
 
 /// Events emitted by the ACP stdout reader task.
@@ -484,7 +535,8 @@ impl AcpProcess {
     /// Create a new session and return its ID.
     async fn do_session_new(&self, cfg: &AgentConfig) -> Result<String> {
         let id = self.next_request_id().await;
-        let req = build_session_new(id, &cfg.work_dir, None);
+        let mcp_servers = resolve_mcp_servers(&self.name, cfg.config_path.as_deref());
+        let req = build_session_new(id, &cfg.work_dir, mcp_servers);
         let resp = self.send_request(&req, None).await?;
 
         if let Some(err) = resp.error {
@@ -884,6 +936,70 @@ mod tests {
         // Tail includes the *last* line number, not the first.
         assert!(tail.contains("line 49"));
         assert!(!tail.contains("line 0:"));
+    }
+
+    #[test]
+    fn test_resolve_mcp_servers_injects_default_deskd() {
+        // No config path => only the default deskd server.
+        let servers = resolve_mcp_servers("kira", None).unwrap();
+        assert!(servers.contains_key("deskd"));
+        assert_eq!(servers["deskd"]["args"][2], "kira");
+    }
+
+    #[test]
+    fn test_resolve_mcp_servers_merges_user_config() {
+        // Write a temp deskd.yaml with an mcp_config field.
+        let dir = std::env::temp_dir().join(format!(
+            "deskd-acp-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("deskd.yaml");
+        let yaml = r#"
+mcp_config: '{"mcpServers":{"filesystem":{"command":"mcp-fs","args":["--root","/tmp"]}}}'
+"#;
+        std::fs::write(&path, yaml).unwrap();
+
+        let servers = resolve_mcp_servers("kira", Some(path.to_str().unwrap())).unwrap();
+        assert!(servers.contains_key("deskd"));
+        assert!(servers.contains_key("filesystem"));
+        assert_eq!(servers["filesystem"]["command"], "mcp-fs");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_resolve_mcp_servers_user_deskd_takes_precedence() {
+        // If the user defines their own `deskd` entry, don't clobber it.
+        let dir = std::env::temp_dir().join(format!(
+            "deskd-acp-test-prec-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("deskd.yaml");
+        let yaml = r#"
+mcp_config: '{"mcpServers":{"deskd":{"command":"/custom/deskd","args":["mcp","--agent","override"]}}}'
+"#;
+        std::fs::write(&path, yaml).unwrap();
+
+        let servers = resolve_mcp_servers("kira", Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(servers["deskd"]["command"], "/custom/deskd");
+        assert_eq!(servers["deskd"]["args"][2], "override");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_resolve_mcp_servers_missing_file_ok() {
+        // Non-existent config path should not crash; default deskd still injected.
+        let servers = resolve_mcp_servers("kira", Some("/nonexistent/path/deskd.yaml")).unwrap();
+        assert!(servers.contains_key("deskd"));
     }
 
     #[test]
