@@ -224,6 +224,9 @@ mod tests {
             output_tokens: None,
             cache_creation_input_tokens: Some(cache_creation),
             cache_read_input_tokens: Some(cache_read),
+            session_count: None,
+            tool_use_count: None,
+            parent_agent: None,
         }
     }
 
