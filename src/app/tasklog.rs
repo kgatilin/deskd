@@ -46,6 +46,15 @@ pub struct TaskLog {
     /// Tokens read from cache.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cache_read_input_tokens: Option<u64>,
+    /// Number of Claude invocations (sessions) for this task. Defaults to 1 per task.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_count: Option<u32>,
+    /// Number of tool_use blocks emitted by Claude during this task.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_use_count: Option<u32>,
+    /// Name of the parent agent if this task ran in a sub-agent. Used for usage attribution.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub parent_agent: Option<String>,
 }
 
 /// Return the path to the task log file for a given agent.
@@ -452,6 +461,9 @@ mod tests {
             output_tokens: None,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            session_count: None,
+            tool_use_count: None,
+            parent_agent: None,
         }
     }
 
@@ -505,6 +517,9 @@ mod tests {
                     output_tokens: None,
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: None,
+                    session_count: None,
+                    tool_use_count: None,
+                    parent_agent: None,
                 };
                 let line = serde_json::to_string(&entry).unwrap();
                 writeln!(file, "{}", line).unwrap();

@@ -316,6 +316,9 @@ async fn test_tasklog_records_crash_error() {
         output_tokens: Some(200),
         cache_creation_input_tokens: Some(500),
         cache_read_input_tokens: Some(800),
+        session_count: Some(1),
+        tool_use_count: Some(0),
+        parent_agent: None,
     };
 
     let log_file = log_dir.join("crash-test-agent.jsonl");
