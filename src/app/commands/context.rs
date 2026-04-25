@@ -25,30 +25,27 @@ fn print_table(snapshot: &[SessionContext]) {
         println!("No active sessions.");
         return;
     }
+    // SESSION column dropped (#406): session IDs add noise without aiding
+    // humans. A trailing STATE column surfaces the stale-fallback case.
     println!(
-        "{:<16} {:<10} {:<28} {:<10} {:<10} %",
-        "AGENT", "SESSION", "MODEL", "TOKENS", "LIMIT"
+        "{:<16} {:<28} {:<12} {:<10} {:<8} {:<8}",
+        "AGENT", "MODEL", "TOKENS", "LIMIT", "%", "STATE"
     );
     println!("{}", "─".repeat(86));
     for s in snapshot {
-        let tokens = s
-            .context_tokens
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "n/a".into());
+        let tokens = match s.context_tokens {
+            Some(t) if s.stale => format!("{} (stale)", t),
+            Some(t) => t.to_string(),
+            None => "n/a".into(),
+        };
         let pct = match s.context_tokens {
             Some(_) => format!("{:>5.1}%", s.utilization() * 100.0),
             None => "    -".to_string(),
         };
-        let warn = if s.is_warning() { "  ⚠️" } else { "" };
+        let state = if s.is_warning() { "⚠️" } else { "" };
         println!(
-            "{:<16} {:<10} {:<28} {:<10} {:<10} {}{}",
-            s.agent,
-            s.session_short(),
-            s.model,
-            tokens,
-            s.context_limit,
-            pct,
-            warn,
+            "{:<16} {:<28} {:<12} {:<10} {:<8} {:<8}",
+            s.agent, s.model, tokens, s.context_limit, pct, state,
         );
     }
 }
@@ -61,11 +58,11 @@ fn print_json(snapshot: &[SessionContext]) -> Result<()> {
                 "agent": s.agent,
                 "model": s.model,
                 "session_id": s.session_id,
-                "session_short": s.session_short(),
                 "context_tokens": s.context_tokens,
                 "context_limit": s.context_limit,
                 "utilization": s.utilization(),
                 "warning": s.is_warning(),
+                "stale": s.stale,
             })
         })
         .collect();
