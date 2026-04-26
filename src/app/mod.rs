@@ -15,6 +15,7 @@ pub mod bus;
 pub mod bus_api;
 pub mod cli;
 pub mod commands;
+pub mod config_changeset;
 pub mod config_reload;
 pub mod config_watcher;
 pub mod context;
