@@ -9,6 +9,7 @@ pub mod a2a_server;
 pub mod acp;
 pub mod adapters;
 pub mod agent;
+pub mod agent_components;
 pub mod agent_process;
 pub mod agent_registry;
 pub mod bus;
