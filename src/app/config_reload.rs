@@ -1,7 +1,7 @@
-/// Unified config hot-reload — watches deskd.yaml and restarts all restartable
+/// Unified config hot-reload — watches deskd.yaml and restarts restartable
 /// components when the config changes.
 ///
-/// Restartable components (aborted and respawned on config change):
+/// Restartable components (cancelled/aborted and respawned on config change):
 ///   - Adapters (Telegram, Discord)
 ///   - Schedule watcher
 ///   - Reminder runner
@@ -15,55 +15,24 @@
 ///
 /// System prompt changes are still injected via bus message (existing pattern
 /// in config_watcher.rs) rather than restarting the worker.
-use tokio::task::JoinHandle;
+///
+/// # Graceful adapter shutdown (Part A)
+///
+/// Adapters that support cooperative cancellation (currently Telegram) are
+/// cancelled via their `CancellationToken` first, giving them up to 1 second
+/// to drain in-flight messages before the task handle is aborted.
+///
+/// # Selective reload (Part B)
+///
+/// `classify_config_change` inspects what actually changed and returns a
+/// `ConfigChangeset` so only the affected components are restarted, avoiding
+/// unnecessary adapter disruption on system-prompt-only or schedule-only edits.
 use tracing::{info, warn};
 
+use crate::app::agent_components::AgentComponents;
+use crate::app::config_changeset::{ConfigChangeset, classify_config_change};
 use crate::app::{adapters, config_watcher, schedule, worker};
 use crate::config;
-
-/// Holds all restartable component handles for a single agent.
-pub struct AgentComponents {
-    pub adapter_handles: Vec<JoinHandle<()>>,
-    pub schedule_watcher: Option<JoinHandle<()>>,
-    pub config_watcher: Option<JoinHandle<()>>,
-    pub reminder_runner: Option<JoinHandle<()>>,
-    pub sub_agent_handles: Vec<JoinHandle<()>>,
-}
-
-impl AgentComponents {
-    /// Abort all restartable components.
-    pub fn abort_all(&mut self) {
-        for h in self.adapter_handles.drain(..) {
-            h.abort();
-        }
-        if let Some(h) = self.schedule_watcher.take() {
-            h.abort();
-        }
-        if let Some(h) = self.config_watcher.take() {
-            h.abort();
-        }
-        if let Some(h) = self.reminder_runner.take() {
-            h.abort();
-        }
-        for h in self.sub_agent_handles.drain(..) {
-            h.abort();
-        }
-    }
-
-    /// Return a summary string of component counts.
-    pub fn summary(&self) -> String {
-        format!(
-            "adapters={}, schedules={}, sub_agents={}",
-            self.adapter_handles.len(),
-            if self.schedule_watcher.is_some() {
-                1
-            } else {
-                0
-            },
-            self.sub_agent_handles.len(),
-        )
-    }
-}
 
 /// Spawn all restartable components for an agent and return their handles.
 pub async fn spawn_components(
@@ -76,6 +45,7 @@ pub async fn spawn_components(
 ) -> anyhow::Result<AgentComponents> {
     let mut components = AgentComponents {
         adapter_handles: Vec::new(),
+        adapter_cancel_tokens: Vec::new(),
         schedule_watcher: None,
         config_watcher: None,
         reminder_runner: None,
@@ -83,7 +53,7 @@ pub async fn spawn_components(
     };
 
     // Adapters (Telegram, Discord, etc.)
-    for adapter in adapters::build_adapters(def, user_cfg, admin_telegram_ids) {
+    for (adapter, cancel_token) in adapters::build_adapters(def, user_cfg, admin_telegram_ids) {
         let bus = bus_socket.to_string();
         let name = agent_name.to_string();
         let adapter_name = adapter.name().to_string();
@@ -93,6 +63,7 @@ pub async fn spawn_components(
             }
         });
         components.adapter_handles.push(handle);
+        components.adapter_cancel_tokens.push(cancel_token);
     }
 
     // Schedule watcher
@@ -200,11 +171,67 @@ pub async fn spawn_components(
     Ok(components)
 }
 
-/// Watch the agent's deskd.yaml for changes and hot-reload all restartable components.
+/// Spawn only adapter components and append them to existing `components`.
+async fn spawn_adapters(
+    def: &config::AgentDef,
+    user_cfg: Option<&config::UserConfig>,
+    admin_telegram_ids: &[i64],
+    bus_socket: &str,
+    agent_name: &str,
+    components: &mut AgentComponents,
+) {
+    for (adapter, cancel_token) in adapters::build_adapters(def, user_cfg, admin_telegram_ids) {
+        let bus = bus_socket.to_string();
+        let name = agent_name.to_string();
+        let adapter_name = adapter.name().to_string();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = adapter.run(bus, name).await {
+                tracing::error!(adapter = %adapter_name, error = %e, "adapter failed");
+            }
+        });
+        components.adapter_handles.push(handle);
+        components.adapter_cancel_tokens.push(cancel_token);
+    }
+}
+
+/// Spawn only schedule/reminder components and store them in `components`.
+fn spawn_schedules(
+    def: &config::AgentDef,
+    bus_socket: &str,
+    agent_name: &str,
+    cfg_path: &str,
+    components: &mut AgentComponents,
+) {
+    {
+        let bus = bus_socket.to_string();
+        let name = agent_name.to_string();
+        let config = cfg_path.to_string();
+        let home = def.work_dir.clone();
+        let handle = tokio::spawn(async move {
+            schedule::watch_and_reload(config, bus, name, home).await;
+        });
+        components.schedule_watcher = Some(handle);
+    }
+    {
+        let bus = bus_socket.to_string();
+        let name = agent_name.to_string();
+        let handle = tokio::spawn(async move {
+            schedule::run_reminders(bus, name).await;
+        });
+        components.reminder_runner = Some(handle);
+    }
+}
+
+/// Watch the agent's deskd.yaml for changes and hot-reload components selectively.
 ///
-/// Polls the file mtime every 30 seconds. On change, aborts all restartable
-/// components, reloads config, and respawns them. Bus server, main worker,
-/// bus API, and workflow engine are NOT affected.
+/// Polls the file mtime every 30 seconds. On change, uses `classify_config_change`
+/// to determine which components need restarting:
+///   - `system_prompt_only` → nothing restarted (system_prompt injected via bus by config_watcher)
+///   - `adapters_changed` → cooperative cancel + respawn adapters only
+///   - `schedules_changed` → abort + respawn schedule_watcher only
+///   - otherwise → full abort_all + respawn
+///
+/// Bus server, main worker, bus API, and workflow engine are never affected.
 pub async fn watch_and_reload(
     def: config::AgentDef,
     initial_components: AgentComponents,
@@ -215,6 +242,8 @@ pub async fn watch_and_reload(
 ) {
     let mut components = initial_components;
     let mut last_modified = file_mtime(&cfg_path);
+    // Track the last known config for diffing.
+    let mut last_user_cfg = config::UserConfig::load(&cfg_path).ok();
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -225,30 +254,91 @@ pub async fn watch_and_reload(
         }
         last_modified = current_mtime;
 
-        info!(agent = %agent_name, "config file changed, reloading all restartable components");
-
-        // Abort all running restartable components.
-        let old_summary = components.summary();
-        components.abort_all();
-        info!(agent = %agent_name, old = %old_summary, "aborted old components");
+        info!(agent = %agent_name, "config file changed, analysing diff");
 
         // Reload config.
-        let user_cfg = match config::UserConfig::load(&cfg_path) {
-            Ok(cfg) => Some(cfg),
+        let new_user_cfg = match config::UserConfig::load(&cfg_path) {
+            Ok(cfg) => cfg,
             Err(e) => {
                 warn!(
                     agent = %agent_name,
                     error = %e,
-                    "failed to reload config, components stopped"
+                    "failed to reload config, components unchanged"
                 );
                 continue;
             }
         };
 
-        // Respawn all restartable components.
+        // Classify what changed.
+        let changeset = if let Some(ref old_cfg) = last_user_cfg {
+            classify_config_change(old_cfg, &new_user_cfg)
+        } else {
+            // No previous config — treat everything as changed.
+            ConfigChangeset {
+                adapters_changed: true,
+                schedules_changed: true,
+                sub_agents_changed: true,
+                system_prompt_only: false,
+            }
+        };
+        last_user_cfg = Some(new_user_cfg.clone());
+
+        if changeset.system_prompt_only {
+            // system_prompt_only: config_watcher.rs injects the new prompt via bus.
+            // No adapter or schedule disruption needed.
+            info!(agent = %agent_name, "system_prompt changed only — no component restart needed");
+            continue;
+        }
+
+        if !changeset.adapters_changed
+            && !changeset.schedules_changed
+            && !changeset.sub_agents_changed
+        {
+            // Only non-restartable fields changed (e.g. mcp_config, context config).
+            info!(agent = %agent_name, "config change requires no component restart");
+            continue;
+        }
+
+        // Selective restart.
+        if changeset.adapters_changed
+            && !changeset.schedules_changed
+            && !changeset.sub_agents_changed
+        {
+            info!(agent = %agent_name, "adapter config changed — restarting adapters only");
+            components.abort_adapters().await;
+            spawn_adapters(
+                &def,
+                Some(&new_user_cfg),
+                &admin_telegram_ids,
+                &bus_socket,
+                &agent_name,
+                &mut components,
+            )
+            .await;
+            info!(agent = %agent_name, adapters = components.adapter_handles.len(), "adapters restarted");
+            continue;
+        }
+
+        if changeset.schedules_changed
+            && !changeset.adapters_changed
+            && !changeset.sub_agents_changed
+        {
+            info!(agent = %agent_name, "schedule config changed — restarting schedules only");
+            components.abort_schedules();
+            spawn_schedules(&def, &bus_socket, &agent_name, &cfg_path, &mut components);
+            info!(agent = %agent_name, "schedules restarted");
+            continue;
+        }
+
+        // Full restart for combined or sub-agent changes.
+        info!(agent = %agent_name, "config change requires full component restart");
+        let old_summary = components.summary();
+        components.abort_all().await;
+        info!(agent = %agent_name, old = %old_summary, "aborted old components");
+
         match spawn_components(
             &def,
-            user_cfg.as_ref(),
+            Some(&new_user_cfg),
             &admin_telegram_ids,
             &bus_socket,
             &agent_name,
@@ -283,37 +373,6 @@ fn file_mtime(path: &str) -> Option<std::time::SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_agent_components_summary() {
-        let components = AgentComponents {
-            adapter_handles: Vec::new(),
-            schedule_watcher: None,
-            config_watcher: None,
-            reminder_runner: None,
-            sub_agent_handles: Vec::new(),
-        };
-        assert_eq!(
-            components.summary(),
-            "adapters=0, schedules=0, sub_agents=0"
-        );
-    }
-
-    #[test]
-    fn test_agent_components_abort_all_empty() {
-        let mut components = AgentComponents {
-            adapter_handles: Vec::new(),
-            schedule_watcher: None,
-            config_watcher: None,
-            reminder_runner: None,
-            sub_agent_handles: Vec::new(),
-        };
-        // Should not panic on empty components.
-        components.abort_all();
-        assert!(components.adapter_handles.is_empty());
-        assert!(components.schedule_watcher.is_none());
-        assert!(components.sub_agent_handles.is_empty());
-    }
 
     #[test]
     fn test_file_mtime_missing() {
