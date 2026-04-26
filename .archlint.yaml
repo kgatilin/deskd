@@ -3,14 +3,34 @@ rules:
     enabled: true
     error_on_violation: false
     level: telemetry
-    threshold: 10  # measured: max fan-out ~9 (worker.rs) after app/domain/infra/ports refactor
+    threshold: 10  # measured: src::app=34 (container), commands=16, workflow=14, worker=12
   fan_in:
     enabled: true
     error_on_violation: false
     level: telemetry
-    threshold: 14  # measured: domain types naturally high (statemachine=13, message=11, config=11)
+    threshold: 14  # measured: domain=56, app=41, ports=22, config=22, infra=18 (aggregation points)
   dip:
     enabled: true
     error_on_violation: false
     level: telemetry
-# last reviewed: 2026-04-25
+  srp:
+    enabled: true
+    error_on_violation: false
+    level: telemetry
+    threshold: 10  # measured: mcp_tools=64fns, worker=52, acp=33, graph=33, config=49
+  isp:
+    enabled: true
+    error_on_violation: false
+    level: telemetry
+    threshold: 5  # measured: ports::store TaskWriter=8 methods
+  max_lines:
+    enabled: true
+    error_on_violation: false
+    level: telemetry
+    threshold: 500  # measured: mcp_tools=1983, worker=1899, workflow=1643, config=1501
+  shotgun_surgery:
+    enabled: true
+    error_on_violation: false
+    level: telemetry
+    threshold: 10  # measured: domain=56 dependents, app=41, ports/config=22, infra=18
+# last reviewed: 2026-04-26
