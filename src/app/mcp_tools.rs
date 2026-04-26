@@ -556,6 +556,142 @@ pub(crate) async fn call_create_reminder(args: &Value) -> Result<Value> {
     }))
 }
 
+pub(crate) async fn call_list_reminders(args: &Value) -> Result<Value> {
+    let target_substr = args.get("target").and_then(|t| t.as_str());
+    let before = match args.get("before").and_then(|b| b.as_str()) {
+        Some(s) => Some(parse_at_time(s)?),
+        None => None,
+    };
+    let after = match args.get("after").and_then(|a| a.as_str()) {
+        Some(s) => Some(parse_at_time(s)?),
+        None => None,
+    };
+    let limit = args
+        .get("limit")
+        .and_then(|l| l.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(50);
+
+    let items = mcp_service::list_reminders(target_substr, before, after, limit)?;
+    let count = items.len();
+    let summary = if count == 0 {
+        "No reminders match.".to_string()
+    } else {
+        let lines: Vec<String> = items
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} → {} | {} | {}",
+                    r.get("at").and_then(|v| v.as_str()).unwrap_or("?"),
+                    r.get("target").and_then(|v| v.as_str()).unwrap_or("?"),
+                    r.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
+                    r.get("message_preview")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                )
+            })
+            .collect();
+        format!("{} reminder(s):\n{}", count, lines.join("\n"))
+    };
+    Ok(json!({
+        "content": [{ "type": "text", "text": summary }],
+        "reminders": items,
+        "isError": false
+    }))
+}
+
+pub(crate) async fn call_get_reminder(args: &Value) -> Result<Value> {
+    let id = args
+        .get("id")
+        .and_then(|i| i.as_str())
+        .context("missing id")?;
+    let reminder = mcp_service::get_reminder(id)?;
+    let text = format!(
+        "id={} at={} target={}\nmessage:\n{}",
+        reminder.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
+        reminder.get("at").and_then(|v| v.as_str()).unwrap_or("?"),
+        reminder
+            .get("target")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?"),
+        reminder
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    );
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "reminder": reminder,
+        "isError": false
+    }))
+}
+
+pub(crate) async fn call_cancel_reminder(args: &Value) -> Result<Value> {
+    let id = args
+        .get("id")
+        .and_then(|i| i.as_str())
+        .context("missing id")?;
+    let result = mcp_service::cancel_reminder(id)?;
+    let cancelled = result
+        .get("cancelled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let text = if cancelled {
+        format!("Reminder {} cancelled.", id)
+    } else {
+        format!(
+            "Reminder {} not found (already fired or never existed).",
+            id
+        )
+    };
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "cancelled": cancelled,
+        "id": id,
+        "isError": false
+    }))
+}
+
+pub(crate) async fn call_update_reminder(args: &Value) -> Result<Value> {
+    let id = args
+        .get("id")
+        .and_then(|i| i.as_str())
+        .context("missing id")?;
+
+    let at_str = args.get("at").and_then(|a| a.as_str());
+    let in_str = args.get("in").and_then(|i| i.as_str());
+    let new_at = if let Some(at) = at_str {
+        Some(parse_at_time(at)?)
+    } else if let Some(dur) = in_str {
+        let secs = crate::app::commands::parse_duration_secs(dur)?;
+        Some(chrono::Utc::now() + chrono::Duration::seconds(secs as i64))
+    } else {
+        None
+    };
+    let new_target = args.get("target").and_then(|t| t.as_str());
+    let new_message = args.get("message").and_then(|m| m.as_str());
+
+    if new_at.is_none() && new_target.is_none() && new_message.is_none() {
+        bail!("update_reminder requires at least one of: 'at', 'in', 'target', 'message'");
+    }
+
+    let updated = mcp_service::update_reminder(id, new_at, new_target, new_message)?;
+    let text = format!(
+        "Reminder {} updated: at={} target={}",
+        id,
+        updated.get("at").and_then(|v| v.as_str()).unwrap_or("?"),
+        updated
+            .get("target")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?"),
+    );
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "reminder": updated,
+        "isError": false
+    }))
+}
+
 /// Parse a human-friendly time string into a UTC DateTime.
 ///
 /// Supported formats:
