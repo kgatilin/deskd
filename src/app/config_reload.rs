@@ -102,6 +102,13 @@ pub async fn spawn_components(
     // Sub-agent workers
     if let Some(ucfg) = user_cfg {
         for sub in &ucfg.agents {
+            let is_context = matches!(
+                sub.kind,
+                crate::domain::config_types::ConfigAgentKind::Context
+            );
+
+            // Context agents are lightweight Q&A workers — no MCP server, no
+            // tool access. Executor agents get the full deskd MCP plumbing.
             let mcp_json = serde_json::json!({
                 "mcpServers": {
                     "deskd": {
@@ -114,6 +121,22 @@ pub async fn spawn_components(
 
             let context_cfg = sub.context.clone().or_else(|| ucfg.context.clone());
 
+            let mut command: Vec<String> = vec![
+                "claude".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "--verbose".into(),
+                "--dangerously-skip-permissions".into(),
+                "--model".into(),
+                sub.model.clone(),
+                "--max-turns".into(),
+                ucfg.max_turns.to_string(),
+            ];
+            if !is_context {
+                command.push("--mcp-config".into());
+                command.push(mcp_json);
+            }
+
             let sub_cfg = crate::app::agent::AgentConfig {
                 name: sub.name.clone(),
                 model: sub.model.clone(),
@@ -122,23 +145,12 @@ pub async fn spawn_components(
                 max_turns: ucfg.max_turns,
                 unix_user: def.unix_user.clone(),
                 budget_usd: def.budget_usd,
-                command: vec![
-                    "claude".into(),
-                    "--output-format".into(),
-                    "stream-json".into(),
-                    "--verbose".into(),
-                    "--dangerously-skip-permissions".into(),
-                    "--model".into(),
-                    sub.model.clone(),
-                    "--max-turns".into(),
-                    ucfg.max_turns.to_string(),
-                    "--mcp-config".into(),
-                    mcp_json,
-                ],
+                command,
                 config_path: Some(cfg_path.to_string()),
                 container: def.container.clone(),
                 session: sub.session.clone(),
                 runtime: sub.runtime.clone(),
+                kind: sub.kind.clone(),
                 context: context_cfg,
                 compact_threshold: sub.compact_threshold,
                 auto_compact_threshold_tokens: sub

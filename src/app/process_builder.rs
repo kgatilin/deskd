@@ -247,7 +247,7 @@ pub fn split_command(command: &[String]) -> (&str, &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::config_types::{ConfigAgentRuntime, ConfigSessionMode};
+    use crate::domain::config_types::{ConfigAgentKind, ConfigAgentRuntime, ConfigSessionMode};
     use std::collections::HashMap;
 
     #[test]
@@ -388,6 +388,7 @@ mod tests {
             container: Some(container),
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            kind: ConfigAgentKind::default(),
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,
@@ -439,6 +440,7 @@ mod tests {
             container: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            kind: ConfigAgentKind::default(),
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,
@@ -463,6 +465,7 @@ mod tests {
             container: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            kind: ConfigAgentKind::default(),
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,
@@ -498,6 +501,7 @@ mod tests {
             container: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            kind: ConfigAgentKind::default(),
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,
@@ -522,6 +526,7 @@ mod tests {
             container: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            kind: ConfigAgentKind::default(),
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: Some(500_000),
@@ -547,6 +552,7 @@ mod tests {
             container: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            kind: ConfigAgentKind::default(),
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,
@@ -570,6 +576,7 @@ mod tests {
             container: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            kind: ConfigAgentKind::default(),
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: Some(400_000),

@@ -1,4 +1,6 @@
-use crate::domain::config_types::{ConfigAgentRuntime, ConfigContextConfig, ConfigSessionMode};
+use crate::domain::config_types::{
+    ConfigAgentKind, ConfigAgentRuntime, ConfigContextConfig, ConfigSessionMode,
+};
 use crate::infra::dto::ConfigModelDef;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -511,6 +513,11 @@ pub struct SubAgentDef {
     /// Agent runtime protocol: claude (default) or acp.
     #[serde(default)]
     pub runtime: ConfigAgentRuntime,
+    /// Worker loop kind: executor (default, full lifecycle) or context (lightweight Q&A).
+    /// Context agents have no tool access, no task queue, no inbox — they answer
+    /// questions from their loaded context with minimal overhead.
+    #[serde(default)]
+    pub kind: ConfigAgentKind,
     /// Per-agent context configuration (overrides global UserConfig.context).
     #[serde(default)]
     pub context: Option<ConfigContextConfig>,
@@ -1477,6 +1484,7 @@ agents:
             env: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            kind: ConfigAgentKind::default(),
             context: None,
             compact_threshold: None,
             compact_strategy: None,
@@ -1500,6 +1508,7 @@ agents:
             env: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            kind: ConfigAgentKind::default(),
             context: None,
             compact_threshold: None,
             compact_strategy: None,

@@ -25,6 +25,21 @@ pub enum AgentRuntime {
     Memory,
 }
 
+/// Worker loop kind: full executor or lightweight context agent.
+///
+/// Executor agents go through the full task lifecycle: queue, inbox,
+/// progress tracking, tool use. Context agents are lightweight Q&A
+/// responders — they answer questions from their loaded context with
+/// no tool access, no task queue, no inbox.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AgentKind {
+    /// Full task lifecycle with tools, inbox, queue, progress (default).
+    #[default]
+    Executor,
+    /// Lightweight Q&A from loaded context — no tools, no queue, no inbox.
+    Context,
+}
+
 /// Domain-level representation of an agent with capabilities and status.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Agent {
@@ -178,5 +193,15 @@ mod tests {
         let rt = AgentRuntime::Memory;
         assert_ne!(rt, AgentRuntime::Claude);
         assert_ne!(rt, AgentRuntime::Acp);
+    }
+
+    #[test]
+    fn default_agent_kind_is_executor() {
+        assert_eq!(AgentKind::default(), AgentKind::Executor);
+    }
+
+    #[test]
+    fn agent_kind_variants_distinct() {
+        assert_ne!(AgentKind::Executor, AgentKind::Context);
     }
 }
