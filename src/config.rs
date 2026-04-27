@@ -411,6 +411,12 @@ pub struct UserConfig {
     /// not set one. Built-in fallback is `DEFAULT_AUTO_COMPACT_THRESHOLD` (300k).
     #[serde(default)]
     pub auto_compact_threshold_tokens: Option<u64>,
+    /// Optional directory of standalone agent files (`*.agent.md`).
+    /// Path is resolved relative to this deskd.yaml's parent directory.
+    /// File-defined agents merge into `agents`; on name collision the file
+    /// definition replaces the inline one. See `infra::agent_file`.
+    #[serde(default)]
+    pub agents_dir: Option<String>,
 }
 
 /// An A2A skill advertised in the Agent Card (per A2A spec).
@@ -624,10 +630,37 @@ impl UserConfig {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read user config: {}", path))?;
         let expanded = expand_env_vars(&raw);
-        let cfg: UserConfig =
+        let mut cfg: UserConfig =
             serde_yaml::from_str(&expanded).context("failed to parse user config")?;
+        cfg.merge_agents_dir(path)?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// If `agents_dir` is set, load every `*.agent.md` file beneath it and
+    /// merge the resulting sub-agents and schedules into this config.
+    /// `config_path` is the path to this deskd.yaml; its parent directory
+    /// is the base for resolving a relative `agents_dir`. On name collision
+    /// the file-defined agent replaces the inline one.
+    fn merge_agents_dir(&mut self, config_path: &str) -> Result<()> {
+        let Some(dir_rel) = self.agents_dir.clone() else {
+            return Ok(());
+        };
+        let base = std::path::Path::new(config_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let agents_dir = base.join(&dir_rel);
+        let loaded = crate::infra::agent_file::load_agent_dir(&agents_dir)
+            .with_context(|| format!("failed to load agents_dir: {}", agents_dir.display()))?;
+        for entry in loaded {
+            if let Some(idx) = self.agents.iter().position(|a| a.name == entry.agent.name) {
+                self.agents[idx] = entry.agent;
+            } else {
+                self.agents.push(entry.agent);
+            }
+            self.schedules.extend(entry.schedules);
+        }
+        Ok(())
     }
 
     /// Validate config invariants that serde can't express on its own.
@@ -1515,5 +1548,86 @@ agents:
             auto_compact_threshold_tokens: None,
         };
         assert!(sub.validate_work_dir("/tmp/parent").is_err());
+    }
+
+    // ─── agents_dir merge tests ──────────────────────────────────────────────
+
+    fn write_file(path: &std::path::Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn user_config_load_without_agents_dir_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("deskd.yaml");
+        write_file(
+            &cfg_path,
+            "model: claude-sonnet-4-6\nagents:\n  - name: inline\n    model: haiku\n    subscribe: []\n",
+        );
+        let cfg = UserConfig::load(cfg_path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.agents.len(), 1);
+        assert_eq!(cfg.agents[0].name, "inline");
+        assert!(cfg.agents_dir.is_none());
+        assert!(cfg.schedules.is_empty());
+    }
+
+    #[test]
+    fn user_config_load_merges_agents_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_subdir = dir.path().join("agents.d");
+        std::fs::create_dir_all(&agents_subdir).unwrap();
+        write_file(
+            &agents_subdir.join("blog.agent.md"),
+            "---\nmodel: claude-sonnet-4-6\njobs:\n  - cron: \"0 30 8 * * *\"\n    prompt: \"morning\"\n---\n\nblog body prompt\n",
+        );
+        let cfg_path = dir.path().join("deskd.yaml");
+        write_file(
+            &cfg_path,
+            "model: claude-sonnet-4-6\nagents_dir: agents.d\nagents:\n  - name: inline\n    model: haiku\n    subscribe: []\n",
+        );
+
+        let cfg = UserConfig::load(cfg_path.to_str().unwrap()).unwrap();
+        let names: Vec<_> = cfg.agents.iter().map(|a| a.name.as_str()).collect();
+        assert!(names.contains(&"inline"));
+        assert!(names.contains(&"blog"));
+        assert_eq!(cfg.schedules.len(), 1);
+        assert_eq!(cfg.schedules[0].target, "agent:blog");
+    }
+
+    #[test]
+    fn user_config_load_file_overrides_inline_on_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_subdir = dir.path().join("agents.d");
+        std::fs::create_dir_all(&agents_subdir).unwrap();
+        write_file(
+            &agents_subdir.join("worker.agent.md"),
+            "---\nname: worker\nmodel: claude-opus-4-6\n---\n\nfile body\n",
+        );
+        let cfg_path = dir.path().join("deskd.yaml");
+        write_file(
+            &cfg_path,
+            "model: claude-sonnet-4-6\nagents_dir: agents.d\nagents:\n  - name: worker\n    model: haiku\n    subscribe: []\n    system_prompt: inline body\n",
+        );
+
+        let cfg = UserConfig::load(cfg_path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.agents.len(), 1);
+        assert_eq!(cfg.agents[0].name, "worker");
+        assert_eq!(cfg.agents[0].model, "claude-opus-4-6");
+        assert!(cfg.agents[0].system_prompt.contains("file body"));
+    }
+
+    #[test]
+    fn user_config_load_missing_agents_dir_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("deskd.yaml");
+        write_file(
+            &cfg_path,
+            "model: claude-sonnet-4-6\nagents_dir: does-not-exist\n",
+        );
+        let cfg = UserConfig::load(cfg_path.to_str().unwrap()).unwrap();
+        assert!(cfg.agents.is_empty());
     }
 }

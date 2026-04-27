@@ -1,5 +1,6 @@
 //! Infrastructure layer — concrete implementations of port traits.
 
+pub mod agent_file;
 pub mod bus_server;
 pub mod context_store;
 pub mod dto;
