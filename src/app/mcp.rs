@@ -345,6 +345,93 @@ fn handle_tools_list(
         }
     }));
 
+    tools.push(json!({
+        "name": "list_reminders",
+        "description": "List pending reminders, sorted by fire time ascending. Optionally filter by target substring or time bounds.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Optional substring to filter reminders by target."
+                },
+                "before": {
+                    "type": "string",
+                    "description": "Only include reminders scheduled before this time (same formats as create_reminder.at)."
+                },
+                "after": {
+                    "type": "string",
+                    "description": "Only include reminders scheduled after this time (same formats as create_reminder.at)."
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Maximum reminders to return (default 50)."
+                }
+            }
+        }
+    }));
+
+    tools.push(json!({
+        "name": "get_reminder",
+        "description": "Fetch the full definition of a single reminder by id (full message body, not preview).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Reminder id (uuid) returned by list_reminders or create_reminder."
+                }
+            },
+            "required": ["id"]
+        }
+    }));
+
+    tools.push(json!({
+        "name": "cancel_reminder",
+        "description": "Cancel a pending reminder by id. Idempotent: returns cancelled=false if it's already fired or never existed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Reminder id to cancel."
+                }
+            },
+            "required": ["id"]
+        }
+    }));
+
+    tools.push(json!({
+        "name": "update_reminder",
+        "description": "Update fields on an existing reminder. At least one of at/in/target/message must be provided. Atomic: scheduler never sees a partial write.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Reminder id to update."
+                },
+                "at": {
+                    "type": "string",
+                    "description": "New fire time (same formats as create_reminder.at)."
+                },
+                "in": {
+                    "type": "string",
+                    "description": "New fire time as duration from now (e.g. 30m, 1h, 2h30m)."
+                },
+                "target": {
+                    "type": "string",
+                    "description": "New bus target."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "New message payload."
+                }
+            },
+            "required": ["id"]
+        }
+    }));
+
     // Unified inbox tools
     tools.push(json!({
         "name": "list_inboxes",
@@ -708,6 +795,10 @@ async fn handle_tools_call(
             mcp_tools::call_add_persistent_agent(args, agent_name, bus_socket, internal_bus).await
         }
         "create_reminder" => mcp_tools::call_create_reminder(args).await,
+        "list_reminders" => mcp_tools::call_list_reminders(args).await,
+        "get_reminder" => mcp_tools::call_get_reminder(args).await,
+        "cancel_reminder" => mcp_tools::call_cancel_reminder(args).await,
+        "update_reminder" => mcp_tools::call_update_reminder(args).await,
         "list_inboxes" => mcp_tools::call_list_inboxes(agent_name, user_config).await,
         "read_inbox" => mcp_tools::call_read_inbox(args, agent_name, user_config).await,
         "search_inbox" => mcp_tools::call_search_inbox(args, agent_name, user_config).await,

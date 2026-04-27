@@ -67,6 +67,212 @@ pub fn create_reminder_at(
     })
 }
 
+/// One pending reminder record loaded from disk.
+struct LoadedReminder {
+    id: String,
+    at: chrono::DateTime<chrono::Utc>,
+    def: crate::config::RemindDef,
+}
+
+/// Read all reminder files from disk, parsing each into `LoadedReminder`.
+/// Files that fail to parse are skipped silently (the scheduler does the same).
+fn load_all_reminders() -> Result<Vec<LoadedReminder>> {
+    let dir = crate::config::reminders_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("read_dir {}", dir.display())),
+    };
+
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(def) = serde_json::from_str::<crate::config::RemindDef>(&content) else {
+            continue;
+        };
+        let Ok(at) = chrono::DateTime::parse_from_rfc3339(&def.at) else {
+            continue;
+        };
+        out.push(LoadedReminder {
+            id: stem.to_string(),
+            at: at.with_timezone(&chrono::Utc),
+            def,
+        });
+    }
+    Ok(out)
+}
+
+/// Truncate a message to a preview of at most `max_chars` characters,
+/// counted by Unicode scalar values to avoid splitting multi-byte chars.
+/// Newlines collapse to spaces so previews stay single-line.
+fn message_preview(message: &str, max_chars: usize) -> String {
+    let collapsed: String = message
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let truncated: String = collapsed.chars().take(max_chars).collect();
+    format!("{}…", truncated)
+}
+
+/// List pending reminders, sorted by fire time ascending.
+///
+/// Filters (all optional, AND-combined):
+/// - `target_substr` — substring match against the reminder's `target` field
+/// - `before` — only reminders firing strictly before this UTC time
+/// - `after` — only reminders firing strictly after this UTC time
+/// - `limit` — cap returned entries (default 50 at the tool layer)
+pub fn list_reminders(
+    target_substr: Option<&str>,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+    after: Option<chrono::DateTime<chrono::Utc>>,
+    limit: usize,
+) -> Result<Vec<Value>> {
+    let mut all = load_all_reminders()?;
+    all.sort_by_key(|r| r.at);
+
+    let filtered = all.into_iter().filter(|r| {
+        if let Some(s) = target_substr
+            && !r.def.target.contains(s)
+        {
+            return false;
+        }
+        if let Some(b) = before
+            && r.at >= b
+        {
+            return false;
+        }
+        if let Some(a) = after
+            && r.at <= a
+        {
+            return false;
+        }
+        true
+    });
+
+    Ok(filtered
+        .take(limit)
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "at": r.def.at,
+                "target": r.def.target,
+                "message_preview": message_preview(&r.def.message, 120),
+            })
+        })
+        .collect())
+}
+
+/// Validate a reminder id — must be a simple filename component (no slashes,
+/// no traversal, no leading dot).
+fn validate_reminder_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains("..")
+        || id.starts_with('.')
+    {
+        bail!("invalid reminder id: {:?}", id);
+    }
+    Ok(())
+}
+
+/// Path on disk for a given reminder id.
+fn reminder_path(id: &str) -> Result<PathBuf> {
+    validate_reminder_id(id)?;
+    Ok(crate::config::reminders_dir().join(format!("{}.json", id)))
+}
+
+/// Read a reminder file and return its full record as JSON.
+pub fn get_reminder(id: &str) -> Result<Value> {
+    let path = reminder_path(id)?;
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reminder not found: {}", id))?;
+    let def: crate::config::RemindDef =
+        serde_json::from_str(&content).context("failed to parse reminder file")?;
+    Ok(json!({
+        "id": id,
+        "at": def.at,
+        "target": def.target,
+        "message": def.message,
+    }))
+}
+
+/// Delete a reminder file. Idempotent: missing file returns `cancelled: false`.
+pub fn cancel_reminder(id: &str) -> Result<Value> {
+    let path = reminder_path(id)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            info!(id = %id, "cancel_reminder");
+            Ok(json!({ "cancelled": true, "id": id }))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(json!({ "cancelled": false, "id": id }))
+        }
+        Err(e) => {
+            Err(e).with_context(|| format!("failed to delete reminder file: {}", path.display()))
+        }
+    }
+}
+
+/// Update one or more fields on an existing reminder.
+///
+/// Atomicity: write to `<id>.json.tmp` then `rename` to `<id>.json` so the
+/// scheduler tick (which reads files every 10s) never observes a partial write.
+pub fn update_reminder(
+    id: &str,
+    new_at: Option<chrono::DateTime<chrono::Utc>>,
+    new_target: Option<&str>,
+    new_message: Option<&str>,
+) -> Result<Value> {
+    let path = reminder_path(id)?;
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reminder not found: {}", id))?;
+    let mut def: crate::config::RemindDef =
+        serde_json::from_str(&content).context("failed to parse reminder file")?;
+
+    if let Some(at) = new_at {
+        def.at = at.to_rfc3339();
+    }
+    if let Some(t) = new_target {
+        def.target = t.to_string();
+    }
+    if let Some(m) = new_message {
+        def.message = m.to_string();
+    }
+
+    let json_text = serde_json::to_string_pretty(&def).context("failed to serialize reminder")?;
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, json_text)
+        .with_context(|| format!("failed to write tmp file: {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &path).with_context(|| {
+        format!(
+            "failed to rename {} -> {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+
+    info!(id = %id, "update_reminder");
+    Ok(json!({
+        "id": id,
+        "at": def.at,
+        "target": def.target,
+        "message": def.message,
+    }))
+}
+
 // ─── Unified inbox ───────────────────────────────────────────────────────────
 
 /// List all inboxes with message counts.
