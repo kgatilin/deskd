@@ -18,6 +18,9 @@ pub struct ConfigChangeset {
     pub sub_agents_changed: bool,
     /// Only system_prompt changed (and nothing else requiring a restart).
     pub system_prompt_only: bool,
+    /// Names of sub-agents present in `old` but missing from `new` — their
+    /// state files should be evicted via `agent_registry::remove`.
+    pub removed_sub_agents: Vec<String>,
 }
 
 /// Compare two `UserConfig` snapshots and classify what changed.
@@ -37,11 +40,21 @@ pub fn classify_config_change(
     let system_prompt_only =
         system_prompt_changed && !adapters_changed && !schedules_changed && !sub_agents_changed;
 
+    let new_names: std::collections::HashSet<&str> =
+        new.agents.iter().map(|a| a.name.as_str()).collect();
+    let removed_sub_agents: Vec<String> = old
+        .agents
+        .iter()
+        .filter(|a| !new_names.contains(a.name.as_str()))
+        .map(|a| a.name.clone())
+        .collect();
+
     ConfigChangeset {
         adapters_changed,
         schedules_changed,
         sub_agents_changed,
         system_prompt_only,
+        removed_sub_agents,
     }
 }
 
@@ -110,6 +123,51 @@ mod tests {
         assert!(cs.schedules_changed);
         assert!(!cs.adapters_changed);
         assert!(!cs.system_prompt_only);
+    }
+
+    fn make_sub_agent(name: &str) -> crate::config::SubAgentDef {
+        crate::config::SubAgentDef {
+            name: name.into(),
+            model: "haiku".into(),
+            system_prompt: String::new(),
+            subscribe: vec![],
+            publish: None,
+            inbox_read: None,
+            scope: Default::default(),
+            can_message: None,
+            work_dir: None,
+            env: None,
+            session: Default::default(),
+            runtime: Default::default(),
+            kind: Default::default(),
+            context: None,
+            compact_threshold: None,
+            compact_strategy: None,
+            auto_compact_threshold_tokens: None,
+        }
+    }
+
+    #[test]
+    fn test_classify_removed_sub_agents() {
+        let mut old = base_config();
+        old.agents = vec![make_sub_agent("kept"), make_sub_agent("removed")];
+        let mut new = old.clone();
+        new.agents.retain(|a| a.name != "removed");
+
+        let cs = classify_config_change(&old, &new);
+        assert!(cs.sub_agents_changed);
+        assert_eq!(cs.removed_sub_agents, vec!["removed".to_string()]);
+    }
+
+    #[test]
+    fn test_classify_no_removed_when_only_added() {
+        let old = base_config();
+        let mut new = old.clone();
+        new.agents = vec![make_sub_agent("added")];
+
+        let cs = classify_config_change(&old, &new);
+        assert!(cs.sub_agents_changed);
+        assert!(cs.removed_sub_agents.is_empty());
     }
 
     #[test]
