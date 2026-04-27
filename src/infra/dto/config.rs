@@ -11,7 +11,9 @@ use crate::domain::statemachine::{ModelDef, TransitionDef};
 use crate::domain::task::TaskCriteria;
 
 // Re-export config value types from domain.
-pub use crate::domain::config_types::{ConfigAgentRuntime, ConfigContextConfig, ConfigSessionMode};
+pub use crate::domain::config_types::{
+    ConfigAgentKind, ConfigAgentRuntime, ConfigContextConfig, ConfigSessionMode,
+};
 
 // ─── ModelDef / TransitionDef ───────────────────────────────────────────────
 

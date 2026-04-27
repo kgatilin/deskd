@@ -602,6 +602,7 @@ mod tests {
                 container: None,
                 session: Default::default(),
                 runtime: Default::default(),
+                kind: Default::default(),
                 context: None,
                 compact_threshold: None,
                 auto_compact_threshold_tokens: None,

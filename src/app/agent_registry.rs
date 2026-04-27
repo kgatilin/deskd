@@ -12,7 +12,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 use crate::config::{self, ContainerConfig, UserConfig};
-use crate::domain::config_types::{ConfigAgentRuntime, ConfigContextConfig, ConfigSessionMode};
+use crate::domain::config_types::{
+    ConfigAgentKind, ConfigAgentRuntime, ConfigContextConfig, ConfigSessionMode,
+};
 
 use super::process_builder::{build_command, inject_required_flags};
 
@@ -44,6 +46,9 @@ pub struct AgentConfig {
     /// Agent runtime protocol: claude (default) or acp.
     #[serde(default)]
     pub runtime: ConfigAgentRuntime,
+    /// Worker loop kind: executor (default, full lifecycle) or context (lightweight Q&A).
+    #[serde(default)]
+    pub kind: ConfigAgentKind,
     /// Context system configuration (main branch, compaction).
     #[serde(default)]
     pub context: Option<ConfigContextConfig>,
@@ -260,6 +265,7 @@ pub async fn create_or_recover(
         container: def.container.clone(),
         session: ConfigSessionMode::default(),
         runtime: def.runtime.clone(),
+        kind: ConfigAgentKind::default(),
         context: user_cfg.and_then(|c| c.context.clone()),
         compact_threshold: None,
         auto_compact_threshold_tokens: user_cfg.and_then(|c| c.auto_compact_threshold_tokens),
@@ -682,6 +688,7 @@ pub async fn spawn_ephemeral(
         container: None,
         session: ConfigSessionMode::default(),
         runtime: ConfigAgentRuntime::default(),
+        kind: ConfigAgentKind::default(),
         context: None,
         compact_threshold: None,
         auto_compact_threshold_tokens: None,
@@ -738,6 +745,7 @@ created_at: "2024-01-01T00:00:00Z"
             container: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            kind: ConfigAgentKind::default(),
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,
@@ -802,6 +810,7 @@ created_at: "2024-01-01T00:00:00Z"
             container: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            kind: ConfigAgentKind::default(),
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,

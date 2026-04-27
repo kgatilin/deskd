@@ -10,7 +10,7 @@ use crate::app::agent::{self, Executor, TokenUsage};
 use crate::app::message::Message;
 use crate::app::tasklog;
 use crate::app::unified_inbox;
-use crate::domain::agent::AgentRuntime;
+use crate::domain::agent::{AgentKind, AgentRuntime};
 use crate::domain::config_types::ConfigSessionMode;
 use crate::domain::events::DomainEvent;
 
@@ -191,19 +191,29 @@ pub async fn run(
     // Start persistent agent process (reused across tasks).
     let effective_bus = bus_socket.as_deref().unwrap_or(socket_path).to_string();
     let agent_runtime: AgentRuntime = initial_state.config.runtime.clone().into();
+    let agent_kind: AgentKind = initial_state.config.kind.clone().into();
     let mut process = start_executor(name, &effective_bus, &agent_runtime).await?;
 
     // Build task limits from agent config — enforced in real-time during tasks.
+    // Context agents get a tight max_turns cap for fast Q&A (no tool loops).
+    let configured_max_turns = if initial_state.config.max_turns > 0 {
+        Some(initial_state.config.max_turns)
+    } else {
+        None
+    };
+    let max_turns = match agent_kind {
+        AgentKind::Context => Some(match configured_max_turns {
+            Some(t) => t.min(3),
+            None => 3,
+        }),
+        AgentKind::Executor => configured_max_turns,
+    };
     let limits = agent::TaskLimits {
-        max_turns: if initial_state.config.max_turns > 0 {
-            Some(initial_state.config.max_turns)
-        } else {
-            None
-        },
+        max_turns,
         budget_usd: Some(budget_usd),
     };
 
-    info!(agent = %name, runtime = ?agent_runtime, "agent process ready, waiting for tasks");
+    info!(agent = %name, runtime = ?agent_runtime, kind = ?agent_kind, "agent process ready, waiting for tasks");
 
     // Startup recovery: handle orphaned active tasks assigned to this agent.
     recover_orphaned_tasks(name, task_store);
@@ -291,6 +301,24 @@ pub async fn run(
                 continue;
             }
         };
+
+        // ── Context agent: lightweight Q&A path ─────────────────────────
+        // Context agents only respond to direct questions (target == agent:{name}).
+        // Fan-out subscriptions (queue:tasks, telegram.in:*) are dropped early
+        // so the agent stays focused. Combined with the clamped max_turns set
+        // above, this gives short-loop answers for context lookups.
+        if agent_kind == AgentKind::Context {
+            let direct_target = format!("agent:{}", name);
+            if msg.target != direct_target {
+                debug!(
+                    agent = %name,
+                    source = %msg.source,
+                    target = %msg.target,
+                    "context: skipping non-direct message"
+                );
+                continue;
+            }
+        }
 
         // ── Memory agent: inject bus events as context ──────────────────
         // For memory agents, messages that are NOT direct questions

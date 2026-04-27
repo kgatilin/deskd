@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::agent::{AgentRuntime, SessionMode};
+use super::agent::{AgentKind, AgentRuntime, SessionMode};
 use super::context::ContextConfig;
 
 // ─── SessionMode / AgentRuntime ─────────────────────────────────────────────
@@ -68,6 +68,35 @@ impl From<&AgentRuntime> for ConfigAgentRuntime {
     }
 }
 
+// ─── AgentKind ──────────────────────────────────────────────────────────────
+
+/// Config-level agent kind (serde for YAML parsing).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigAgentKind {
+    #[default]
+    Executor,
+    Context,
+}
+
+impl From<ConfigAgentKind> for AgentKind {
+    fn from(dto: ConfigAgentKind) -> Self {
+        match dto {
+            ConfigAgentKind::Executor => AgentKind::Executor,
+            ConfigAgentKind::Context => AgentKind::Context,
+        }
+    }
+}
+
+impl From<&AgentKind> for ConfigAgentKind {
+    fn from(k: &AgentKind) -> Self {
+        match k {
+            AgentKind::Executor => ConfigAgentKind::Executor,
+            AgentKind::Context => ConfigAgentKind::Context,
+        }
+    }
+}
+
 // ─── ContextConfig ─────────────────────────────────────────────────────────
 
 /// Config-level context configuration (serde for YAML parsing).
@@ -119,5 +148,27 @@ mod tests {
         let yaml = "memory";
         let rt: ConfigAgentRuntime = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(rt, ConfigAgentRuntime::Memory);
+    }
+
+    #[test]
+    fn config_agent_kind_default_is_executor() {
+        assert_eq!(ConfigAgentKind::default(), ConfigAgentKind::Executor);
+    }
+
+    #[test]
+    fn config_agent_kind_roundtrip() {
+        let dto = ConfigAgentKind::Context;
+        let domain: AgentKind = dto.into();
+        assert_eq!(domain, AgentKind::Context);
+        let back: ConfigAgentKind = (&domain).into();
+        assert_eq!(back, ConfigAgentKind::Context);
+    }
+
+    #[test]
+    fn config_agent_kind_serde() {
+        let executor: ConfigAgentKind = serde_yaml::from_str("executor").unwrap();
+        assert_eq!(executor, ConfigAgentKind::Executor);
+        let context: ConfigAgentKind = serde_yaml::from_str("context").unwrap();
+        assert_eq!(context, ConfigAgentKind::Context);
     }
 }

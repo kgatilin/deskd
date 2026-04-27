@@ -38,6 +38,7 @@ pub async fn handle(action: AgentAction) -> Result<()> {
                 container: None,
                 session: crate::domain::config_types::ConfigSessionMode::default(),
                 runtime: crate::domain::config_types::ConfigAgentRuntime::default(),
+                kind: crate::domain::config_types::ConfigAgentKind::default(),
                 context: None,
                 compact_threshold: None,
                 auto_compact_threshold_tokens: None,
