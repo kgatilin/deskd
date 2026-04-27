@@ -256,15 +256,20 @@ pub async fn watch_and_reload(
     let mut last_modified = file_mtime(&cfg_path);
     // Track the last known config for diffing.
     let mut last_user_cfg = config::UserConfig::load(&cfg_path).ok();
+    // Track the agents_dir directory mtime so that creating/removing/renaming
+    // *.agent.md files (which doesn't touch deskd.yaml) still triggers reload.
+    let mut last_agents_dir_mtime = agents_dir_mtime(&cfg_path, last_user_cfg.as_ref());
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
         let current_mtime = file_mtime(&cfg_path);
-        if current_mtime == last_modified {
+        let current_agents_dir_mtime = agents_dir_mtime(&cfg_path, last_user_cfg.as_ref());
+        if current_mtime == last_modified && current_agents_dir_mtime == last_agents_dir_mtime {
             continue;
         }
         last_modified = current_mtime;
+        last_agents_dir_mtime = current_agents_dir_mtime;
 
         info!(agent = %agent_name, "config file changed, analysing diff");
 
@@ -291,6 +296,7 @@ pub async fn watch_and_reload(
                 schedules_changed: true,
                 sub_agents_changed: true,
                 system_prompt_only: false,
+                removed_sub_agents: Vec::new(),
             }
         };
         last_user_cfg = Some(new_user_cfg.clone());
@@ -348,6 +354,21 @@ pub async fn watch_and_reload(
         components.abort_all().await;
         info!(agent = %agent_name, old = %old_summary, "aborted old components");
 
+        // Evict state files for sub-agents that vanished from config (e.g. their
+        // *.agent.md was deleted). Without this they could be respawned on the
+        // next `deskd serve` because state files survive aborts.
+        for removed in &changeset.removed_sub_agents {
+            match crate::app::agent_registry::remove(removed).await {
+                Ok(()) => info!(agent = %agent_name, removed = %removed, "evicted sub-agent state"),
+                Err(e) => warn!(
+                    agent = %agent_name,
+                    removed = %removed,
+                    error = %e,
+                    "failed to evict sub-agent state"
+                ),
+            }
+        }
+
         match spawn_components(
             &def,
             Some(&new_user_cfg),
@@ -382,9 +403,43 @@ fn file_mtime(path: &str) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
+/// Resolve `user_cfg.agents_dir` relative to the deskd.yaml parent and return
+/// the latest mtime among the directory itself and any contained `*.agent.md`
+/// file. Returns `None` when no agents_dir is configured or the directory is
+/// missing — callers compare for equality so two `None`s match.
+fn agents_dir_mtime(
+    cfg_path: &str,
+    user_cfg: Option<&config::UserConfig>,
+) -> Option<std::time::SystemTime> {
+    let dir_rel = user_cfg.and_then(|c| c.agents_dir.as_deref())?;
+    let base = std::path::Path::new(cfg_path).parent()?;
+    let dir = base.join(dir_rel);
+    let mut latest = std::fs::metadata(&dir)
+        .ok()
+        .and_then(|m| m.modified().ok())?;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "md")
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".agent.md"))
+                && let Ok(meta) = entry.metadata()
+                && let Ok(mtime) = meta.modified()
+                && mtime > latest
+            {
+                latest = mtime;
+            }
+        }
+    }
+    Some(latest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_file_mtime_missing() {
@@ -394,5 +449,60 @@ mod tests {
     #[test]
     fn test_file_mtime_existing() {
         assert!(file_mtime("Cargo.toml").is_some());
+    }
+
+    #[test]
+    fn test_agents_dir_mtime_none_without_dir_field() {
+        let cfg = config::UserConfig::default();
+        // No agents_dir field configured → returns None.
+        assert!(agents_dir_mtime("/tmp/whatever.yaml", Some(&cfg)).is_none());
+    }
+
+    #[test]
+    fn test_agents_dir_mtime_changes_when_agent_file_added_or_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("deskd.yaml");
+        std::fs::write(&cfg_path, "model: haiku\nagents_dir: agents.d\n").unwrap();
+
+        let agents_dir = tmp.path().join("agents.d");
+        std::fs::create_dir(&agents_dir).unwrap();
+
+        let cfg = config::UserConfig {
+            agents_dir: Some("agents.d".into()),
+            ..Default::default()
+        };
+
+        let before = agents_dir_mtime(cfg_path.to_str().unwrap(), Some(&cfg));
+        assert!(
+            before.is_some(),
+            "empty agents_dir should still report mtime"
+        );
+
+        // Sleep briefly so mtime resolution can register a change.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let agent_file = agents_dir.join("foo.agent.md");
+        let mut f = std::fs::File::create(&agent_file).unwrap();
+        f.write_all(b"---\nname: foo\nmodel: haiku\n---\nbody\n")
+            .unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let after_create = agents_dir_mtime(cfg_path.to_str().unwrap(), Some(&cfg));
+        assert!(after_create.is_some());
+        assert_ne!(
+            before, after_create,
+            "creating *.agent.md must change mtime"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::remove_file(&agent_file).unwrap();
+
+        let after_remove = agents_dir_mtime(cfg_path.to_str().unwrap(), Some(&cfg));
+        assert!(after_remove.is_some());
+        assert_ne!(
+            after_create, after_remove,
+            "removing *.agent.md must change mtime"
+        );
     }
 }
