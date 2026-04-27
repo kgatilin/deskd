@@ -24,6 +24,8 @@ use uuid::Uuid;
 use crate::app::unified_inbox;
 use crate::config::TelegramRoute;
 
+mod attachments;
+
 /// Maximum characters per Telegram message (API limit).
 const TELEGRAM_MAX_LEN: usize = 4096;
 
@@ -91,6 +93,8 @@ pub struct TelegramAdapter {
     routes: Vec<TelegramRoute>,
     admin_telegram_ids: Vec<i64>,
     agent_name: String,
+    work_dir: String,
+    max_attachment_bytes: u64,
     cancel: CancellationToken,
 }
 
@@ -100,6 +104,8 @@ impl TelegramAdapter {
         routes: Vec<TelegramRoute>,
         admin_telegram_ids: Vec<i64>,
         agent_name: String,
+        work_dir: String,
+        max_attachment_bytes: u64,
         cancel: CancellationToken,
     ) -> Self {
         Self {
@@ -107,6 +113,8 @@ impl TelegramAdapter {
             routes,
             admin_telegram_ids,
             agent_name,
+            work_dir,
+            max_attachment_bytes,
             cancel,
         }
     }
@@ -145,6 +153,8 @@ impl super::Adapter for TelegramAdapter {
             chat_names,
             chat_route_to,
             self.admin_telegram_ids,
+            self.work_dir,
+            self.max_attachment_bytes,
             self.cancel,
         ))
     }
@@ -175,6 +185,8 @@ pub async fn run(
     chat_names: std::collections::HashMap<i64, String>,
     chat_route_to: std::collections::HashMap<i64, String>,
     admin_telegram_ids: Vec<i64>,
+    work_dir: String,
+    max_attachment_bytes: u64,
     cancel: CancellationToken,
 ) -> Result<()> {
     info!(agent = %agent_name, "starting Telegram adapter");
@@ -221,6 +233,7 @@ pub async fn run(
         let name = agent_name.clone();
         let mention_only: std::collections::HashSet<i64> = mention_only_chats.into_iter().collect();
         let cancel = cancel.clone();
+        let work_dir = work_dir.clone();
         tokio::spawn(async move {
             if let Err(e) = polling_loop(
                 bot,
@@ -232,6 +245,8 @@ pub async fn run(
                 chat_names,
                 chat_route_to,
                 admin_telegram_ids,
+                work_dir,
+                max_attachment_bytes,
                 cancel,
             )
             .await
@@ -535,6 +550,8 @@ async fn handle_message(
     chat_names: &std::collections::HashMap<i64, String>,
     chat_route_to: &std::collections::HashMap<i64, String>,
     admin_ids: &std::collections::HashSet<i64>,
+    work_dir: &str,
+    max_attachment_bytes: u64,
 ) -> Result<()> {
     // Skip messages from the bot itself to prevent reply loops.
     if msg
@@ -552,6 +569,8 @@ async fn handle_message(
 
     // Determine the task text and optional image data from the message.
     // Photos are base64-encoded in memory and passed alongside the caption.
+    // Documents / voice / audio / video are downloaded to disk and the path
+    // is annotated into the task text so the agent can read them via tools.
     // Pure text messages are passed through unchanged.
     let mut image_base64: Option<String> = None;
     let task_text: Option<String> = if let Some(photos) = msg.photo() {
@@ -575,6 +594,57 @@ async fn handle_message(
             }
         } else {
             None
+        }
+    } else if let Some(class) = attachments::classify_attachment(&msg) {
+        // Non-photo attachment: download to {work_dir}/.deskd/attachments/<chat_id>/<msg_id>/<name>
+        let chat_id = msg.chat.id.0;
+        let message_id = msg.id.0;
+        let filename = attachments::sanitize_filename(class.suggested_filename());
+        let dest = attachments::attachment_path(work_dir, chat_id, message_id, &filename);
+        let caption = msg.caption().map(|s| s.to_string());
+        let kind_label = class.kind_label();
+
+        match attachments::download_to_path(
+            bot,
+            &class.file_meta().id,
+            class.file_meta().size as u64,
+            &dest,
+            max_attachment_bytes,
+        )
+        .await
+        {
+            Ok(attachments::DownloadOutcome::Saved) => {
+                let annotation =
+                    format!("[attachment: {} saved to {}]", kind_label, dest.display());
+                Some(match caption {
+                    Some(c) if !c.trim().is_empty() => format!("{}\n{}", annotation, c),
+                    _ => annotation,
+                })
+            }
+            Ok(attachments::DownloadOutcome::OverCap { size, limit }) => {
+                let limit_mb = limit as f64 / (1024.0 * 1024.0);
+                let size_mb = size as f64 / (1024.0 * 1024.0);
+                let reply = format!(
+                    "Attachment too large: {:.1} MB exceeds {:.1} MB limit.",
+                    size_mb, limit_mb
+                );
+                let _ = bot.send_message(msg.chat.id, &reply).await;
+                debug!(
+                    chat_id = chat_id,
+                    kind = kind_label,
+                    size = size,
+                    "attachment over cap, skipped"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(chat_id = chat_id, kind = kind_label, error = %e, "failed to download attachment");
+                let annotation = format!("[attachment: {} download failed]", kind_label);
+                Some(match caption {
+                    Some(c) if !c.trim().is_empty() => format!("{}\n{}", annotation, c),
+                    _ => annotation,
+                })
+            }
         }
     } else {
         msg.text().map(|t| t.to_string())
@@ -748,6 +818,8 @@ async fn polling_loop(
     chat_names: std::collections::HashMap<i64, String>,
     chat_route_to: std::collections::HashMap<i64, String>,
     admin_telegram_ids: Vec<i64>,
+    work_dir: String,
+    max_attachment_bytes: u64,
     cancel: CancellationToken,
 ) -> Result<()> {
     let admin_ids: std::collections::HashSet<i64> = admin_telegram_ids.into_iter().collect();
@@ -794,6 +866,8 @@ async fn polling_loop(
                     &chat_names,
                     &chat_route_to,
                     &admin_ids,
+                    &work_dir,
+                    max_attachment_bytes,
                 )
                 .await
             {
