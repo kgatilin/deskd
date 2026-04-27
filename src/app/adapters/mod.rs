@@ -39,6 +39,8 @@ pub fn build_adapters(
                 routes,
                 admin_telegram_ids.to_vec(),
                 def.name.clone(),
+                def.work_dir.clone(),
+                tg.max_attachment_bytes,
                 cancel.clone(),
             )),
             cancel,

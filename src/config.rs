@@ -109,6 +109,15 @@ pub struct RoomDef {
 pub struct TelegramConfig {
     /// Bot token from @BotFather. Typically set via ${TELEGRAM_BOT_TOKEN}.
     pub token: String,
+    /// Maximum size in bytes for a single attachment (PDF, doc, voice, etc.)
+    /// before it is rejected with a friendly Telegram reply. Defaults to 20 MB.
+    /// Photos use the same cap when downloaded as multimodal images.
+    #[serde(default = "default_max_attachment_bytes")]
+    pub max_attachment_bytes: u64,
+}
+
+fn default_max_attachment_bytes() -> u64 {
+    20 * 1024 * 1024
 }
 
 /// Discord bot adapter config. Defined per-agent in workspace.yaml.
