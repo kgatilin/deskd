@@ -44,6 +44,9 @@ path = "src/main.rs"
 name = "session2graph"
 path = "src/bin/session2graph.rs"
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = []
 vendored-openssl = ["openssl"]
