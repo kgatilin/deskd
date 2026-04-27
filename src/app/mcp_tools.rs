@@ -1039,6 +1039,152 @@ pub(crate) async fn call_list_agents(
     }))
 }
 
+/// Snapshot of bus connectivity for diagnosing routing issues.
+///
+/// Reports two layers:
+/// - `internal_bus`: the lazy container-local bus used for sub-agent
+///   orchestration. `running: false` means no sub-agents have been spawned.
+/// - `host_bus`: the per-agent bus the caller is itself attached to (the
+///   socket pointed at by `DESKD_BUS_SOCKET`). The list of clients comes from
+///   sending `{"type":"list"}` and reading `list_response.clients`.
+///
+/// Sub-agent visibility on the internal bus is scoped to the caller's
+/// children — same rule as `list_agents` — so an agent cannot enumerate
+/// siblings via this tool.
+pub(crate) async fn call_bus_status(
+    caller: &str,
+    bus_socket: &str,
+    internal_bus: &Arc<Mutex<Option<InternalBus>>>,
+) -> Result<Value> {
+    // Internal bus snapshot ---------------------------------------------------
+    let internal = {
+        let ibus_guard = internal_bus.lock().await;
+        match &*ibus_guard {
+            None => json!({
+                "running": false,
+                "socket_path": Value::Null,
+                "sub_agents": [],
+            }),
+            Some(ibus) => {
+                let mut sub_agents = Vec::new();
+                for name in &ibus.sub_agents {
+                    // Same scoped visibility as list_agents.
+                    if let Ok(state) = crate::app::agent::load_state(name) {
+                        let visible = match &state.parent {
+                            Some(parent) => parent == caller,
+                            None => true,
+                        };
+                        if !visible {
+                            continue;
+                        }
+                    }
+
+                    let alive = ibus
+                        .worker_handles
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, handle)| !handle.is_finished())
+                        .unwrap_or(false);
+
+                    sub_agents.push(json!({"name": name, "alive": alive}));
+                }
+                json!({
+                    "running": true,
+                    "socket_path": ibus.socket_path,
+                    "sub_agents": sub_agents,
+                })
+            }
+        }
+    };
+
+    // Host bus snapshot -------------------------------------------------------
+    // Best-effort: a failure to query the bus is reported as `error` rather
+    // than failing the whole tool call, so the caller still gets the internal
+    // bus picture.
+    let host = match query_bus_clients(bus_socket).await {
+        Ok(clients) => json!({
+            "socket_path": bus_socket,
+            "connected_clients": clients,
+        }),
+        Err(e) => json!({
+            "socket_path": bus_socket,
+            "connected_clients": [],
+            "error": format!("{:#}", e),
+        }),
+    };
+
+    let result = json!({
+        "internal_bus": internal,
+        "host_bus": host,
+    });
+
+    Ok(json!({
+        "content": [{"type": "text", "text": serde_json::to_string_pretty(&result)?}],
+        "isError": false
+    }))
+}
+
+/// Open a short-lived connection to a bus socket and return the names of
+/// currently-connected clients.
+///
+/// Bus protocol requires a REGISTER as the first message, so we register
+/// under an ephemeral name, send `{"type":"list"}`, then read the
+/// `list_response` (which is delivered wrapped as a regular bus message
+/// with `payload.clients`).
+async fn query_bus_clients(socket_path: &str) -> Result<Vec<String>> {
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        UnixStream::connect(socket_path),
+    )
+    .await
+    .with_context(|| format!("timeout connecting to bus at {}", socket_path))?
+    .with_context(|| format!("failed to connect to bus at {}", socket_path))?;
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(read_half);
+
+    let probe_name = format!("__bus_status_probe_{}", Uuid::new_v4());
+    let empty_subs: Vec<String> = Vec::new();
+    let register = serde_json::json!({
+        "type": "register",
+        "name": probe_name,
+        "subscriptions": empty_subs,
+    });
+    let mut reg_line = serde_json::to_string(&register)?;
+    reg_line.push('\n');
+    write_half.write_all(reg_line.as_bytes()).await?;
+    write_half.write_all(b"{\"type\":\"list\"}\n").await?;
+    write_half.flush().await?;
+
+    let mut line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        reader.read_line(&mut line),
+    )
+    .await
+    .with_context(|| "timeout reading list_response from bus")??;
+
+    let msg: Value = serde_json::from_str(line.trim())
+        .with_context(|| format!("invalid list_response: {:?}", line))?;
+
+    // Server delivers the list as a BusMessage; the actual list is in
+    // `payload.clients`. Filter out our own probe registration so callers
+    // don't see it in the snapshot.
+    let clients = msg
+        .get("payload")
+        .and_then(|p| p.get("clients"))
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .filter(|n| n != &probe_name)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(clients)
+}
+
 /// Read recent log lines captured from a sub-agent's stderr or stream-json
 /// stdout. Access is restricted to sub-agents of the caller (or the caller's
 /// own logs) so an agent cannot peek at a sibling's diagnostics.
@@ -1822,6 +1968,37 @@ mod tests {
         assert_eq!(parsed["exists"], false);
         assert_eq!(parsed["source"], "stderr");
         assert!(parsed["lines"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bus_status_no_internal_bus_reports_not_running() {
+        // When the internal bus has not been initialized, bus_status must still
+        // succeed: it reports `running: false` for the internal bus and a
+        // best-effort error for the (likely unreachable) host bus.
+        let internal_bus: Arc<Mutex<Option<InternalBus>>> = Arc::new(Mutex::new(None));
+        let unique = format!("/tmp/__bus_status_test_{}.sock", Uuid::new_v4());
+        let resp = call_bus_status("test-caller", &unique, &internal_bus)
+            .await
+            .expect("bus_status must not fail when internal bus is absent");
+        let text = resp["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["internal_bus"]["running"], false);
+        assert!(
+            parsed["internal_bus"]["sub_agents"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(parsed["host_bus"]["socket_path"], unique);
+        // host bus is unreachable in test env → expect an error field but no
+        // connected clients.
+        assert!(parsed["host_bus"].get("error").is_some());
+        assert!(
+            parsed["host_bus"]["connected_clients"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
