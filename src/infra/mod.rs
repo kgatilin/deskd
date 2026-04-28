@@ -3,6 +3,7 @@
 pub mod agent_file;
 pub mod bus_server;
 pub mod context_store;
+pub mod diag;
 pub mod dto;
 pub mod memory_bus;
 pub mod memory_store;
