@@ -3,12 +3,12 @@ rules:
     enabled: true
     error_on_violation: false
     level: telemetry
-    threshold: 16  # measured: src::app=34 (container), commands=16, workflow=14, worker=12
+    threshold: 16  # measured: src::app=36 (container), commands=16, workflow=14, worker=12
   fan_in:
     enabled: true
     error_on_violation: false
     level: telemetry
-    threshold: 22  # measured: domain=56, app=41, ports=22, config=22, infra=18 (aggregation points)
+    threshold: 22  # measured: domain=56, app=43, ports=22, config=25, infra=18 (aggregation points)
   dip:
     enabled: true
     error_on_violation: false
@@ -17,7 +17,7 @@ rules:
     enabled: true
     error_on_violation: false
     level: telemetry
-    threshold: 35  # measured: mcp_tools=64fns, worker=52, acp=33, graph=33, config=49
+    threshold: 35  # measured: mcp_tools=71fns, worker=56, config=55, acp=33, graph=33
   isp:
     enabled: true
     error_on_violation: false
@@ -27,10 +27,10 @@ rules:
     enabled: true
     error_on_violation: false
     level: telemetry
-    threshold: 800  # measured: mcp_tools=1983, worker=1899, workflow=1643, config=1501
+    threshold: 800  # measured: mcp_tools=2296, worker=2041, workflow=1643, schedule=1258, graph=1384, config=1633, bus_api=1156, telegram=1481
   shotgun_surgery:
     enabled: true
     error_on_violation: false
     level: telemetry
-    threshold: 22  # measured: domain=56 dependents, app=41, ports/config=22, infra=18
-# last reviewed: 2026-04-27
+    threshold: 22  # measured: domain=56 dependents, app=43, config=25, infra=18
+# last reviewed: 2026-04-28
