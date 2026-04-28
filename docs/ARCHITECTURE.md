@@ -13,9 +13,9 @@ deskd follows a hexagonal (ports-and-adapters) architecture. Dependency directio
 ```mermaid
 flowchart TD
     main["main.rs / bin/<br/>composition root"]
-    app["app/<br/>use cases · worker · serve · MCP tools"]
+    app["app/<br/>use cases · worker · serve · MCP tools<br/>AgentProcess · AcpProcess (Executor impls)"]
     ports["ports/<br/>traits: MessageBus, Executor,<br/>TaskReader/Writer, ContextRepository,<br/>StateMachineReader/Writer<br/><i>+ bus_wire DTOs</i>"]
-    infra["infra/<br/>UnixBus · InMemoryBus<br/>TaskStore · SmStore · ContextStore<br/>AgentProcess · AcpProcess<br/><i>+ dto/ adapters</i>"]
+    infra["infra/<br/>UnixBus · InMemoryBus<br/>TaskStore · StateMachineStore · FileContextStore<br/><i>+ dto/ adapters</i>"]
     domain["domain/<br/>pure types: Message · Task ·<br/>MainBranch/Node · ModelDef/Instance ·<br/>DomainEvent · Agent · WorkItem"]
 
     main --> app
@@ -41,7 +41,7 @@ flowchart TD
 
 **Rules** (enforced by module boundaries):
 
-- `domain/` depends only on `std` and `serde_json::Value`. Pure data types, no serde derives, no I/O.
+- `domain/` depends only on `std` and `serde_json::Value`. Pure data types — no `Serialize`/`Deserialize` derives (some structs hold `serde_json::Value` payloads), no I/O.
 - `ports/` depends only on `domain/`. Defines trait interfaces (object-safe via `Pin<Box<dyn Future>>`) plus shared wire DTOs in `ports::bus_wire`.
 - `infra/` depends on `ports/` + `domain/`. Concrete implementations: Unix sockets, file stores, subprocess executors. Owns `infra::dto/` adapters that carry serde derives.
 - `app/` orchestrates domain + ports for use cases (worker loop, serve command, MCP tools, graph engine). Does not depend on `infra/` directly — it receives trait objects from the composition root.
@@ -51,7 +51,7 @@ flowchart TD
 
 ## 2. Domain Model
 
-Core types live in `src/domain/` and are referenced by traits in `src/ports/`. Domain types have **no serde derives** — wire/persistence formats are owned by adapter layers.
+Core types live in `src/domain/` and are referenced by traits in `src/ports/`. Domain structs do **not derive `Serialize`/`Deserialize`** — wire/persistence formats are owned by adapter layers. (Some types hold `serde_json::Value` payloads, but the structs themselves stay free of serde derives.)
 
 ```mermaid
 classDiagram
@@ -159,7 +159,7 @@ classDiagram
     Instance ..> ModelDef : runs
 
     note for Message "domain/message.rs<br/>no serde — pure data"
-    note for Task "domain/task.rs<br/>retry: exponential backoff"
+    note for Task "domain/task.rs<br/>retry: exponential backoff<br/>(representative subset — Task also has<br/>created_at, updated_at, created_by,<br/>cost_usd, turns, metadata, timed_out_at)"
     note for MainBranch "domain/context.rs<br/>materialized via to_system_prompt()"
     note for ModelDef "domain/statemachine.rs"
     note for DomainEvent "domain/events.rs<br/>JSON via infra::dto::bus"
@@ -170,10 +170,10 @@ classDiagram
 | Port trait | File | Implementations |
 |---|---|---|
 | `MessageBus` | `ports/bus.rs` | `infra::unix_bus::UnixBus` (prod), `infra::memory_bus::InMemoryBus` (tests) |
-| `Executor` | `ports/executor.rs` | Claude/Memory `AgentProcess`, `AcpProcess` (constructed in `app/worker.rs::start_executor`) |
+| `Executor` | `ports/executor.rs` | `app::agent_process::AgentProcess` (Claude/Memory), `app::acp::AcpProcess` — both live in `app/`, constructed in `app/worker.rs::start_executor` |
 | `TaskReader` + `TaskWriter` | `ports/store.rs` | `infra::task_store::TaskStore` (file-backed), `infra::memory_store` (tests) |
-| `StateMachineReader` + `StateMachineWriter` | `ports/store.rs` | `infra::sm_store`, `infra::memory_store` |
-| `ContextRepository` | `ports/store.rs` | `infra::context_store` |
+| `StateMachineReader` + `StateMachineWriter` | `ports/store.rs` | `infra::sm_store::StateMachineStore`, `infra::memory_store` (tests) |
+| `ContextRepository` | `ports/store.rs` | `infra::context_store::FileContextStore` |
 
 `TaskRepository` and `StateMachineRepository` are blanket-impl supertraits combining the ISP-split reader/writer pairs.
 
@@ -353,6 +353,7 @@ flowchart LR
 | `domain::MainBranch` ↔ context YAML | `infra/dto/context.rs` | `default_main_path(work_dir) = {work_dir}/.deskd/context/main.yaml` |
 | `domain::Instance` ↔ instance JSON | `infra/dto/instance.rs` | One file per state-machine instance |
 | `WorkspaceConfig`, `UserConfig` | `infra/dto/config.rs` | Parsed from `workspace.yaml` and per-agent `deskd.yaml` |
+| Config enums (`ConfigSessionMode`, `ConfigAgentRuntime`, `ConfigAgentKind`, `ConfigContextConfig`) | `domain/config_types.rs` | Pure config-shaped enums consumed by the DTOs in `infra/dto/config.rs` — they live in `domain/` because both the parsed-config layer and the runtime need to read them |
 
 `bus_wire` lives in `ports/` (not `infra/`) because the wire format is part of the contract that any `MessageBus` implementation must speak — multiple adapters share it.
 
