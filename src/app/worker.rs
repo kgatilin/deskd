@@ -121,6 +121,30 @@ pub async fn bus_connect(
     Ok(stream)
 }
 
+/// Persist a compaction summary as a tagged static node in the agent's MainBranch on disk.
+///
+/// Implements AC #4 of #222: compacted context is saved to
+/// `{work_dir}/.deskd/context/main.yaml` so it survives restarts. If the file
+/// does not yet exist, a new MainBranch is created.
+fn persist_compaction_summary(name: &str, work_dir: &str, summary: &str) -> Result<()> {
+    if summary.trim().is_empty() {
+        return Ok(());
+    }
+    let path = crate::domain::context::default_main_path(work_dir);
+    let repo = crate::app::context::new_context_store();
+    let mut branch = crate::app::context::MainBranch::load(&repo, &path)
+        .unwrap_or_else(|_| crate::app::context::MainBranch::new(name, 100_000));
+    let id = format!("compact-{}", chrono::Utc::now().to_rfc3339());
+    branch.add_static_tagged(
+        &id,
+        "Compaction Summary",
+        "system",
+        summary,
+        vec!["compaction-summary".to_string()],
+    );
+    branch.save(&repo, &path)
+}
+
 /// Helper: write an inbox entry for a completed task.
 fn write_inbox(
     name: &str,
@@ -376,6 +400,17 @@ pub async fn run(
                                 cost = turn.cost_usd,
                                 "memory: compaction completed"
                             );
+                            if let Err(e) = persist_compaction_summary(
+                                name,
+                                &initial_state.config.work_dir,
+                                &turn.response_text,
+                            ) {
+                                warn!(
+                                    agent = %name,
+                                    error = %e,
+                                    "memory: failed to persist compaction summary"
+                                );
+                            }
                             // Reset token counter — the session now has condensed history.
                             memory_tokens_estimate = 0;
                         }
@@ -684,6 +719,17 @@ pub async fn run(
                                 output_tokens = compact_turn.token_usage.output_tokens,
                                 "session compaction completed"
                             );
+                            if let Err(e) = persist_compaction_summary(
+                                name,
+                                &initial_state.config.work_dir,
+                                &compact_turn.response_text,
+                            ) {
+                                warn!(
+                                    agent = %name,
+                                    error = %e,
+                                    "session: failed to persist compaction summary"
+                                );
+                            }
                             // Reset — the session now has condensed history.
                             session_input_tokens = 0;
                         }
@@ -1923,5 +1969,73 @@ mod tests {
             compaction_triggered,
             "compaction should have triggered within 1000 events"
         );
+    }
+
+    // ─── persist_compaction_summary tests ────────────────────────────────────
+
+    #[test]
+    fn test_persist_compaction_summary_creates_file() {
+        let dir = std::env::temp_dir().join(format!("deskd-compact-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let work_dir = dir.to_str().unwrap();
+
+        let summary = "Decisions: chose A over B. Errors: hit X. Next: ship.";
+        persist_compaction_summary("test-agent", work_dir, summary).expect("persist failed");
+
+        let path = crate::domain::context::default_main_path(work_dir);
+        assert!(path.exists(), "main.yaml should exist at {:?}", path);
+
+        let repo = crate::app::context::new_context_store();
+        let branch = crate::app::context::MainBranch::load(&repo, &path).expect("load failed");
+        assert!(
+            branch.nodes.iter().any(|n| {
+                n.tags.iter().any(|t| t == "compaction-summary")
+                    && matches!(
+                        &n.kind,
+                        crate::domain::context::NodeKind::Static { content, .. }
+                            if content == summary
+                    )
+            }),
+            "expected node tagged compaction-summary with summary content"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_persist_compaction_summary_appends_to_existing() {
+        let dir = std::env::temp_dir().join(format!("deskd-compact-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let work_dir = dir.to_str().unwrap();
+
+        persist_compaction_summary("test-agent", work_dir, "first").unwrap();
+        // chrono::Utc::now() has nanosecond precision, but to be safe use distinct content.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        persist_compaction_summary("test-agent", work_dir, "second").unwrap();
+
+        let path = crate::domain::context::default_main_path(work_dir);
+        let repo = crate::app::context::new_context_store();
+        let branch = crate::app::context::MainBranch::load(&repo, &path).unwrap();
+        let count = branch
+            .nodes
+            .iter()
+            .filter(|n| n.tags.iter().any(|t| t == "compaction-summary"))
+            .count();
+        assert_eq!(count, 2, "expected two compaction-summary nodes");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_persist_compaction_summary_empty_is_noop() {
+        let dir = std::env::temp_dir().join(format!("deskd-compact-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let work_dir = dir.to_str().unwrap();
+
+        persist_compaction_summary("test-agent", work_dir, "   \n  ").unwrap();
+        let path = crate::domain::context::default_main_path(work_dir);
+        assert!(!path.exists(), "empty summary must not create file");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
