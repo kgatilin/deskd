@@ -74,6 +74,8 @@ fn make_config(name: &str) -> deskd::app::agent::AgentConfig {
         context: None,
         compact_threshold: None,
         auto_compact_threshold_tokens: None,
+        empty_completion_threshold: None,
+        empty_completion_restart_min_secs: None,
     }
 }
 

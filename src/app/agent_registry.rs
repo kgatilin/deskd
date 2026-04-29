@@ -62,6 +62,16 @@ pub struct AgentConfig {
     /// (`context_size::DEFAULT_AUTO_COMPACT_THRESHOLD`, 300k).
     #[serde(default)]
     pub auto_compact_threshold_tokens: Option<u64>,
+    /// Number of consecutive empty completions that triggers an auto-restart
+    /// of the agent worker (#424). `None` falls back to the built-in default
+    /// (3); see [`crate::app::worker::DEFAULT_EMPTY_COMPLETION_THRESHOLD`].
+    #[serde(default)]
+    pub empty_completion_threshold: Option<u32>,
+    /// Minimum seconds between auto-restarts triggered by empty-completion
+    /// detection (#424). `None` falls back to the built-in default (60); see
+    /// [`crate::app::worker::DEFAULT_EMPTY_COMPLETION_RESTART_MIN_SECS`].
+    #[serde(default)]
+    pub empty_completion_restart_min_secs: Option<u64>,
 }
 
 fn default_budget_usd() -> f64 {
@@ -108,6 +118,18 @@ pub struct AgentState {
     /// Turns accumulated in the current session (resets on session_id change).
     #[serde(default)]
     pub session_turns: u32,
+    /// Number of consecutive empty completions observed (#424).
+    /// Reset to 0 on the first non-empty completion. Used for auto-restart
+    /// of suspected-hung claude workers.
+    #[serde(default)]
+    pub consecutive_empty_completions: u32,
+    /// RFC 3339 timestamp of the last auto-restart triggered by empty-completion
+    /// detection (#424). Used to enforce the rate-limit between restarts.
+    #[serde(default)]
+    pub last_empty_restart_at: Option<String>,
+    /// Cumulative number of auto-restarts triggered by empty-completion detection (#424).
+    #[serde(default)]
+    pub total_empty_restarts: u32,
 }
 
 fn default_status() -> String {
@@ -222,6 +244,9 @@ pub async fn create(cfg: &AgentConfig) -> Result<AgentState> {
         session_start: None,
         session_cost: 0.0,
         session_turns: 0,
+        consecutive_empty_completions: 0,
+        last_empty_restart_at: None,
+        total_empty_restarts: 0,
     };
 
     save_state(&state)?;
@@ -257,6 +282,9 @@ pub async fn create_or_update_from_config(cfg: &AgentConfig) -> Result<AgentStat
         session_start: None,
         session_cost: 0.0,
         session_turns: 0,
+        consecutive_empty_completions: 0,
+        last_empty_restart_at: None,
+        total_empty_restarts: 0,
     };
     save_state(&state)?;
     info!(agent = %cfg.name, "sub-agent created");
@@ -299,6 +327,8 @@ pub async fn create_or_recover(
         context: user_cfg.and_then(|c| c.context.clone()),
         compact_threshold: None,
         auto_compact_threshold_tokens: user_cfg.and_then(|c| c.auto_compact_threshold_tokens),
+        empty_completion_threshold: None,
+        empty_completion_restart_min_secs: None,
     };
 
     let path = state_path(&def.name);
@@ -326,6 +356,9 @@ pub async fn create_or_recover(
         session_start: None,
         session_cost: 0.0,
         session_turns: 0,
+        consecutive_empty_completions: 0,
+        last_empty_restart_at: None,
+        total_empty_restarts: 0,
     };
     save_state(&state)?;
     info!(agent = %def.name, "agent created");
@@ -722,6 +755,8 @@ pub async fn spawn_ephemeral(
         context: None,
         compact_threshold: None,
         auto_compact_threshold_tokens: None,
+        empty_completion_threshold: None,
+        empty_completion_restart_min_secs: None,
     };
 
     create(&cfg).await?;
@@ -779,6 +814,8 @@ created_at: "2024-01-01T00:00:00Z"
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         };
         let state = AgentState {
             config: cfg,
@@ -796,6 +833,9 @@ created_at: "2024-01-01T00:00:00Z"
             session_start: Some(Utc::now().to_rfc3339()),
             session_cost: 0.0,
             session_turns: 0,
+            consecutive_empty_completions: 0,
+            last_empty_restart_at: None,
+            total_empty_restarts: 0,
         };
         let yaml = serde_yaml::to_string(&state).unwrap();
         let restored: AgentState = serde_yaml::from_str(&yaml).unwrap();
@@ -844,6 +884,8 @@ created_at: "2024-01-01T00:00:00Z"
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         };
         let state = AgentState {
             config: cfg,
@@ -861,6 +903,9 @@ created_at: "2024-01-01T00:00:00Z"
             session_start: Some("2026-01-01T00:00:00Z".to_string()),
             session_cost: 0.5,
             session_turns: 3,
+            consecutive_empty_completions: 0,
+            last_empty_restart_at: None,
+            total_empty_restarts: 0,
         };
 
         save_state(&state).unwrap();

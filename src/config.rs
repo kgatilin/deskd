@@ -577,6 +577,15 @@ pub struct SubAgentDef {
     /// then to the built-in default (300k).
     #[serde(default)]
     pub auto_compact_threshold_tokens: Option<u64>,
+    /// Empty-completion auto-restart threshold (issue #424). After this many
+    /// consecutive zero-token / sub-2s completions, the worker is restarted.
+    /// `None` falls back to the workspace default.
+    #[serde(default)]
+    pub empty_completion_threshold: Option<u32>,
+    /// Minimum seconds between auto-restarts triggered by empty-completion
+    /// detection (rate-limit). `None` falls back to the workspace default.
+    #[serde(default)]
+    pub empty_completion_restart_min_secs: Option<u64>,
 }
 
 impl SubAgentDef {
@@ -1603,6 +1612,8 @@ agents:
             compact_threshold: None,
             compact_strategy: None,
             auto_compact_threshold_tokens: None,
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         };
         assert!(sub.validate_work_dir("/tmp/parent").is_ok());
     }
@@ -1627,6 +1638,8 @@ agents:
             compact_threshold: None,
             compact_strategy: None,
             auto_compact_threshold_tokens: None,
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         };
         assert!(sub.validate_work_dir("/tmp/parent").is_err());
     }

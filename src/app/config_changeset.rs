@@ -144,6 +144,8 @@ mod tests {
             compact_threshold: None,
             compact_strategy: None,
             auto_compact_threshold_tokens: None,
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         }
     }
 

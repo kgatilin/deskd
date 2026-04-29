@@ -156,6 +156,8 @@ pub async fn spawn_components(
                 auto_compact_threshold_tokens: sub
                     .auto_compact_threshold_tokens
                     .or(ucfg.auto_compact_threshold_tokens),
+                empty_completion_threshold: sub.empty_completion_threshold,
+                empty_completion_restart_min_secs: sub.empty_completion_restart_min_secs,
             };
             crate::app::agent::create_or_update_from_config(&sub_cfg).await?;
 

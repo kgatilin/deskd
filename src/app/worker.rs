@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::io::Write;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::app::acp;
@@ -13,6 +13,47 @@ use crate::app::unified_inbox;
 use crate::domain::agent::{AgentKind, AgentRuntime};
 use crate::domain::config_types::ConfigSessionMode;
 use crate::domain::events::DomainEvent;
+
+// ─── Empty-completion detection (#424) ──────────────────────────────────────
+//
+// A `result` event from a hung claude worker can land with `output_tokens=0`
+// AND `duration_secs<2` and otherwise looks like a successful turn. The
+// heuristic below flags those, increments a per-agent counter, and triggers
+// an auto-restart once `consecutive_empty_completions` crosses the threshold.
+
+/// Default threshold of consecutive empty completions before auto-restart.
+pub const DEFAULT_EMPTY_COMPLETION_THRESHOLD: u32 = 3;
+
+/// Default minimum seconds between auto-restarts triggered by empty-completion
+/// detection. Prevents tight restart loops when the upstream model is dead.
+pub const DEFAULT_EMPTY_COMPLETION_RESTART_MIN_SECS: u64 = 60;
+
+/// Maximum duration (seconds) a "real" completion is expected to take when
+/// `output_tokens` is also 0. Anything below this with zero output is treated
+/// as suspect (likely-hung worker).
+const EMPTY_COMPLETION_DURATION_THRESHOLD_SECS: u64 = 2;
+
+/// Returns true if a `result` event looks like a hung-worker empty completion:
+/// zero output tokens AND sub-threshold wall-clock duration.
+///
+/// Heuristic is callable from tests as well as the worker loop.
+pub fn is_empty_completion(output_tokens: u64, duration_secs: u64) -> bool {
+    output_tokens == 0 && duration_secs < EMPTY_COMPLETION_DURATION_THRESHOLD_SECS
+}
+
+/// Returns true if `last_restart_at` is far enough in the past (or absent)
+/// that another auto-restart is allowed under the rate-limit window.
+pub fn empty_restart_allowed(last_restart_at: Option<&str>, min_interval_secs: u64) -> bool {
+    let Some(ts) = last_restart_at else {
+        return true;
+    };
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) else {
+        // Malformed timestamp — be permissive rather than wedging the agent.
+        return true;
+    };
+    let elapsed = chrono::Utc::now().signed_duration_since(parsed.with_timezone(&chrono::Utc));
+    elapsed.num_seconds() >= min_interval_secs as i64
+}
 
 /// Create an executor for the given runtime type.
 ///
@@ -670,7 +711,7 @@ pub async fn run(
                 // Track cumulative session input tokens for compaction trigger.
                 session_input_tokens += turn.token_usage.input_tokens;
 
-                handle_task_success(
+                let empty_outcome = handle_task_success(
                     name,
                     &msg,
                     &ctx,
@@ -682,8 +723,40 @@ pub async fn run(
                     &initial_state.config.model,
                     &writer,
                     task_store,
+                    &agent_runtime,
                 )
                 .await;
+
+                // Empty-completion auto-restart (#424). When the heuristic has
+                // tripped N consecutive times we kill the (likely-hung) claude
+                // worker and respawn with a fresh session, gated by a
+                // configurable rate-limit window.
+                if empty_outcome == EmptyCompletionOutcome::ThresholdReached
+                    && note_empty_restart(name)
+                {
+                    error!(
+                        agent = %name,
+                        "agent {} hit empty-completion threshold — auto-restarting worker",
+                        name
+                    );
+                    process.stop().await;
+                    match start_executor_fresh(name, &effective_bus, &agent_runtime).await {
+                        Ok(new_proc) => {
+                            process = new_proc;
+                            info!(
+                                agent = %name,
+                                "agent process auto-restarted after empty-completion threshold"
+                            );
+                        }
+                        Err(re) => {
+                            warn!(
+                                agent = %name,
+                                error = %re,
+                                "failed to auto-restart agent after empty-completion threshold"
+                            );
+                        }
+                    }
+                }
 
                 // Check compaction trigger for all agent types.
                 // Memory agents have their own injection-based trigger above;
@@ -775,6 +848,10 @@ pub async fn run(
 }
 
 /// Log token usage for a completed task to a JSONL file.
+///
+/// `status` marks entries the doctor (#422) treats specially. `Some("empty")`
+/// signals the empty-completion heuristic fired (#424); `None` means the
+/// completion looked normal and no status field is written.
 #[allow(clippy::too_many_arguments)]
 fn log_token_usage(
     work_dir: &str,
@@ -786,6 +863,7 @@ fn log_token_usage(
     model: &str,
     github_repo: Option<&str>,
     github_pr: Option<u64>,
+    status: Option<&str>,
 ) {
     let deskd_dir = std::path::Path::new(work_dir).join(".deskd");
     if let Err(e) = std::fs::create_dir_all(&deskd_dir) {
@@ -821,6 +899,9 @@ fn log_token_usage(
     }
     if let Some(pr) = github_pr {
         entry["github_pr"] = serde_json::json!(pr);
+    }
+    if let Some(s) = status {
+        entry["status"] = serde_json::json!(s);
     }
 
     match std::fs::OpenOptions::new()
@@ -1077,6 +1158,18 @@ fn recover_orphaned_tasks(agent_name: &str, task_store: &dyn crate::ports::store
 }
 
 /// Handle successful task completion: log, inbox, queue update, bus reply.
+/// Outcome of a successful task w.r.t. the empty-completion heuristic (#424).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmptyCompletionOutcome {
+    /// Completion looked normal — counter has been reset.
+    Normal,
+    /// Empty completion detected; counter incremented but below threshold.
+    BelowThreshold,
+    /// Empty completion detected; counter has reached or exceeded threshold —
+    /// caller should attempt a rate-limited auto-restart.
+    ThresholdReached,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_task_success(
     name: &str,
@@ -1090,14 +1183,43 @@ async fn handle_task_success(
     model: &str,
     writer: &std::sync::Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     task_store: &dyn crate::ports::store::TaskRepository,
-) {
-    info!(
-        agent = %name,
-        cost = turn.cost_usd,
-        turns = turn.num_turns,
-        "task completed (persistent)"
-    );
+    runtime: &AgentRuntime,
+) -> EmptyCompletionOutcome {
+    // Empty-completion detection is restricted to `runtime: claude` per #424.
+    // Memory agents share the Claude executor but their zero-output turns are
+    // legitimate (event ingestion only), so we exclude them here.
+    let detect_empty = matches!(runtime, AgentRuntime::Claude);
+    let is_empty =
+        detect_empty && is_empty_completion(turn.token_usage.output_tokens, task_duration_secs);
 
+    let outcome = update_empty_completion_state(name, is_empty);
+
+    if is_empty {
+        warn!(
+            agent = %name,
+            output_tokens = turn.token_usage.output_tokens,
+            duration_secs = task_duration_secs,
+            consecutive = match outcome {
+                EmptyCompletionOutcome::BelowThreshold | EmptyCompletionOutcome::ThresholdReached => {
+                    agent::load_state(name)
+                        .map(|s| s.consecutive_empty_completions)
+                        .unwrap_or(0)
+                }
+                EmptyCompletionOutcome::Normal => 0,
+            },
+            "agent {} returned empty completion — likely hung",
+            name
+        );
+    } else {
+        info!(
+            agent = %name,
+            cost = turn.cost_usd,
+            turns = turn.num_turns,
+            "task completed (persistent)"
+        );
+    }
+
+    let usage_status = if is_empty { Some("empty") } else { None };
     log_token_usage(
         work_dir,
         name,
@@ -1108,8 +1230,10 @@ async fn handle_task_success(
         model,
         ctx.github_repo.as_deref(),
         ctx.github_pr,
+        usage_status,
     );
 
+    let task_status = if is_empty { "empty" } else { "ok" };
     let parent_agent = agent::load_state(name).ok().and_then(|s| s.parent);
     let log_entry = tasklog::TaskLog {
         ts: chrono::Utc::now().to_rfc3339(),
@@ -1117,7 +1241,7 @@ async fn handle_task_success(
         turns: turn.num_turns,
         cost: turn.cost_usd,
         duration_ms: task_duration_ms,
-        status: "ok".to_string(),
+        status: task_status.to_string(),
         task: tasklog::truncate_task(&ctx.task_raw, 60),
         error: None,
         msg_id: msg.id.clone(),
@@ -1191,6 +1315,81 @@ async fn handle_task_success(
         },
     )
     .await;
+
+    outcome
+}
+
+/// Update the persistent agent state for empty-completion tracking (#424).
+///
+/// Increments `consecutive_empty_completions` when `is_empty` is true; resets
+/// to zero on the first non-empty completion. Returns the resulting outcome
+/// so the caller can decide whether to trigger a restart.
+///
+/// State write failures are logged at WARN level but do not propagate — the
+/// detector is best-effort and must not block task completion.
+fn update_empty_completion_state(name: &str, is_empty: bool) -> EmptyCompletionOutcome {
+    let mut st = match agent::load_state(name) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(agent = %name, error = %e, "empty-detection: failed to load state");
+            return if is_empty {
+                EmptyCompletionOutcome::BelowThreshold
+            } else {
+                EmptyCompletionOutcome::Normal
+            };
+        }
+    };
+
+    let threshold = st
+        .config
+        .empty_completion_threshold
+        .unwrap_or(DEFAULT_EMPTY_COMPLETION_THRESHOLD);
+
+    let outcome = if !is_empty {
+        st.consecutive_empty_completions = 0;
+        EmptyCompletionOutcome::Normal
+    } else {
+        st.consecutive_empty_completions = st.consecutive_empty_completions.saturating_add(1);
+        if st.consecutive_empty_completions >= threshold {
+            EmptyCompletionOutcome::ThresholdReached
+        } else {
+            EmptyCompletionOutcome::BelowThreshold
+        }
+    };
+
+    if let Err(e) = agent::save_state_pub(&st) {
+        warn!(agent = %name, error = %e, "empty-detection: failed to save state");
+    }
+    outcome
+}
+
+/// Note an empty-completion-triggered restart in agent state and return
+/// whether the restart was permitted by the rate-limit window. Updates
+/// `last_empty_restart_at` and `total_empty_restarts` on success and resets
+/// the consecutive counter so post-restart traffic doesn't immediately
+/// re-trigger another restart.
+fn note_empty_restart(name: &str) -> bool {
+    let Ok(mut st) = agent::load_state(name) else {
+        return false;
+    };
+    let min_secs = st
+        .config
+        .empty_completion_restart_min_secs
+        .unwrap_or(DEFAULT_EMPTY_COMPLETION_RESTART_MIN_SECS);
+    if !empty_restart_allowed(st.last_empty_restart_at.as_deref(), min_secs) {
+        warn!(
+            agent = %name,
+            "empty-detection: threshold reached but restart suppressed by rate-limit"
+        );
+        return false;
+    }
+    st.last_empty_restart_at = Some(chrono::Utc::now().to_rfc3339());
+    st.total_empty_restarts = st.total_empty_restarts.saturating_add(1);
+    st.consecutive_empty_completions = 0;
+    if let Err(e) = agent::save_state_pub(&st) {
+        warn!(agent = %name, error = %e, "empty-detection: failed to save restart state");
+    }
+    true
 }
 
 /// Handle task failure: log, queue update, crash recovery, bus reply.
@@ -1510,6 +1709,54 @@ fn truncate(s: &str, max: usize) -> &str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ─── empty-completion heuristic tests (#424) ────────────────────────────
+
+    #[test]
+    fn test_is_empty_completion_zero_tokens_short_duration_is_empty() {
+        assert!(is_empty_completion(0, 0));
+        assert!(is_empty_completion(0, 1));
+    }
+
+    #[test]
+    fn test_is_empty_completion_real_completion_is_not_empty() {
+        // Real completions emit tokens; that alone disqualifies.
+        assert!(!is_empty_completion(100, 0));
+        assert!(!is_empty_completion(1, 60));
+    }
+
+    #[test]
+    fn test_is_empty_completion_long_zero_token_duration_is_not_empty() {
+        // A worker that genuinely ran but legitimately returned zero tokens
+        // (e.g. tool-only turn) takes more than the threshold — don't flag.
+        assert!(!is_empty_completion(
+            0,
+            EMPTY_COMPLETION_DURATION_THRESHOLD_SECS
+        ));
+        assert!(!is_empty_completion(
+            0,
+            EMPTY_COMPLETION_DURATION_THRESHOLD_SECS + 5
+        ));
+    }
+
+    #[test]
+    fn test_empty_restart_allowed_when_no_prior_restart() {
+        assert!(empty_restart_allowed(None, 60));
+    }
+
+    #[test]
+    fn test_empty_restart_allowed_when_window_elapsed() {
+        // Pick a timestamp clearly older than any plausible window.
+        let stale = "2020-01-01T00:00:00Z";
+        assert!(empty_restart_allowed(Some(stale), 60));
+    }
+
+    #[test]
+    fn test_empty_restart_allowed_blocks_within_window() {
+        // Use "now" so the window is fresh.
+        let now = chrono::Utc::now().to_rfc3339();
+        assert!(!empty_restart_allowed(Some(&now), 60));
+    }
 
     // ─── budget_enforced tests ───────────────────────────────────────────────
 
