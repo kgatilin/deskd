@@ -245,6 +245,13 @@ impl AlertSink for LogSink {
         file.write_all(line.as_bytes())
             .await
             .with_context(|| format!("write alert log: {}", self.path.display()))?;
+        // tokio::fs::File buffers writes internally; without an explicit flush
+        // here, drop happens before the buffer is committed to the kernel and
+        // a subsequent `read_to_string` (or another append) misses the data.
+        // This was the pre-existing flake in `log_sink_writes_jsonl` (#428 CI).
+        file.flush()
+            .await
+            .with_context(|| format!("flush alert log: {}", self.path.display()))?;
         Ok(())
     }
 }

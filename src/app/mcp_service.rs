@@ -807,3 +807,219 @@ pub async fn stop_agent_process(name: &str, pid: u32) {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
+
+/// Outcome of `perform_agent_restart` — the previous PID and whether the
+/// session was reset.
+pub struct RestartOutcome {
+    /// PID of the worker child that was running before the kill (0 if none).
+    pub previous_pid: u32,
+    /// Whether session_id / session_cost / session_turns / session_start were
+    /// cleared as part of this restart.
+    pub fresh_session: bool,
+}
+
+/// Perform the shared "kill worker + mutate state file" portion of an agent
+/// restart. Used by both the bus-API handler (`agent_restart`) and the CLI
+/// (`deskd agent restart`) so the state-file mutation logic lives in one
+/// place.
+///
+/// Steps:
+/// 1. Load current state, capture `pid`.
+/// 2. SIGTERM the worker child if a live PID is present (no-op for pid=0 or
+///    a pid whose `/proc/<pid>` no longer exists — we still succeed so a
+///    restart on an already-stopped agent is a no-panic no-op).
+/// 3. Re-load state, optionally clear the session fields (`fresh_session`),
+///    set `status = "restarting"`, save.
+///
+/// Does NOT poll for `idle` — callers that need to wait for the supervisor
+/// to respawn the worker do so themselves.
+pub async fn perform_agent_restart(name: &str, fresh_session: bool) -> Result<RestartOutcome> {
+    perform_agent_restart_inner(name, fresh_session, None).await
+}
+
+/// Like `perform_agent_restart`, but reads/writes the state file under an
+/// explicit home directory (`{home}/.deskd/agents/{name}.yaml`) instead of
+/// `$HOME`. Tests use this to avoid mutating process env, which races under
+/// the parallel test harness (#423 CI flake on PR #428).
+pub async fn perform_agent_restart_in(
+    home: &Path,
+    name: &str,
+    fresh_session: bool,
+) -> Result<RestartOutcome> {
+    perform_agent_restart_inner(name, fresh_session, Some(home)).await
+}
+
+async fn perform_agent_restart_inner(
+    name: &str,
+    fresh_session: bool,
+    home: Option<&Path>,
+) -> Result<RestartOutcome> {
+    let load = |name: &str| match home {
+        Some(h) => crate::app::agent::load_state_in(h, name),
+        None => crate::app::agent::load_state(name),
+    };
+    let save = |state: &crate::app::agent::AgentState| match home {
+        Some(h) => crate::app::agent::save_state_in(h, state),
+        None => crate::app::agent::save_state_pub(state),
+    };
+
+    let state = load(name)?;
+    let pid = state.pid;
+
+    // Only call SIGTERM if /proc/<pid> still exists. stop_agent_process
+    // already short-circuits on pid=0, but we also want to avoid a blocking
+    // 30s wait when the pid has been recycled or never existed.
+    if pid > 0 && Path::new(&format!("/proc/{}", pid)).exists() {
+        stop_agent_process(name, pid).await;
+    }
+
+    let mut updated = load(name)?;
+    if fresh_session {
+        updated.session_id.clear();
+        updated.session_cost = 0.0;
+        updated.session_turns = 0;
+        updated.session_start = None;
+    }
+    updated.status = "restarting".to_string();
+    save(&updated)?;
+
+    Ok(RestartOutcome {
+        previous_pid: pid,
+        fresh_session,
+    })
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    use crate::app::agent::{AgentConfig, AgentState};
+    use tempfile::TempDir;
+
+    /// Persist a minimal `AgentState` for a unique `name` under an isolated
+    /// tempdir-as-home. Returns the `(TempDir, name)` pair so tests can pass
+    /// the path explicitly to `perform_agent_restart_in` instead of mutating
+    /// the process-wide `HOME` env var (POSIX setenv is not thread-safe;
+    /// concurrent tests racing on `HOME` caused the #423 CI flake on
+    /// PR #428).
+    fn seed_agent_state(pid: u32, session_id: &str) -> (TempDir, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let name = format!("restart-test-{}", uuid::Uuid::new_v4());
+
+        let cfg = AgentConfig {
+            name: name.clone(),
+            model: "claude-sonnet-4-6".into(),
+            system_prompt: String::new(),
+            work_dir: "/tmp".into(),
+            max_turns: 10,
+            unix_user: None,
+            budget_usd: 50.0,
+            command: vec!["claude".into()],
+            config_path: None,
+            container: None,
+            session: crate::infra::dto::ConfigSessionMode::Persistent,
+            runtime: crate::infra::dto::ConfigAgentRuntime::Claude,
+            kind: crate::infra::dto::ConfigAgentKind::Executor,
+            context: None,
+            compact_threshold: None,
+            auto_compact_threshold_tokens: None,
+        };
+        let state = AgentState {
+            config: cfg,
+            pid,
+            session_id: session_id.to_string(),
+            total_turns: 5,
+            total_cost: 1.23,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: "idle".into(),
+            current_task: String::new(),
+            parent: None,
+            scope: None,
+            can_message: None,
+            env_keys: None,
+            session_start: Some("2026-01-01T00:00:00Z".into()),
+            session_cost: 0.5,
+            session_turns: 3,
+        };
+        crate::app::agent::save_state_in(tmp.path(), &state).unwrap();
+        (tmp, name)
+    }
+
+    /// Verifies `--fresh-session` clears `session_id` (and the related
+    /// session counters) before the worker respawns.
+    #[tokio::test]
+    async fn test_restart_fresh_session_clears_session_id() {
+        let (tmp, name) = seed_agent_state(0, "sess-original");
+
+        let outcome = perform_agent_restart_in(tmp.path(), &name, true)
+            .await
+            .unwrap();
+        assert!(outcome.fresh_session);
+        assert_eq!(outcome.previous_pid, 0);
+
+        let st = crate::app::agent::load_state_in(tmp.path(), &name).unwrap();
+        assert_eq!(st.session_id, "");
+        assert_eq!(st.session_cost, 0.0);
+        assert_eq!(st.session_turns, 0);
+        assert!(st.session_start.is_none());
+        // total_turns / total_cost are NOT reset.
+        assert_eq!(st.total_turns, 5);
+        assert!((st.total_cost - 1.23).abs() < f64::EPSILON);
+        assert_eq!(st.status, "restarting");
+    }
+
+    /// Verifies the default (non-fresh) restart preserves the session_id so
+    /// claude resumes the previous conversation on next task.
+    #[tokio::test]
+    async fn test_restart_preserves_session_id() {
+        let (tmp, name) = seed_agent_state(0, "sess-preserved");
+
+        let outcome = perform_agent_restart_in(tmp.path(), &name, false)
+            .await
+            .unwrap();
+        assert!(!outcome.fresh_session);
+
+        let st = crate::app::agent::load_state_in(tmp.path(), &name).unwrap();
+        assert_eq!(st.session_id, "sess-preserved");
+        // session counters are also untouched.
+        assert!((st.session_cost - 0.5).abs() < f64::EPSILON);
+        assert_eq!(st.session_turns, 3);
+        assert_eq!(st.session_start.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(st.status, "restarting");
+    }
+
+    /// Verifies a restart against an already-stopped agent (pid=0) succeeds
+    /// without panicking and without trying to SIGTERM a non-existent PID.
+    #[tokio::test]
+    async fn test_restart_stopped_agent_no_panic() {
+        let (tmp, name) = seed_agent_state(0, "sess-stopped");
+
+        let outcome = perform_agent_restart_in(tmp.path(), &name, false)
+            .await
+            .unwrap();
+        assert_eq!(outcome.previous_pid, 0);
+        // State file mutated even when there's no live worker — supervisor
+        // will respawn on next task.
+        let st = crate::app::agent::load_state_in(tmp.path(), &name).unwrap();
+        assert_eq!(st.status, "restarting");
+    }
+
+    /// Verifies `perform_agent_restart` runs end-to-end without any bus
+    /// connection — the explicit design choice from the issue spec is that
+    /// the CLI must work when `deskd serve` is hung. This test exercises that
+    /// path: no bus_socket env var, no UnixStream, just direct state-file
+    /// mutation. `perform_agent_restart` does not read `DESKD_BUS_SOCKET`,
+    /// so we don't need to (and must not, under parallel tests) clear it.
+    #[tokio::test]
+    async fn test_restart_with_bus_disconnected() {
+        let (tmp, name) = seed_agent_state(0, "sess-no-bus");
+
+        // No connect_bus / no UnixStream::connect — call should still succeed.
+        let outcome = perform_agent_restart_in(tmp.path(), &name, true)
+            .await
+            .unwrap();
+        assert!(outcome.fresh_session);
+        let st = crate::app::agent::load_state_in(tmp.path(), &name).unwrap();
+        assert_eq!(st.session_id, "");
+        assert_eq!(st.status, "restarting");
+    }
+}

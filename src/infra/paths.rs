@@ -54,7 +54,15 @@ fn chown_recursive(dir: &Path, user: &str) {
 /// Where agent state files are stored: `~/.deskd/agents/`.
 pub fn state_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let dir = PathBuf::from(home).join(".deskd").join("agents");
+    state_dir_in(Path::new(&home))
+}
+
+/// Like `state_dir`, but reads the base from an explicit home path instead
+/// of `$HOME`. Lets tests place state files under a tempdir without mutating
+/// process env (which is unsafe under the parallel test harness; see #423
+/// CI failure on PR #428).
+pub fn state_dir_in(home: &Path) -> PathBuf {
+    let dir = home.join(".deskd").join("agents");
     std::fs::create_dir_all(&dir).ok();
     dir
 }

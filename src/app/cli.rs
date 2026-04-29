@@ -346,6 +346,33 @@ pub enum AgentAction {
         #[arg(long)]
         stuck_minutes: Option<i64>,
     },
+    /// Restart one or more agents.
+    ///
+    /// Kills the running claude worker child for the named agent. The
+    /// supervisor (worker loop running inside `deskd serve`) respawns claude
+    /// when the next task arrives. By default the previous session_id is
+    /// preserved so claude resumes the conversation.
+    ///
+    /// Examples:
+    ///   deskd agent restart uagent
+    ///   deskd agent restart uagent --fresh-session
+    ///   deskd agent restart --all
+    ///   deskd agent restart uagent --timeout 60
+    Restart {
+        /// Agent name to restart. Required unless --all is set.
+        name: Option<String>,
+        /// Restart every registered agent in sequence.
+        #[arg(long)]
+        all: bool,
+        /// Drop session_id so claude starts a brand-new conversation
+        /// (no --resume). Preserves total_turns / total_cost.
+        #[arg(long = "fresh-session")]
+        fresh_session: bool,
+        /// Seconds to wait for the agent to return to `ready` (idle)
+        /// before exiting non-zero. Default 30.
+        #[arg(long, default_value = "30")]
+        timeout: u64,
+    },
     /// Update an agent's settings in workspace.yaml.
     ///
     /// Currently supports switching the named container profile referenced

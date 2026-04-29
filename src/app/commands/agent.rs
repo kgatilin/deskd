@@ -594,6 +594,14 @@ pub async fn handle(action: AgentAction) -> Result<()> {
         } => {
             super::doctor::handle(name, last, empty_threshold, idle_minutes, stuck_minutes).await?;
         }
+        AgentAction::Restart {
+            name,
+            all,
+            fresh_session,
+            timeout,
+        } => {
+            return restart_agents(name, all, fresh_session, timeout).await;
+        }
         AgentAction::Spawn {
             name,
             task,
@@ -653,6 +661,125 @@ fn format_list_status(
         crate::domain::agent::AgentStatus::Ready => format!("ready{}", suffix),
         crate::domain::agent::AgentStatus::Busy { .. } => format!("busy{}", suffix),
         crate::domain::agent::AgentStatus::Unhealthy { .. } => "unhealthy".to_string(),
+    }
+}
+
+/// Restart one or all agents and wait for them to return to ready.
+///
+/// Per-target work is delegated to `restart_one_agent`, which calls into the
+/// shared `mcp_service::perform_agent_restart` helper used by the bus API
+/// (so the kill-and-mutate logic lives in one place). Exit code is non-zero
+/// if any agent fails to return to ready in time. See
+/// `restart_one_agent`'s doc-comment for the rationale on bypassing the bus.
+async fn restart_agents(
+    name: Option<String>,
+    all: bool,
+    fresh_session: bool,
+    timeout_secs: u64,
+) -> Result<()> {
+    if all && name.is_some() {
+        anyhow::bail!("pass either <name> or --all, not both");
+    }
+    if !all && name.is_none() {
+        anyhow::bail!("missing agent name (or pass --all)");
+    }
+
+    let targets: Vec<String> = if all {
+        let agents = agent::list().await?;
+        if agents.is_empty() {
+            println!("No agents registered");
+            return Ok(());
+        }
+        agents.into_iter().map(|s| s.config.name).collect()
+    } else {
+        vec![name.unwrap()]
+    };
+
+    let mut had_failure = false;
+    for target in &targets {
+        match restart_one_agent(target, fresh_session, timeout_secs).await {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("agent restart {}: {}", target, e);
+                had_failure = true;
+            }
+        }
+    }
+
+    if had_failure {
+        anyhow::bail!("one or more agents failed to return to ready");
+    }
+    Ok(())
+}
+
+/// Restart a single agent and poll for `idle` within `timeout_secs`.
+///
+/// # Design: why the CLI bypasses the bus
+///
+/// The CLI intentionally does NOT route the restart through the bus
+/// (`bus_api::handle_agent_restart`). The motivation is the recovery
+/// scenario described in kgatilin/deskd#423: an operator runs `deskd agent
+/// restart <name>` precisely *because* the agent (and possibly the bus
+/// itself) is hung. Sending an RPC over a hung bus would block forever and
+/// defeat the purpose of the command.
+///
+/// To avoid maintaining two copies of the kill-and-mutate logic, both the
+/// CLI and the bus handler share `mcp_service::perform_agent_restart`,
+/// which performs the load/kill/save cycle without touching the bus. The
+/// CLI then layers polling and user-facing feedback on top.
+async fn restart_one_agent(name: &str, fresh_session: bool, timeout_secs: u64) -> Result<()> {
+    use std::time::Duration;
+
+    // Shared with bus_api::handle_agent_restart — see the doc-comment above
+    // for why we deliberately do not dispatch through the bus.
+    let outcome = crate::app::mcp_service::perform_agent_restart(name, fresh_session).await?;
+
+    if outcome.fresh_session {
+        info!(agent = %name, "cleared session_id (--fresh-session)");
+    }
+
+    if outcome.previous_pid > 0
+        && std::path::Path::new(&format!("/proc/{}", outcome.previous_pid)).exists()
+    {
+        // perform_agent_restart already SIGTERM'd it; if /proc still shows
+        // the pid here, the kernel is still tearing it down — log for the
+        // user but no action needed.
+        println!(
+            "agent {}: sent SIGTERM to pid {}",
+            name, outcome.previous_pid
+        );
+    } else if outcome.previous_pid == 0 {
+        // Already stopped — restart still succeeds (no-op kill, supervisor
+        // will respawn on next task).
+        println!("agent {}: already stopped (no live pid)", name);
+    } else {
+        println!(
+            "agent {}: stopped pid {} (exited)",
+            name, outcome.previous_pid
+        );
+    }
+
+    // Poll the state file for status=idle (ready). The worker loop sets
+    // status to "idle" via set_idle() once it has finished its current task
+    // and is waiting on the bus.
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        if let Ok(s) = agent::load_state(name) {
+            // "idle" or "ready" both count as ready. "working" / "restarting"
+            // do not.
+            if s.status == "idle" || s.status == "ready" {
+                println!("agent {}: ready", name);
+                return Ok(());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "agent '{}' did not return to ready within {}s",
+                name,
+                timeout_secs
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 

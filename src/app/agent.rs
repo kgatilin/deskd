@@ -9,8 +9,8 @@
 pub use super::agent_process::AgentProcess;
 pub use super::agent_registry::{
     AgentConfig, AgentState, create, create_or_recover, create_or_update_from_config,
-    default_agent_command, list, load_state, remove, save_state_pub, send, spawn_ephemeral,
-    stderr_log_path, stream_log_path, to_domain_agent,
+    default_agent_command, list, load_state, load_state_in, remove, save_state_in, save_state_pub,
+    send, spawn_ephemeral, stderr_log_path, stream_log_path, to_domain_agent,
 };
 pub use super::process_builder::build_command;
 
