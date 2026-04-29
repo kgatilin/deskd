@@ -3,7 +3,7 @@
 use anyhow::Result;
 use tracing::info;
 
-use crate::app::{agent, bus, bus_api, config_reload, worker, workflow};
+use crate::app::{agent, alerts, bus, bus_api, config_reload, worker, workflow};
 use crate::config;
 
 /// Start per-agent buses and workers for all agents in workspace config.
@@ -204,12 +204,74 @@ pub async fn serve(config_path: String) -> Result<()> {
         }
     }
 
+    // ── Proactive degradation alerts (#425) ──────────────────────────────
+    // When workspace.yaml defines an `alerts:` block, start a single poll
+    // loop that polls a verdict source and dispatches transition alerts to
+    // every configured sink. The verdict source is currently a placeholder
+    // pending #422; sink + dedup machinery is fully exercised regardless.
+    if let Some(alerts_cfg) = workspace.alerts.clone() {
+        if alerts_cfg.sinks.is_empty() {
+            info!("alerts config present but no sinks defined — skipping alert manager");
+        } else if let Some(any_socket) = workspace.agents.first().map(|a| a.bus_socket()) {
+            let agents_for_source: Vec<(String, std::path::PathBuf)> = workspace
+                .agents
+                .iter()
+                .map(|a| {
+                    (
+                        a.name.clone(),
+                        std::path::PathBuf::from(&a.work_dir)
+                            .join(".deskd")
+                            .join("usage.jsonl"),
+                    )
+                })
+                .collect();
+            let manager = alerts::AlertManager::from_config(&alerts_cfg, &any_socket, "deskd");
+            let source = alerts::HeuristicVerdictSource::new(agents_for_source);
+            let interval = std::time::Duration::from_secs(alerts_cfg.poll_interval_secs.max(1));
+            tokio::spawn(async move {
+                run_alerts_loop(manager, source, interval).await;
+            });
+            info!(
+                sinks = alerts_cfg.sinks.len(),
+                interval_secs = alerts_cfg.poll_interval_secs,
+                "started alert manager"
+            );
+        } else {
+            info!("alerts config present but no agents — skipping alert manager");
+        }
+    }
+
     info!("all agents started — press Ctrl-C to stop");
 
     tokio::signal::ctrl_c().await?;
     config::ServeState::remove();
     info!("shutting down");
     Ok(())
+}
+
+/// Run a single poll-and-dispatch loop for the alert manager.
+/// Exits only when the deskd serve process stops.
+async fn run_alerts_loop<S>(manager: alerts::AlertManager, source: S, interval: std::time::Duration)
+where
+    S: alerts::VerdictSource,
+{
+    if manager.is_empty() {
+        return;
+    }
+    let mut ticker = tokio::time::interval(interval);
+    // First tick fires immediately by default; skip it so the source sees a
+    // somewhat-warm runtime before the first poll.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        match source.poll().await {
+            Ok(reports) => manager.observe(reports).await,
+            Err(e) => {
+                tracing::warn!(error = %e, "alert verdict source poll failed");
+            }
+        }
+    }
 }
 
 /// Query which agents are currently connected to a bus socket.
