@@ -233,6 +233,7 @@ mod tests {
             rooms: vec![],
             admin_telegram_ids: vec![],
             a2a,
+            alerts: None,
         }
     }
 

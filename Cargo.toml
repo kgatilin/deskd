@@ -31,6 +31,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 jsonwebtoken = "9"
 ring = "0.17"
+async-trait = "0.1"
 
 [lib]
 name = "deskd"

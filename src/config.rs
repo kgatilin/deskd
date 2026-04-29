@@ -53,6 +53,43 @@ pub struct WorkspaceConfig {
     /// A2A protocol configuration for cross-instance agent communication.
     #[serde(default)]
     pub a2a: Option<A2aConfig>,
+    /// Proactive degradation alerts (#425). When set, deskd serve starts an
+    /// alert manager per agent that fires verdict-transition alerts to the
+    /// configured sinks.
+    #[serde(default)]
+    pub alerts: Option<AlertsConfig>,
+}
+
+/// Alert configuration block — `alerts:` in workspace.yaml.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct AlertsConfig {
+    /// Sinks that receive each alert. Order is preserved; sink failures are
+    /// isolated per-sink so a failing telegram does not block log/bus.
+    #[serde(default)]
+    pub sinks: Vec<AlertSinkConfig>,
+    /// How often the alert manager polls the verdict source, in seconds.
+    /// Defaults to 60s.
+    #[serde(default = "default_alert_poll_secs")]
+    pub poll_interval_secs: u64,
+}
+
+fn default_alert_poll_secs() -> u64 {
+    60
+}
+
+/// A single alert sink. Three kinds are supported (#425):
+/// `bus_message`, `telegram`, and `log`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AlertSinkConfig {
+    /// Publish the alert as a bus message to `agent:<target_agent>`.
+    BusMessage { target_agent: String },
+    /// Send the alert as a Telegram message via the existing telegram
+    /// adapter — `chat_id` is a string so `${ADMIN_CHAT_ID}` env-var
+    /// expansion works without the YAML parser tripping on negative ints.
+    Telegram { chat_id: String },
+    /// Append the alert as a single-line JSON record to `path`.
+    Log { path: String },
 }
 
 /// A2A protocol configuration in workspace.yaml.
@@ -764,6 +801,50 @@ agents:
         assert_eq!(cfg.agents[0].unix_user.as_deref(), Some("kira"));
         assert!(cfg.agents[0].telegram.is_none());
         assert!(cfg.agents[0].config.is_none());
+    }
+
+    #[test]
+    fn test_workspace_config_alerts_block() {
+        let yaml = r#"
+agents:
+  - name: kira
+    work_dir: /home/kira
+alerts:
+  sinks:
+    - kind: bus_message
+      target_agent: dev
+    - kind: telegram
+      chat_id: "-1001234"
+    - kind: log
+      path: /var/log/deskd/alerts.jsonl
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let alerts = cfg.alerts.expect("alerts block parsed");
+        assert_eq!(alerts.sinks.len(), 3);
+        assert_eq!(alerts.poll_interval_secs, 60);
+        assert!(matches!(
+            alerts.sinks[0],
+            AlertSinkConfig::BusMessage { ref target_agent } if target_agent == "dev"
+        ));
+        assert!(matches!(
+            alerts.sinks[1],
+            AlertSinkConfig::Telegram { ref chat_id } if chat_id == "-1001234"
+        ));
+        assert!(matches!(
+            alerts.sinks[2],
+            AlertSinkConfig::Log { ref path } if path == "/var/log/deskd/alerts.jsonl"
+        ));
+    }
+
+    #[test]
+    fn test_workspace_config_alerts_default_absent() {
+        let yaml = r#"
+agents:
+  - name: kira
+    work_dir: /home/kira
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.alerts.is_none());
     }
 
     #[test]
