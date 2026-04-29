@@ -5,6 +5,7 @@ pub mod agent;
 pub mod bus;
 pub mod context;
 pub mod dashboard;
+pub mod doctor;
 pub mod graph;
 pub mod remind;
 pub mod restart;
