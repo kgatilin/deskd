@@ -990,29 +990,15 @@ async fn handle_agent_restart(params: &Value, _bus_socket: &str, caller: &str) -
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let state = crate::app::agent::load_state(agent)?;
-    let pid = state.pid;
-
-    if pid > 0 {
-        mcp_service::stop_agent_process(agent, pid).await;
-    }
-
-    let mut updated = crate::app::agent::load_state(agent)?;
-    if fresh_session {
-        // Reset session fields so the worker starts a fresh conversation
-        // on next task. Preserves total_turns / total_cost.
-        updated.session_id.clear();
-        updated.session_cost = 0.0;
-        updated.session_turns = 0;
-        updated.session_start = None;
-    }
-    updated.status = "restarting".to_string();
-    crate::app::agent::save_state_pub(&updated)?;
+    // Shared kill-and-mutate path; lives in mcp_service so the CLI can call
+    // the same logic without going through the bus (see commands/agent.rs
+    // restart_one_agent for the recovery-scenario rationale).
+    let outcome = mcp_service::perform_agent_restart(agent, fresh_session).await?;
 
     info!(
         agent = %agent,
-        pid = pid,
-        fresh_session = fresh_session,
+        pid = outcome.previous_pid,
+        fresh_session = outcome.fresh_session,
         caller = %caller,
         "agent_restart via bus API"
     );
@@ -1020,8 +1006,8 @@ async fn handle_agent_restart(params: &Value, _bus_socket: &str, caller: &str) -
     Ok(json!({
         "agent": agent,
         "restarted": true,
-        "previous_pid": pid,
-        "fresh_session": fresh_session,
+        "previous_pid": outcome.previous_pid,
+        "fresh_session": outcome.fresh_session,
     }))
 }
 

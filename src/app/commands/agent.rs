@@ -666,15 +666,11 @@ fn format_list_status(
 
 /// Restart one or all agents and wait for them to return to ready.
 ///
-/// Implementation:
-/// 1. Resolve target agent list (single named, or all registered).
-/// 2. For each: clear session_id (when --fresh-session) directly in the state
-///    file BEFORE killing, then SIGTERM the claude worker child PID. The
-///    supervisor (worker loop in `deskd serve`) respawns claude on the next
-///    task — so for the agent to fully return to `idle` we just wait for the
-///    state file's `status` field.
-/// 3. Poll each agent's state until `idle` (a.k.a. ready) within --timeout.
-/// 4. Exit code is non-zero if any agent fails to return to ready in time.
+/// Per-target work is delegated to `restart_one_agent`, which calls into the
+/// shared `mcp_service::perform_agent_restart` helper used by the bus API
+/// (so the kill-and-mutate logic lives in one place). Exit code is non-zero
+/// if any agent fails to return to ready in time. See
+/// `restart_one_agent`'s doc-comment for the rationale on bypassing the bus.
 async fn restart_agents(
     name: Option<String>,
     all: bool,
@@ -717,39 +713,50 @@ async fn restart_agents(
 }
 
 /// Restart a single agent and poll for `idle` within `timeout_secs`.
+///
+/// # Design: why the CLI bypasses the bus
+///
+/// The CLI intentionally does NOT route the restart through the bus
+/// (`bus_api::handle_agent_restart`). The motivation is the recovery
+/// scenario described in kgatilin/deskd#423: an operator runs `deskd agent
+/// restart <name>` precisely *because* the agent (and possibly the bus
+/// itself) is hung. Sending an RPC over a hung bus would block forever and
+/// defeat the purpose of the command.
+///
+/// To avoid maintaining two copies of the kill-and-mutate logic, both the
+/// CLI and the bus handler share `mcp_service::perform_agent_restart`,
+/// which performs the load/kill/save cycle without touching the bus. The
+/// CLI then layers polling and user-facing feedback on top.
 async fn restart_one_agent(name: &str, fresh_session: bool, timeout_secs: u64) -> Result<()> {
     use std::time::Duration;
 
-    let state = agent::load_state(name)
-        .map_err(|e| anyhow::anyhow!("failed to load agent state for '{}': {}", name, e))?;
-    let pid = state.pid;
+    // Shared with bus_api::handle_agent_restart — see the doc-comment above
+    // for why we deliberately do not dispatch through the bus.
+    let outcome = crate::app::mcp_service::perform_agent_restart(name, fresh_session).await?;
 
-    // --fresh-session: clear session_id BEFORE respawn so claude does not
-    // pass --resume. Done first so a race where the worker respawns claude
-    // before we get here can't pick up the stale session_id.
-    if fresh_session {
-        let mut s = state.clone();
-        s.session_id.clear();
-        s.session_cost = 0.0;
-        s.session_turns = 0;
-        s.session_start = None;
-        agent::save_state_pub(&s)?;
+    if outcome.fresh_session {
         info!(agent = %name, "cleared session_id (--fresh-session)");
     }
 
-    if pid > 0 && std::path::Path::new(&format!("/proc/{}", pid)).exists() {
-        crate::app::mcp_service::stop_agent_process(name, pid).await;
-        println!("agent {}: sent SIGTERM to pid {}", name, pid);
-    } else {
+    if outcome.previous_pid > 0
+        && std::path::Path::new(&format!("/proc/{}", outcome.previous_pid)).exists()
+    {
+        // perform_agent_restart already SIGTERM'd it; if /proc still shows
+        // the pid here, the kernel is still tearing it down — log for the
+        // user but no action needed.
+        println!(
+            "agent {}: sent SIGTERM to pid {}",
+            name, outcome.previous_pid
+        );
+    } else if outcome.previous_pid == 0 {
         // Already stopped — restart still succeeds (no-op kill, supervisor
         // will respawn on next task).
         println!("agent {}: already stopped (no live pid)", name);
-    }
-
-    // Mark restarting so external observers see a transition.
-    if let Ok(mut s) = agent::load_state(name) {
-        s.status = "restarting".to_string();
-        let _ = agent::save_state_pub(&s);
+    } else {
+        println!(
+            "agent {}: stopped pid {} (exited)",
+            name, outcome.previous_pid
+        );
     }
 
     // Poll the state file for status=idle (ready). The worker loop sets
