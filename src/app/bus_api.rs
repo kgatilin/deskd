@@ -982,6 +982,13 @@ async fn handle_agent_restart(params: &Value, _bus_socket: &str, caller: &str) -
         .get("agent")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'agent' parameter"))?;
+    // When true, drop session_id so the next claude invocation does not
+    // pass --resume (starts a brand-new conversation). When false (default),
+    // session_id is preserved so the worker resumes the previous session.
+    let fresh_session = params
+        .get("fresh_session")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let state = crate::app::agent::load_state(agent)?;
     let pid = state.pid;
@@ -990,21 +997,31 @@ async fn handle_agent_restart(params: &Value, _bus_socket: &str, caller: &str) -
         mcp_service::stop_agent_process(agent, pid).await;
     }
 
-    // Reset session fields so the worker starts a fresh session on next task.
     let mut updated = crate::app::agent::load_state(agent)?;
-    updated.session_id.clear();
-    updated.session_cost = 0.0;
-    updated.session_turns = 0;
-    updated.session_start = None;
+    if fresh_session {
+        // Reset session fields so the worker starts a fresh conversation
+        // on next task. Preserves total_turns / total_cost.
+        updated.session_id.clear();
+        updated.session_cost = 0.0;
+        updated.session_turns = 0;
+        updated.session_start = None;
+    }
     updated.status = "restarting".to_string();
     crate::app::agent::save_state_pub(&updated)?;
 
-    info!(agent = %agent, pid = pid, caller = %caller, "agent_restart via bus API");
+    info!(
+        agent = %agent,
+        pid = pid,
+        fresh_session = fresh_session,
+        caller = %caller,
+        "agent_restart via bus API"
+    );
 
     Ok(json!({
         "agent": agent,
         "restarted": true,
         "previous_pid": pid,
+        "fresh_session": fresh_session,
     }))
 }
 

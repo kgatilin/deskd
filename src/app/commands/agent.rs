@@ -594,6 +594,14 @@ pub async fn handle(action: AgentAction) -> Result<()> {
         } => {
             super::doctor::handle(name, last, empty_threshold, idle_minutes, stuck_minutes).await?;
         }
+        AgentAction::Restart {
+            name,
+            all,
+            fresh_session,
+            timeout,
+        } => {
+            return restart_agents(name, all, fresh_session, timeout).await;
+        }
         AgentAction::Spawn {
             name,
             task,
@@ -653,6 +661,118 @@ fn format_list_status(
         crate::domain::agent::AgentStatus::Ready => format!("ready{}", suffix),
         crate::domain::agent::AgentStatus::Busy { .. } => format!("busy{}", suffix),
         crate::domain::agent::AgentStatus::Unhealthy { .. } => "unhealthy".to_string(),
+    }
+}
+
+/// Restart one or all agents and wait for them to return to ready.
+///
+/// Implementation:
+/// 1. Resolve target agent list (single named, or all registered).
+/// 2. For each: clear session_id (when --fresh-session) directly in the state
+///    file BEFORE killing, then SIGTERM the claude worker child PID. The
+///    supervisor (worker loop in `deskd serve`) respawns claude on the next
+///    task — so for the agent to fully return to `idle` we just wait for the
+///    state file's `status` field.
+/// 3. Poll each agent's state until `idle` (a.k.a. ready) within --timeout.
+/// 4. Exit code is non-zero if any agent fails to return to ready in time.
+async fn restart_agents(
+    name: Option<String>,
+    all: bool,
+    fresh_session: bool,
+    timeout_secs: u64,
+) -> Result<()> {
+    if all && name.is_some() {
+        anyhow::bail!("pass either <name> or --all, not both");
+    }
+    if !all && name.is_none() {
+        anyhow::bail!("missing agent name (or pass --all)");
+    }
+
+    let targets: Vec<String> = if all {
+        let agents = agent::list().await?;
+        if agents.is_empty() {
+            println!("No agents registered");
+            return Ok(());
+        }
+        agents.into_iter().map(|s| s.config.name).collect()
+    } else {
+        vec![name.unwrap()]
+    };
+
+    let mut had_failure = false;
+    for target in &targets {
+        match restart_one_agent(target, fresh_session, timeout_secs).await {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("agent restart {}: {}", target, e);
+                had_failure = true;
+            }
+        }
+    }
+
+    if had_failure {
+        anyhow::bail!("one or more agents failed to return to ready");
+    }
+    Ok(())
+}
+
+/// Restart a single agent and poll for `idle` within `timeout_secs`.
+async fn restart_one_agent(name: &str, fresh_session: bool, timeout_secs: u64) -> Result<()> {
+    use std::time::Duration;
+
+    let state = agent::load_state(name)
+        .map_err(|e| anyhow::anyhow!("failed to load agent state for '{}': {}", name, e))?;
+    let pid = state.pid;
+
+    // --fresh-session: clear session_id BEFORE respawn so claude does not
+    // pass --resume. Done first so a race where the worker respawns claude
+    // before we get here can't pick up the stale session_id.
+    if fresh_session {
+        let mut s = state.clone();
+        s.session_id.clear();
+        s.session_cost = 0.0;
+        s.session_turns = 0;
+        s.session_start = None;
+        agent::save_state_pub(&s)?;
+        info!(agent = %name, "cleared session_id (--fresh-session)");
+    }
+
+    if pid > 0 && std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+        crate::app::mcp_service::stop_agent_process(name, pid).await;
+        println!("agent {}: sent SIGTERM to pid {}", name, pid);
+    } else {
+        // Already stopped — restart still succeeds (no-op kill, supervisor
+        // will respawn on next task).
+        println!("agent {}: already stopped (no live pid)", name);
+    }
+
+    // Mark restarting so external observers see a transition.
+    if let Ok(mut s) = agent::load_state(name) {
+        s.status = "restarting".to_string();
+        let _ = agent::save_state_pub(&s);
+    }
+
+    // Poll the state file for status=idle (ready). The worker loop sets
+    // status to "idle" via set_idle() once it has finished its current task
+    // and is waiting on the bus.
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        if let Ok(s) = agent::load_state(name) {
+            // "idle" or "ready" both count as ready. "working" / "restarting"
+            // do not.
+            if s.status == "idle" || s.status == "ready" {
+                println!("agent {}: ready", name);
+                return Ok(());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "agent '{}' did not return to ready within {}s",
+                name,
+                timeout_secs
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
