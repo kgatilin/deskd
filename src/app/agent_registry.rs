@@ -6,7 +6,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
@@ -118,6 +118,13 @@ fn state_path(name: &str) -> PathBuf {
     config::state_dir().join(format!("{}.yaml", name))
 }
 
+/// Like `state_path`, but resolves the agents dir under an explicit home path
+/// instead of `$HOME`. Used by tests so they don't have to mutate process env
+/// (which races under parallel test harness; see #423 CI flake on PR #428).
+fn state_path_in(home: &Path, name: &str) -> PathBuf {
+    crate::infra::paths::state_dir_in(home).join(format!("{}.yaml", name))
+}
+
 fn log_path(name: &str) -> PathBuf {
     config::log_dir().join(format!("{}.log", name))
 }
@@ -153,21 +160,44 @@ pub(crate) fn rotate_stream_log(path: &PathBuf, max_bytes: u64) {
 
 pub fn load_state(name: &str) -> Result<AgentState> {
     let path = state_path(name);
+    load_state_at(&path, name)
+}
+
+/// Like `load_state`, but reads from `~/.deskd/agents/<name>.yaml` under an
+/// explicit `home` directory instead of `$HOME`. Used by tests to avoid
+/// mutating process env (see #423 / PR #428 CI flake).
+pub fn load_state_in(home: &Path, name: &str) -> Result<AgentState> {
+    let path = state_path_in(home, name);
+    load_state_at(&path, name)
+}
+
+fn load_state_at(path: &Path, name: &str) -> Result<AgentState> {
     let content =
-        std::fs::read_to_string(&path).with_context(|| format!("Agent '{}' not found", name))?;
+        std::fs::read_to_string(path).with_context(|| format!("Agent '{}' not found", name))?;
     let state: AgentState = serde_yaml::from_str(&content)?;
     Ok(state)
 }
 
 pub(crate) fn save_state(state: &AgentState) -> Result<()> {
     let path = state_path(&state.config.name);
-    let content = serde_yaml::to_string(state)?;
-    std::fs::write(&path, content)?;
-    Ok(())
+    save_state_at(&path, state)
 }
 
 pub fn save_state_pub(state: &AgentState) -> Result<()> {
     save_state(state)
+}
+
+/// Like `save_state_pub`, but writes under an explicit `home` directory
+/// instead of `$HOME`. Used by tests (see #423 / PR #428 CI flake).
+pub fn save_state_in(home: &Path, state: &AgentState) -> Result<()> {
+    let path = state_path_in(home, &state.config.name);
+    save_state_at(&path, state)
+}
+
+fn save_state_at(path: &Path, state: &AgentState) -> Result<()> {
+    let content = serde_yaml::to_string(state)?;
+    std::fs::write(path, content)?;
+    Ok(())
 }
 
 /// Create a new agent (saves state file; does not start a worker process).
