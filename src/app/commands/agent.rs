@@ -143,30 +143,25 @@ pub async fn handle(action: AgentAction) -> Result<()> {
                 println!("No agents registered");
             } else {
                 println!(
-                    "{:<15} {:<12} {:<8} {:<10} {:<12} MODEL",
+                    "{:<15} {:<14} {:<8} {:<10} {:<12} MODEL",
                     "NAME", "STATUS", "TURNS", "COST", "USER"
                 );
+                let thresholds = crate::app::doctor::DoctorThresholds::default();
                 for a in &agents {
                     let domain = agent::to_domain_agent(a, &live);
-                    let status_str = match &domain.status {
-                        crate::domain::agent::AgentStatus::Ready => {
-                            if a.parent.is_some() {
-                                "ready[sub]"
-                            } else {
-                                "ready"
-                            }
-                        }
-                        crate::domain::agent::AgentStatus::Busy { .. } => {
-                            if a.parent.is_some() {
-                                "busy[sub]"
-                            } else {
-                                "busy"
-                            }
-                        }
-                        crate::domain::agent::AgentStatus::Unhealthy { .. } => "unhealthy",
-                    };
+                    // Run the same heuristic the `doctor` command uses so the
+                    // STATUS column is honest (no more `ready` for hung agents
+                    // — see #422).
+                    let verdict = super::doctor::diagnose_one(
+                        &a.config.name,
+                        thresholds.empty_completion_threshold.max(3) * 3,
+                        &thresholds,
+                    )
+                    .map(|(v, _, _)| v)
+                    .ok();
+                    let status_str = format_list_status(verdict.as_ref(), &domain, a);
                     println!(
-                        "{:<15} {:<12} {:<8} ${:<9.2} {:<12} {}",
+                        "{:<15} {:<14} {:<8} ${:<9.2} {:<12} {}",
                         domain.name,
                         status_str,
                         a.total_turns,
@@ -590,6 +585,15 @@ pub async fn handle(action: AgentAction) -> Result<()> {
                 "Run `deskd restart` (or restart the agent's process) for the change to take effect."
             );
         }
+        AgentAction::Doctor {
+            name,
+            last,
+            empty_threshold,
+            idle_minutes,
+            stuck_minutes,
+        } => {
+            super::doctor::handle(name, last, empty_threshold, idle_minutes, stuck_minutes).await?;
+        }
         AgentAction::Spawn {
             name,
             task,
@@ -622,6 +626,34 @@ pub async fn handle(action: AgentAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Format the STATUS column for `agent list`, honoring the doctor verdict
+/// when it surfaces a real problem.
+///
+/// Falls back to the original `ready / busy / unhealthy` labels when the
+/// verdict is `Healthy` so existing consumers (TUI, scripts) keep working.
+fn format_list_status(
+    verdict: Option<&crate::app::doctor::Verdict>,
+    domain: &crate::domain::agent::Agent,
+    state: &agent::AgentState,
+) -> String {
+    use crate::app::doctor::Verdict;
+    let suffix = if state.parent.is_some() { "[sub]" } else { "" };
+    if let Some(v) = verdict {
+        match v {
+            Verdict::Hung { .. } => return format!("🔴 hung{}", suffix),
+            Verdict::Stuck { .. } => return format!("🔴 stuck{}", suffix),
+            Verdict::Dead { .. } => return format!("🔴 dead{}", suffix),
+            Verdict::Idle { .. } => return format!("🟡 idle{}", suffix),
+            Verdict::Healthy { .. } => {} // fall through to base label
+        }
+    }
+    match &domain.status {
+        crate::domain::agent::AgentStatus::Ready => format!("ready{}", suffix),
+        crate::domain::agent::AgentStatus::Busy { .. } => format!("busy{}", suffix),
+        crate::domain::agent::AgentStatus::Unhealthy { .. } => "unhealthy".to_string(),
+    }
 }
 
 /// Parse a stream-json line and print a human-readable summary.

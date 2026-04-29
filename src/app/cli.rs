@@ -321,6 +321,31 @@ pub enum AgentAction {
         #[arg(long, default_value = "50")]
         max_turns: u32,
     },
+    /// Diagnose agent health: print a verdict per agent (or one agent in detail).
+    ///
+    /// Synthesizes signals from the agent state file, process table, recent
+    /// task log entries, and the input inbox into a single 🔴/🟡/🟢 verdict.
+    ///
+    /// Examples:
+    ///   deskd agent doctor              # one verdict line per agent
+    ///   deskd agent doctor life         # detailed breakdown for `life`
+    ///   deskd agent doctor --empty-threshold 5
+    Doctor {
+        /// Agent name. Omit to diagnose all registered agents.
+        name: Option<String>,
+        /// Show the last N task log entries for the detailed view.
+        #[arg(long, default_value = "10")]
+        last: usize,
+        /// Override the consecutive-empty-completions threshold for `Hung`.
+        #[arg(long)]
+        empty_threshold: Option<usize>,
+        /// Override the idle-minutes threshold for `Idle` (default 60).
+        #[arg(long)]
+        idle_minutes: Option<i64>,
+        /// Override the queued-minutes threshold for `Stuck` (default 5).
+        #[arg(long)]
+        stuck_minutes: Option<i64>,
+    },
     /// Update an agent's settings in workspace.yaml.
     ///
     /// Currently supports switching the named container profile referenced
