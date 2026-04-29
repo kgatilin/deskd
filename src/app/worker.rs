@@ -1758,6 +1758,109 @@ mod tests {
         assert!(!empty_restart_allowed(Some(&now), 60));
     }
 
+    // ─── update_empty_completion_state tests (#424) ─────────────────────────
+
+    /// Set up an isolated HOME under /tmp and persist a minimal `AgentState`
+    /// for `name` so `update_empty_completion_state` can load + save it.
+    /// Returns the agent name (caller passes it back to the function under test).
+    fn setup_agent_state(threshold: Option<u32>) -> String {
+        // Unique HOME per test so concurrent runs don't clobber each other's state.
+        let name = format!("emptyfn-{}", uuid::Uuid::new_v4());
+        let tmp = std::env::temp_dir().join(format!("deskd-test-{}", &name));
+        std::fs::create_dir_all(tmp.join(".deskd/agents")).unwrap();
+        // SAFETY: override HOME for the duration of the test. Per-test unique
+        // tmp dir means concurrent tests do not corrupt each other's state file.
+        unsafe { std::env::set_var("HOME", &tmp) };
+
+        let cfg = crate::app::agent::AgentConfig {
+            name: name.clone(),
+            model: "claude-sonnet-4-6".into(),
+            system_prompt: String::new(),
+            work_dir: "/tmp".into(),
+            max_turns: 10,
+            unix_user: None,
+            budget_usd: 50.0,
+            command: vec!["claude".into()],
+            config_path: None,
+            container: None,
+            session: crate::infra::dto::ConfigSessionMode::Persistent,
+            runtime: crate::infra::dto::ConfigAgentRuntime::Claude,
+            kind: crate::infra::dto::ConfigAgentKind::Executor,
+            context: None,
+            compact_threshold: None,
+            auto_compact_threshold_tokens: None,
+            empty_completion_threshold: threshold,
+            empty_completion_restart_min_secs: None,
+        };
+        let state = crate::app::agent::AgentState {
+            config: cfg,
+            pid: 0,
+            session_id: String::new(),
+            total_turns: 0,
+            total_cost: 0.0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: "idle".into(),
+            current_task: String::new(),
+            parent: None,
+            scope: None,
+            can_message: None,
+            env_keys: None,
+            session_start: None,
+            session_cost: 0.0,
+            session_turns: 0,
+            consecutive_empty_completions: 0,
+            last_empty_restart_at: None,
+            total_empty_restarts: 0,
+        };
+        crate::app::agent::save_state_pub(&state).unwrap();
+        name
+    }
+
+    #[test]
+    fn test_update_empty_completion_state_normal_resets_counter() {
+        let name = setup_agent_state(Some(3));
+        // Pre-seed counter to 2 so we can verify the reset path.
+        let mut st = crate::app::agent::load_state(&name).unwrap();
+        st.consecutive_empty_completions = 2;
+        crate::app::agent::save_state_pub(&st).unwrap();
+
+        let outcome = update_empty_completion_state(&name, false);
+        assert_eq!(outcome, EmptyCompletionOutcome::Normal);
+
+        let st = crate::app::agent::load_state(&name).unwrap();
+        assert_eq!(st.consecutive_empty_completions, 0);
+    }
+
+    #[test]
+    fn test_update_empty_completion_state_below_threshold_increments() {
+        let name = setup_agent_state(Some(3));
+
+        let outcome = update_empty_completion_state(&name, true);
+        assert_eq!(outcome, EmptyCompletionOutcome::BelowThreshold);
+        let st = crate::app::agent::load_state(&name).unwrap();
+        assert_eq!(st.consecutive_empty_completions, 1);
+
+        let outcome = update_empty_completion_state(&name, true);
+        assert_eq!(outcome, EmptyCompletionOutcome::BelowThreshold);
+        let st = crate::app::agent::load_state(&name).unwrap();
+        assert_eq!(st.consecutive_empty_completions, 2);
+    }
+
+    #[test]
+    fn test_update_empty_completion_state_threshold_reached() {
+        let name = setup_agent_state(Some(3));
+        // Seed counter to 2 so the next empty completion reaches threshold (3).
+        let mut st = crate::app::agent::load_state(&name).unwrap();
+        st.consecutive_empty_completions = 2;
+        crate::app::agent::save_state_pub(&st).unwrap();
+
+        let outcome = update_empty_completion_state(&name, true);
+        assert_eq!(outcome, EmptyCompletionOutcome::ThresholdReached);
+
+        let st = crate::app::agent::load_state(&name).unwrap();
+        assert_eq!(st.consecutive_empty_completions, 3);
+    }
+
     // ─── budget_enforced tests ───────────────────────────────────────────────
 
     #[test]
