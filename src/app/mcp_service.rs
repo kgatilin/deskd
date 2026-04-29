@@ -922,6 +922,8 @@ mod restart_tests {
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         };
         let state = AgentState {
             config: cfg,
@@ -939,6 +941,9 @@ mod restart_tests {
             session_start: Some("2026-01-01T00:00:00Z".into()),
             session_cost: 0.5,
             session_turns: 3,
+            consecutive_empty_completions: 0,
+            last_empty_restart_at: None,
+            total_empty_restarts: 0,
         };
         crate::app::agent::save_state_in(tmp.path(), &state).unwrap();
         (tmp, name)

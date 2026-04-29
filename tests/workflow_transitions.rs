@@ -571,6 +571,8 @@ async fn test_sm_move_notifies_workflow_engine() {
 /// Starts workflow engine → only the instance without result should be dispatched.
 #[tokio::test]
 async fn test_dispatch_pending_skips_completed_instances() {
+    // Serialize env mutation; setenv is not thread-safe on POSIX.
+    let _env_guard = deskd::test_support::env_lock().lock().await;
     let socket = temp_socket();
     let tmp = temp_dir();
 

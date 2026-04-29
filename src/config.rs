@@ -779,6 +779,8 @@ mod tests {
 
     #[test]
     fn test_expand_env_vars_braces() {
+        // Serialize env mutation; setenv is not thread-safe on POSIX.
+        let _env_guard = crate::test_support::env_lock().blocking_lock();
         unsafe { std::env::set_var("TEST_TOKEN_DESKD", "abc123") };
         let result = expand_env_vars("token: ${TEST_TOKEN_DESKD}");
         assert_eq!(result, "token: abc123");
@@ -786,6 +788,8 @@ mod tests {
 
     #[test]
     fn test_expand_env_vars_dollar() {
+        // Serialize env mutation; setenv is not thread-safe on POSIX.
+        let _env_guard = crate::test_support::env_lock().blocking_lock();
         unsafe { std::env::set_var("TEST_VAR_DESKD", "hello") };
         let result = expand_env_vars("val: $TEST_VAR_DESKD end");
         assert_eq!(result, "val: hello end");

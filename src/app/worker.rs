@@ -1762,14 +1762,19 @@ mod tests {
 
     /// Set up an isolated HOME under /tmp and persist a minimal `AgentState`
     /// for `name` so `update_empty_completion_state` can load + save it.
-    /// Returns the agent name (caller passes it back to the function under test).
-    fn setup_agent_state(threshold: Option<u32>) -> String {
-        // Unique HOME per test so concurrent runs don't clobber each other's state.
+    /// Returns the agent name plus the env-lock guard — callers MUST keep
+    /// the guard alive for the test's full duration so concurrent env
+    /// mutations elsewhere can't race with this test's file I/O.
+    fn setup_agent_state(threshold: Option<u32>) -> (String, tokio::sync::MutexGuard<'static, ()>) {
+        // Acquire the global env lock BEFORE mutating HOME. setenv is not
+        // thread-safe on POSIX; without serialization, concurrent set_var
+        // calls cause UB that flakes unrelated file-I/O tests.
+        let guard = crate::test_support::env_lock().blocking_lock();
         let name = format!("emptyfn-{}", uuid::Uuid::new_v4());
         let tmp = std::env::temp_dir().join(format!("deskd-test-{}", &name));
         std::fs::create_dir_all(tmp.join(".deskd/agents")).unwrap();
-        // SAFETY: override HOME for the duration of the test. Per-test unique
-        // tmp dir means concurrent tests do not corrupt each other's state file.
+        // SAFETY: ENV_LOCK serializes all env-mutating tests, and per-test
+        // unique tmp dir keeps state files from clobbering each other.
         unsafe { std::env::set_var("HOME", &tmp) };
 
         let cfg = crate::app::agent::AgentConfig {
@@ -1813,12 +1818,12 @@ mod tests {
             total_empty_restarts: 0,
         };
         crate::app::agent::save_state_pub(&state).unwrap();
-        name
+        (name, guard)
     }
 
     #[test]
     fn test_update_empty_completion_state_normal_resets_counter() {
-        let name = setup_agent_state(Some(3));
+        let (name, _env_guard) = setup_agent_state(Some(3));
         // Pre-seed counter to 2 so we can verify the reset path.
         let mut st = crate::app::agent::load_state(&name).unwrap();
         st.consecutive_empty_completions = 2;
@@ -1833,7 +1838,7 @@ mod tests {
 
     #[test]
     fn test_update_empty_completion_state_below_threshold_increments() {
-        let name = setup_agent_state(Some(3));
+        let (name, _env_guard) = setup_agent_state(Some(3));
 
         let outcome = update_empty_completion_state(&name, true);
         assert_eq!(outcome, EmptyCompletionOutcome::BelowThreshold);
@@ -1848,7 +1853,7 @@ mod tests {
 
     #[test]
     fn test_update_empty_completion_state_threshold_reached() {
-        let name = setup_agent_state(Some(3));
+        let (name, _env_guard) = setup_agent_state(Some(3));
         // Seed counter to 2 so the next empty completion reaches threshold (3).
         let mut st = crate::app::agent::load_state(&name).unwrap();
         st.consecutive_empty_completions = 2;

@@ -58,7 +58,11 @@ async fn read_one(
         .and_then(|l| serde_json::from_str(&l).ok())
 }
 
-fn setup_state_dir() -> std::path::PathBuf {
+async fn setup_state_dir() -> (std::path::PathBuf, tokio::sync::MutexGuard<'static, ()>) {
+    // Serialize env mutation; setenv is not thread-safe on POSIX. Caller MUST
+    // keep the returned guard alive for the test's full duration so concurrent
+    // env-mutating tests can't race with this test's file I/O.
+    let guard = deskd::test_support::env_lock().lock().await;
     let tmp = std::path::PathBuf::from(format!(
         "/tmp/deskd-test-crash-state-{}",
         std::time::SystemTime::now()
@@ -66,10 +70,10 @@ fn setup_state_dir() -> std::path::PathBuf {
             .unwrap()
             .as_nanos()
     ));
-    // SAFETY: test runs single-threaded at this point.
+    // SAFETY: ENV_LOCK serializes all env-mutating tests across the workspace.
     unsafe { std::env::set_var("HOME", &tmp) };
     std::fs::create_dir_all(tmp.join(".deskd/agents")).unwrap();
-    tmp
+    (tmp, guard)
 }
 
 fn test_agent_config(name: &str) -> deskd::app::agent::AgentConfig {
@@ -98,7 +102,7 @@ fn test_agent_config(name: &str) -> deskd::app::agent::AgentConfig {
 /// State persistence survives crash: session_id, cost, turns preserved.
 #[tokio::test]
 async fn test_state_survives_crash() {
-    let _tmp = setup_state_dir();
+    let (_tmp, _env_guard) = setup_state_dir().await;
 
     let cfg = test_agent_config("crash-agent");
     let state = deskd::app::agent::create(&cfg).await.unwrap();

@@ -862,6 +862,8 @@ created_at: "2024-01-01T00:00:00Z"
 
     #[test]
     fn test_state_save_load_roundtrip() {
+        // Serialize env mutation; setenv is not thread-safe on POSIX.
+        let _env_guard = crate::test_support::env_lock().blocking_lock();
         let tmp =
             std::env::temp_dir().join(format!("deskd-test-agent-state-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();

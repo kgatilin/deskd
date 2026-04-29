@@ -478,6 +478,8 @@ mod tests {
 
     #[test]
     fn test_compute_stats_attributes_subagent_to_parent() {
+        // Serialize env mutation; setenv is not thread-safe on POSIX.
+        let _env_guard = crate::test_support::env_lock().blocking_lock();
         // Set up isolated HOME with two agents: parent "p1" and sub-agent "p1-sub".
         let tmp = std::path::PathBuf::from(format!(
             "/tmp/deskd-test-usage-{}",

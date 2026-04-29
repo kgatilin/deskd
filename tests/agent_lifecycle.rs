@@ -84,6 +84,8 @@ fn make_config(name: &str) -> deskd::app::agent::AgentConfig {
 /// Covers: create, load, update, list, duplicate check, remove, remove-nonexistent.
 #[tokio::test]
 async fn test_agent_state_lifecycle() {
+    // Serialize env mutation; setenv is not thread-safe on POSIX.
+    let _env_guard = deskd::test_support::env_lock().lock().await;
     // Set up isolated HOME.
     let tmp = std::path::PathBuf::from(format!(
         "/tmp/deskd-test-state-{}",
@@ -92,7 +94,7 @@ async fn test_agent_state_lifecycle() {
             .unwrap()
             .as_nanos()
     ));
-    // SAFETY: single test, no other test modifies HOME concurrently in this file.
+    // SAFETY: ENV_LOCK serializes all env-mutating tests across the workspace.
     unsafe { std::env::set_var("HOME", &tmp) };
     std::fs::create_dir_all(tmp.join(".deskd/agents")).unwrap();
 
