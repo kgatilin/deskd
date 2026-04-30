@@ -1083,6 +1083,55 @@ fn budget_enforced(budget_usd: f64) -> bool {
     budget_usd > 0.0
 }
 
+/// Persist a per-turn context measurement to `~/.deskd/logs/<agent>/context.jsonl`
+/// (#403 AC #2). Captures pinned-token count, resolved auto-compact threshold,
+/// and model context window so future strategies (drop-tool-results,
+/// fork-with-synopsis) and `/context` history have an authoritative timeseries.
+///
+/// Best-effort: a missing agent state, missing session, or write failure is
+/// logged as `warn!` and never propagates — the worker must not fail a task
+/// because the observational log couldn't be appended.
+fn log_context_measurement(name: &str, model: &str, usage: &agent::TokenUsage) {
+    let state = match agent::load_state(name) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                agent = %name,
+                error = %e,
+                "context_log: skipped — could not load agent state"
+            );
+            return;
+        }
+    };
+    if state.session_id.trim().is_empty() {
+        // No session yet (first turn, ACP runtime, etc.) — nothing meaningful
+        // to record. context_size already treats these as `n/a`.
+        return;
+    }
+
+    let tokens = usage
+        .input_tokens
+        .saturating_add(usage.cache_creation_input_tokens)
+        .saturating_add(usage.cache_read_input_tokens);
+    let threshold = crate::app::context_size::resolve_auto_compact_threshold(
+        state.config.auto_compact_threshold_tokens,
+    );
+    let context_limit = crate::app::context_size::context_window_for_model(model);
+
+    let entry = crate::app::context_log::ContextLog {
+        ts: chrono::Utc::now().to_rfc3339(),
+        agent: name.to_string(),
+        session_id: state.session_id.clone(),
+        model: model.to_string(),
+        tokens,
+        threshold,
+        context_limit,
+    };
+    if let Err(e) = crate::app::context_log::append(&entry) {
+        warn!(agent = %name, error = %e, "context_log: append failed");
+    }
+}
+
 /// Log a skipped task (budget exceeded or empty payload).
 fn log_skip(name: &str, msg: &Message, ctx: &TaskContext, status: &str, error: Option<&str>) {
     let parent_agent = agent::load_state(name).ok().and_then(|s| s.parent);
@@ -1258,6 +1307,8 @@ async fn handle_task_success(
     if let Err(e) = tasklog::log_task(name, &log_entry) {
         warn!(agent = %name, error = %e, "failed to write task log");
     }
+
+    log_context_measurement(name, model, &turn.token_usage);
 
     let progress_was_streamed = !full_response.is_empty();
     let response = if full_response.is_empty() {

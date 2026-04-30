@@ -21,6 +21,7 @@ pub mod config_changeset;
 pub mod config_reload;
 pub mod config_watcher;
 pub mod context;
+pub mod context_log;
 pub mod context_size;
 pub mod doctor;
 pub mod graph;
