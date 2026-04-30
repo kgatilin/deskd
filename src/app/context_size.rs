@@ -606,6 +606,8 @@ mod tests {
                 context: None,
                 compact_threshold: None,
                 auto_compact_threshold_tokens: None,
+                empty_completion_threshold: None,
+                empty_completion_restart_min_secs: None,
             },
             pid,
             session_id: session_id.into(),
@@ -621,6 +623,9 @@ mod tests {
             session_start: None,
             session_cost: 0.0,
             session_turns: 0,
+            consecutive_empty_completions: 0,
+            last_empty_restart_at: None,
+            total_empty_restarts: 0,
         }
     }
 

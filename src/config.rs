@@ -577,6 +577,15 @@ pub struct SubAgentDef {
     /// then to the built-in default (300k).
     #[serde(default)]
     pub auto_compact_threshold_tokens: Option<u64>,
+    /// Empty-completion auto-restart threshold (issue #424). After this many
+    /// consecutive zero-token / sub-2s completions, the worker is restarted.
+    /// `None` falls back to the workspace default.
+    #[serde(default)]
+    pub empty_completion_threshold: Option<u32>,
+    /// Minimum seconds between auto-restarts triggered by empty-completion
+    /// detection (rate-limit). `None` falls back to the workspace default.
+    #[serde(default)]
+    pub empty_completion_restart_min_secs: Option<u64>,
 }
 
 impl SubAgentDef {
@@ -770,6 +779,8 @@ mod tests {
 
     #[test]
     fn test_expand_env_vars_braces() {
+        // Serialize env mutation; setenv is not thread-safe on POSIX.
+        let _env_guard = crate::test_support::env_lock().blocking_lock();
         unsafe { std::env::set_var("TEST_TOKEN_DESKD", "abc123") };
         let result = expand_env_vars("token: ${TEST_TOKEN_DESKD}");
         assert_eq!(result, "token: abc123");
@@ -777,6 +788,8 @@ mod tests {
 
     #[test]
     fn test_expand_env_vars_dollar() {
+        // Serialize env mutation; setenv is not thread-safe on POSIX.
+        let _env_guard = crate::test_support::env_lock().blocking_lock();
         unsafe { std::env::set_var("TEST_VAR_DESKD", "hello") };
         let result = expand_env_vars("val: $TEST_VAR_DESKD end");
         assert_eq!(result, "val: hello end");
@@ -1603,6 +1616,8 @@ agents:
             compact_threshold: None,
             compact_strategy: None,
             auto_compact_threshold_tokens: None,
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         };
         assert!(sub.validate_work_dir("/tmp/parent").is_ok());
     }
@@ -1627,6 +1642,8 @@ agents:
             compact_threshold: None,
             compact_strategy: None,
             auto_compact_threshold_tokens: None,
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         };
         assert!(sub.validate_work_dir("/tmp/parent").is_err());
     }

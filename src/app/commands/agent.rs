@@ -42,6 +42,8 @@ pub async fn handle(action: AgentAction) -> Result<()> {
                 context: None,
                 compact_threshold: None,
                 auto_compact_threshold_tokens: None,
+                empty_completion_threshold: None,
+                empty_completion_restart_min_secs: None,
             };
             let state = agent::create(&cfg).await?;
             println!("Agent {} created", state.config.name);
@@ -205,6 +207,12 @@ pub async fn handle(action: AgentAction) -> Result<()> {
                 }
             );
             println!("Created:    {}", s.created_at);
+            // Empty-completion detection state (#424).
+            println!("Empty cons: {}", s.consecutive_empty_completions);
+            println!("Empty rstr: {}", s.total_empty_restarts);
+            if let Some(ref ts) = s.last_empty_restart_at {
+                println!("Last empty restart: {}", ts);
+            }
         }
         AgentAction::Read {
             name,

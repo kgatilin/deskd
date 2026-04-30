@@ -392,6 +392,8 @@ mod tests {
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         };
 
         let extra_env = [("DESKD_BUS_SOCKET", "/home/test/.deskd/bus.sock")];
@@ -444,6 +446,8 @@ mod tests {
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         };
         let cmd = build_command(&cfg, &[], &[]);
         let program = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -469,6 +473,8 @@ mod tests {
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         };
         let extra_env = [("DESKD_BUS_SOCKET", "/tmp/bus.sock")];
         let cmd = build_command(&cfg, &[], &extra_env);
@@ -505,6 +511,8 @@ mod tests {
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         };
         let env = auto_compact_env_for(&cfg).expect("env tuple");
         assert_eq!(env.0, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE");
@@ -530,6 +538,8 @@ mod tests {
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: Some(500_000),
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         };
         let env = auto_compact_env_for(&cfg).expect("env tuple");
         // 500k of 1M = 50%.
@@ -556,6 +566,8 @@ mod tests {
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: None,
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         };
         let env = auto_compact_env_for(&cfg).expect("env tuple");
         assert_eq!(env.1, "83");
@@ -580,6 +592,8 @@ mod tests {
             context: None,
             compact_threshold: None,
             auto_compact_threshold_tokens: Some(400_000),
+            empty_completion_threshold: None,
+            empty_completion_restart_min_secs: None,
         };
         let cmd = build_command(&cfg, &[], &[]);
         let envs: Vec<(String, String)> = cmd

@@ -133,6 +133,8 @@ mod tests {
 
     #[test]
     fn test_handle_remind_writes_file() {
+        // Serialize env mutation; setenv is not thread-safe on POSIX.
+        let _env_guard = deskd::test_support::env_lock().blocking_lock();
         let tmp = std::path::PathBuf::from(format!(
             "/tmp/deskd-test-remind-{}",
             std::time::SystemTime::now()

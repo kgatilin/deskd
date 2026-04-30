@@ -656,7 +656,13 @@ mod tests {
 
         let contents = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected 2 alert lines (Degraded + Recovered), got {}: {:?}",
+            lines.len(),
+            contents,
+        );
         let first: AlertRecord = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(first.kind, AlertKind::Degraded);
         let second: AlertRecord = serde_json::from_str(lines[1]).unwrap();
