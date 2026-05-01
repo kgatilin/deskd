@@ -161,7 +161,13 @@ async fn run_schedule(def: ScheduleDef, bus_socket: String, agent_name: String, 
         info!(agent = %agent_name, target = %def.target, action = ?def.action, "schedule firing");
 
         if let Err(e) = fire(&def, &bus_socket, &agent_name, &home_dir).await {
-            warn!(agent = %agent_name, target = %def.target, error = %e, "schedule fire failed");
+            crate::infra::diag::warn_event(
+                Some(&bus_socket),
+                "schedule",
+                "schedule.fire_failed",
+                format!("schedule fire failed for target {}: {}", def.target, e),
+                serde_json::json!({"agent": agent_name, "target": def.target, "cron": def.cron}),
+            );
         }
     }
 }
@@ -298,7 +304,13 @@ async fn fire_github_poll(
                     );
                 }
                 Err(e) => {
-                    warn!(agent = %agent_name, repo = %repo, error = %e, "github_poll issues failed");
+                    crate::infra::diag::warn_event(
+                        Some(bus_socket),
+                        "github_poll",
+                        "transport.poll_failed",
+                        format!("github_poll issues failed for {}: {}", repo, e),
+                        serde_json::json!({"agent": agent_name, "repo": repo, "event": "issues"}),
+                    );
                 }
             }
         }
@@ -327,7 +339,13 @@ async fn fire_github_poll(
                     );
                 }
                 Err(e) => {
-                    warn!(agent = %agent_name, repo = %repo, error = %e, "github_poll issue_comments failed");
+                    crate::infra::diag::warn_event(
+                        Some(bus_socket),
+                        "github_poll",
+                        "transport.poll_failed",
+                        format!("github_poll issue_comments failed for {}: {}", repo, e),
+                        serde_json::json!({"agent": agent_name, "repo": repo, "event": "issue_comments"}),
+                    );
                 }
             }
         }
@@ -356,7 +374,13 @@ async fn fire_github_poll(
                     );
                 }
                 Err(e) => {
-                    warn!(agent = %agent_name, repo = %repo, error = %e, "github_poll pull_requests failed");
+                    crate::infra::diag::warn_event(
+                        Some(bus_socket),
+                        "github_poll",
+                        "transport.poll_failed",
+                        format!("github_poll pull_requests failed for {}: {}", repo, e),
+                        serde_json::json!({"agent": agent_name, "repo": repo, "event": "pull_requests"}),
+                    );
                 }
             }
         }

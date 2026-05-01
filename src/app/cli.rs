@@ -541,6 +541,27 @@ pub enum BusAction {
         #[arg(long, env = "DESKD_AGENT_NAME")]
         agent: Option<String>,
     },
+    /// Tail bus messages matching one or more topic patterns as JSONL.
+    ///
+    /// Each line on stdout is the message payload. Use a glob (`diagnostics.*`)
+    /// to match a topic family, or an exact topic for a single channel.
+    ///
+    /// Examples:
+    ///   deskd bus subscribe diagnostics.warn
+    ///   deskd bus subscribe diagnostics.*
+    ///   deskd bus subscribe --socket /tmp/deskd.sock 'agent:*'
+    Subscribe {
+        /// One or more subscription patterns (exact topic or glob ending in `*`).
+        #[arg(value_name = "PATTERN", required = true, num_args = 1..)]
+        patterns: Vec<String>,
+        /// Bus socket path. Defaults to $DESKD_BUS_SOCKET, or auto-discovered
+        /// from running serve state.
+        #[arg(long, env = "DESKD_BUS_SOCKET")]
+        socket: Option<String>,
+        /// Client name to register on the bus (default: deskd-cli-subscribe).
+        #[arg(long, default_value = "deskd-cli-subscribe")]
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]

@@ -36,7 +36,13 @@ pub async fn watch_system_prompt(config_path: String, bus_socket: String, agent_
         let cfg = match crate::config::UserConfig::load(&config_path) {
             Ok(c) => c,
             Err(e) => {
-                warn!(agent = %agent_name, error = %e, "config_watcher: failed to reload config");
+                crate::infra::diag::warn_event(
+                    Some(&bus_socket),
+                    "config_watcher",
+                    "config.reload_failed",
+                    format!("failed to reload config for agent {}: {}", agent_name, e),
+                    serde_json::json!({"agent": agent_name, "config_path": config_path}),
+                );
                 continue;
             }
         };

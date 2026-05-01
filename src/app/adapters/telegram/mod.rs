@@ -833,7 +833,13 @@ async fn polling_loop(
             result = updates_fut => match result {
                 Ok(u) => u,
                 Err(e) => {
-                    warn!(agent = %agent_name, error = %e, "get_updates error, retrying in 5s");
+                    crate::infra::diag::warn_event(
+                        Some(&socket_path),
+                        "telegram",
+                        "transport.poll_failed",
+                        format!("telegram get_updates failed: {}", e),
+                        serde_json::json!({"agent": agent_name}),
+                    );
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(5)) => {},
                         _ = cancel.cancelled() => {
