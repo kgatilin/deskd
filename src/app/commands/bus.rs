@@ -17,6 +17,13 @@ pub async fn handle(action: BusAction) -> Result<()> {
         } => {
             return handle_api(socket, config_opt, agent).await;
         }
+        BusAction::Subscribe {
+            patterns,
+            socket,
+            name,
+        } => {
+            return handle_subscribe(patterns, socket, name).await;
+        }
         BusAction::Status { socket } => {
             if !std::path::Path::new(&socket).exists() {
                 println!("Bus is not running (socket not found: {})", socket);
@@ -172,6 +179,60 @@ fn resolve_config(explicit: Option<String>) -> Option<String> {
     }
     config::ServeState::load()
         .and_then(|state| state.find_agent_config().map(|a| a.config_path.clone()))
+}
+
+/// Subscribe to one or more bus topics and emit each received message as a
+/// single JSON line on stdout. Runs until the bus connection drops or the
+/// process is interrupted.
+async fn handle_subscribe(
+    patterns: Vec<String>,
+    socket: Option<String>,
+    name: String,
+) -> Result<()> {
+    let bus_socket = resolve_bus_socket(socket)?;
+
+    if !std::path::Path::new(&bus_socket).exists() {
+        anyhow::bail!("Bus socket not found: {}", bus_socket);
+    }
+
+    let mut stream = UnixStream::connect(&bus_socket)
+        .await
+        .map_err(|e| anyhow::anyhow!("Cannot connect to bus at {}: {}", bus_socket, e))?;
+
+    let reg = serde_json::json!({
+        "type": "register",
+        "name": name,
+        "subscriptions": patterns,
+    });
+    let mut line = serde_json::to_string(&reg)?;
+    line.push('\n');
+    stream.write_all(line.as_bytes()).await?;
+
+    info!(
+        socket = %bus_socket,
+        client = %name,
+        patterns = ?patterns,
+        "subscribed; tailing messages as JSONL"
+    );
+
+    let (reader, _writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    while let Some(l) = lines.next_line().await? {
+        let trimmed = l.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Emit just the payload — that's the structured event the producer published.
+        let payload = v.get("payload").cloned().unwrap_or(v);
+        println!("{}", serde_json::to_string(&payload)?);
+    }
+
+    Ok(())
 }
 
 async fn handle_api(
