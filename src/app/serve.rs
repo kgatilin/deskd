@@ -5,6 +5,7 @@ use tracing::info;
 
 use crate::app::{agent, alerts, bus, bus_api, config_reload, worker, workflow};
 use crate::config;
+use crate::infra::diag;
 
 /// Start per-agent buses and workers for all agents in workspace config.
 /// Each agent has its own isolated bus at {work_dir}/.deskd/bus.sock.
@@ -37,7 +38,18 @@ pub async fn serve(config_path: String) -> Result<()> {
         );
     }
     if let Err(e) = serve_state.save() {
-        tracing::warn!(error = %e, "failed to write serve state");
+        let bus_for_diag = workspace
+            .agents
+            .first()
+            .map(|a| a.bus_socket())
+            .unwrap_or_default();
+        diag::warn_event(
+            Some(&bus_for_diag),
+            "supervisor",
+            "state.write_failed",
+            format!("failed to write serve state: {}", e),
+            serde_json::json!({}),
+        );
     }
 
     for def in &workspace.agents {
@@ -65,7 +77,16 @@ pub async fn serve(config_path: String) -> Result<()> {
             let agent_name = name.clone();
             tokio::spawn(async move {
                 if let Err(e) = bus::serve(&bus).await {
-                    tracing::error!(agent = %agent_name, socket = %bus, error = %e, "bus failed");
+                    diag::error_event(
+                        Some(&bus),
+                        "supervisor",
+                        "bus.serve_failed",
+                        format!("bus failed: {}", e),
+                        serde_json::json!({
+                            "agent": agent_name,
+                            "socket": bus,
+                        }),
+                    );
                 }
             });
         }
@@ -88,7 +109,13 @@ pub async fn serve(config_path: String) -> Result<()> {
                 )
                 .await
                 {
-                    tracing::error!(agent = %agent_name, error = %e, "bus_api exited");
+                    diag::error_event(
+                        Some(&bus),
+                        "supervisor",
+                        "bus_api.exited",
+                        format!("bus_api exited: {}", e),
+                        serde_json::json!({ "agent": agent_name }),
+                    );
                 }
             });
             info!(agent = %name, "started bus API handler");
@@ -109,7 +136,13 @@ pub async fn serve(config_path: String) -> Result<()> {
                 )
                 .await
                 {
-                    tracing::error!(agent = %worker_name, error = %e, "worker exited with error");
+                    diag::error_event(
+                        Some(&bus),
+                        "supervisor",
+                        "worker.exited",
+                        format!("worker exited with error: {}", e),
+                        serde_json::json!({ "agent": worker_name }),
+                    );
                 }
             });
         }
@@ -126,7 +159,13 @@ pub async fn serve(config_path: String) -> Result<()> {
                 .map(TryInto::try_into)
                 .collect::<Result<Vec<_>, String>>()
                 .unwrap_or_else(|e| {
-                    tracing::error!(agent = %def.name, "invalid model definition: {e}");
+                    diag::error_event(
+                        Some(&bus_socket),
+                        "supervisor",
+                        "config.invalid_model",
+                        format!("invalid model definition: {}", e),
+                        serde_json::json!({ "agent": def.name }),
+                    );
                     vec![]
                 });
             let agent_name = def.name.clone();
@@ -151,16 +190,24 @@ pub async fn serve(config_path: String) -> Result<()> {
                 let bus_client = match crate::app::bus::connect_bus(&bus).await {
                     Ok(b) => b,
                     Err(e) => {
-                        tracing::error!(
-                            agent = %agent_name,
-                            error = %e,
-                            "workflow engine failed to connect to bus"
+                        diag::error_event(
+                            Some(&bus),
+                            "supervisor",
+                            "workflow.bus_connect_failed",
+                            format!("workflow engine failed to connect to bus: {}", e),
+                            serde_json::json!({ "agent": agent_name }),
                         );
                         return;
                     }
                 };
                 if let Err(e) = workflow::run(&bus_client, models, &sm_store, &task_store).await {
-                    tracing::error!(agent = %agent_name, error = %e, "workflow engine exited");
+                    diag::error_event(
+                        Some(&bus),
+                        "supervisor",
+                        "workflow.exited",
+                        format!("workflow engine exited: {}", e),
+                        serde_json::json!({ "agent": agent_name }),
+                    );
                 }
             });
             info!(agent = %def.name, models = ucfg.models.len(), "started workflow engine");
@@ -228,8 +275,9 @@ pub async fn serve(config_path: String) -> Result<()> {
             let manager = alerts::AlertManager::from_config(&alerts_cfg, &any_socket, "deskd");
             let source = alerts::HeuristicVerdictSource::new(agents_for_source);
             let interval = std::time::Duration::from_secs(alerts_cfg.poll_interval_secs.max(1));
+            let diag_bus = any_socket.clone();
             tokio::spawn(async move {
-                run_alerts_loop(manager, source, interval).await;
+                run_alerts_loop(manager, source, interval, diag_bus).await;
             });
             info!(
                 sinks = alerts_cfg.sinks.len(),
@@ -251,8 +299,12 @@ pub async fn serve(config_path: String) -> Result<()> {
 
 /// Run a single poll-and-dispatch loop for the alert manager.
 /// Exits only when the deskd serve process stops.
-async fn run_alerts_loop<S>(manager: alerts::AlertManager, source: S, interval: std::time::Duration)
-where
+async fn run_alerts_loop<S>(
+    manager: alerts::AlertManager,
+    source: S,
+    interval: std::time::Duration,
+    bus_socket: String,
+) where
     S: alerts::VerdictSource,
 {
     if manager.is_empty() {
@@ -268,7 +320,13 @@ where
         match source.poll().await {
             Ok(reports) => manager.observe(reports).await,
             Err(e) => {
-                tracing::warn!(error = %e, "alert verdict source poll failed");
+                diag::warn_event(
+                    Some(&bus_socket),
+                    "alerts",
+                    "verdict.poll_failed",
+                    format!("alert verdict source poll failed: {}", e),
+                    serde_json::json!({}),
+                );
             }
         }
     }

@@ -222,8 +222,10 @@ pub async fn run(
     let sender_task = {
         let bot = bot.clone();
         let cancel = cancel.clone();
+        let bus = socket_path.clone();
+        let name = agent_name.clone();
         tokio::spawn(async move {
-            outbound_sender(bot, outbound_rx, cancel).await;
+            outbound_sender(bot, outbound_rx, cancel, bus, name).await;
         })
     };
 
@@ -438,6 +440,8 @@ async fn outbound_sender(
     bot: Bot,
     mut rx: mpsc::UnboundedReceiver<OutboundCmd>,
     cancel: CancellationToken,
+    bus_socket: String,
+    agent_name: String,
 ) {
     let mut typing_tasks: HashMap<i64, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut progress_ids: HashMap<i64, teloxide::types::MessageId> = HashMap::new();
@@ -478,7 +482,13 @@ async fn outbound_sender(
                     if result.is_err()
                         && let Err(e) = bot.send_message(chat, chunk).await
                     {
-                        warn!(chat_id = chat_id, error = %e, "failed to send Telegram message");
+                        crate::infra::diag::warn_event(
+                            Some(&bus_socket),
+                            &agent_name,
+                            "transport.send_failed",
+                            format!("failed to send Telegram message: {}", e),
+                            serde_json::json!({ "chat_id": chat_id }),
+                        );
                     }
                 }
 
