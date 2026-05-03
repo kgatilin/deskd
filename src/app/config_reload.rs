@@ -27,12 +27,13 @@
 /// `classify_config_change` inspects what actually changed and returns a
 /// `ConfigChangeset` so only the affected components are restarted, avoiding
 /// unnecessary adapter disruption on system-prompt-only or schedule-only edits.
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::app::agent_components::AgentComponents;
 use crate::app::config_changeset::{ConfigChangeset, classify_config_change};
 use crate::app::{adapters, config_watcher, schedule, worker};
 use crate::config;
+use crate::infra::diag;
 
 /// Spawn all restartable components for an agent and return their handles.
 pub async fn spawn_components(
@@ -58,8 +59,14 @@ pub async fn spawn_components(
         let name = agent_name.to_string();
         let adapter_name = adapter.name().to_string();
         let handle = tokio::spawn(async move {
-            if let Err(e) = adapter.run(bus, name).await {
-                tracing::error!(adapter = %adapter_name, error = %e, "adapter failed");
+            if let Err(e) = adapter.run(bus.clone(), name.clone()).await {
+                diag::error_event(
+                    Some(&bus),
+                    "supervisor",
+                    "adapter.failed",
+                    format!("adapter failed: {}", e),
+                    serde_json::json!({ "adapter": adapter_name, "agent": name }),
+                );
             }
         });
         components.adapter_handles.push(handle);
@@ -175,7 +182,13 @@ pub async fn spawn_components(
                 )
                 .await
                 {
-                    tracing::error!(agent = %sub_name, error = %e, "sub-agent worker exited");
+                    diag::error_event(
+                        Some(&bus),
+                        "supervisor",
+                        "sub_agent.exited",
+                        format!("sub-agent worker exited: {}", e),
+                        serde_json::json!({ "agent": sub_name }),
+                    );
                 }
             });
             components.sub_agent_handles.push(handle);
@@ -199,8 +212,14 @@ async fn spawn_adapters(
         let name = agent_name.to_string();
         let adapter_name = adapter.name().to_string();
         let handle = tokio::spawn(async move {
-            if let Err(e) = adapter.run(bus, name).await {
-                tracing::error!(adapter = %adapter_name, error = %e, "adapter failed");
+            if let Err(e) = adapter.run(bus.clone(), name.clone()).await {
+                diag::error_event(
+                    Some(&bus),
+                    "supervisor",
+                    "adapter.failed",
+                    format!("adapter failed: {}", e),
+                    serde_json::json!({ "adapter": adapter_name, "agent": name }),
+                );
             }
         });
         components.adapter_handles.push(handle);
@@ -279,10 +298,12 @@ pub async fn watch_and_reload(
         let new_user_cfg = match config::UserConfig::load(&cfg_path) {
             Ok(cfg) => cfg,
             Err(e) => {
-                warn!(
-                    agent = %agent_name,
-                    error = %e,
-                    "failed to reload config, components unchanged"
+                diag::warn_event(
+                    Some(&bus_socket),
+                    "config_reload",
+                    "config.reload_failed",
+                    format!("failed to reload config, components unchanged: {}", e),
+                    serde_json::json!({ "agent": agent_name, "path": cfg_path }),
                 );
                 continue;
             }
@@ -362,11 +383,12 @@ pub async fn watch_and_reload(
         for removed in &changeset.removed_sub_agents {
             match crate::app::agent_registry::remove(removed).await {
                 Ok(()) => info!(agent = %agent_name, removed = %removed, "evicted sub-agent state"),
-                Err(e) => warn!(
-                    agent = %agent_name,
-                    removed = %removed,
-                    error = %e,
-                    "failed to evict sub-agent state"
+                Err(e) => diag::warn_event(
+                    Some(&bus_socket),
+                    "config_reload",
+                    "sub_agent.evict_failed",
+                    format!("failed to evict sub-agent state: {}", e),
+                    serde_json::json!({ "agent": agent_name, "removed": removed }),
                 ),
             }
         }
@@ -391,10 +413,12 @@ pub async fn watch_and_reload(
                 );
             }
             Err(e) => {
-                warn!(
-                    agent = %agent_name,
-                    error = %e,
-                    "failed to respawn components after config reload"
+                diag::warn_event(
+                    Some(&bus_socket),
+                    "config_reload",
+                    "components.respawn_failed",
+                    format!("failed to respawn components after config reload: {}", e),
+                    serde_json::json!({ "agent": agent_name }),
                 );
             }
         }
