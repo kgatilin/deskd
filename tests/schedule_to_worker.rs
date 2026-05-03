@@ -14,13 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 fn temp_socket() -> String {
-    format!(
-        "/tmp/deskd-test-sched-{}.sock",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
+    format!("/tmp/deskd-test-sched-{}.sock", uuid::Uuid::new_v4())
 }
 
 async fn connect_and_register(
