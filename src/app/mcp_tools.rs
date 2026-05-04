@@ -1269,6 +1269,65 @@ pub(crate) async fn call_agent_logs(args: &Value, caller: &str) -> Result<Value>
     }))
 }
 
+/// Read recent task log entries (one per completed task) for an agent. Reads
+/// the structured JSONL written by the worker on every task completion, with
+/// `ts`, `source`, `task`, `status`, `turns`, `cost`, `duration_ms`, and
+/// `error` fields. Access mirrors `agent_logs`: caller may read its own
+/// history or a sub-agent's.
+pub(crate) async fn call_agent_tasks(args: &Value, caller: &str) -> Result<Value> {
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .context("agent_tasks: missing required 'name'")?;
+
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    if limit == 0 || limit > 200 {
+        bail!("agent_tasks: 'limit' must be in 1..=200 (got {})", limit);
+    }
+
+    let source_filter = args.get("source").and_then(|v| v.as_str());
+
+    let since = match args.get("since").and_then(|v| v.as_str()) {
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .with_context(|| format!("agent_tasks: 'since' must be RFC3339 (got {:?})", s))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+
+    // Access control: caller may read its own task log or its sub-agents'.
+    if name != caller {
+        let state = crate::app::agent::load_state(name)
+            .with_context(|| format!("agent '{}' not found", name))?;
+        match &state.parent {
+            Some(p) if p == caller => {}
+            _ => bail!(
+                "agent '{}' is not a sub-agent of '{}' — task history access denied",
+                name,
+                caller
+            ),
+        }
+    }
+
+    let path = crate::app::tasklog::log_path(name);
+    let entries = crate::app::tasklog::read_logs_from_path(&path, limit, source_filter, since)?;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&json!({
+                "name": name,
+                "path": path.display().to_string(),
+                "exists": path.exists(),
+                "returned": entries.len(),
+                "tasks": entries,
+            }))?
+        }],
+        "isError": false
+    }))
+}
+
 pub(crate) async fn call_remove_agent(
     args: &Value,
     caller: &str,
@@ -1968,6 +2027,145 @@ mod tests {
         assert_eq!(parsed["exists"], false);
         assert_eq!(parsed["source"], "stderr");
         assert!(parsed["lines"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_tasks_rejects_missing_name() {
+        let err = call_agent_tasks(&json!({}), "caller").await.unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("name"), "expected name error, got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn agent_tasks_rejects_bad_limit() {
+        for bad in [0u64, 500] {
+            let err = call_agent_tasks(&json!({"name": "x", "limit": bad}), "x")
+                .await
+                .unwrap_err();
+            let msg = format!("{:#}", err);
+            assert!(msg.contains("limit"), "expected limit error, got: {}", msg);
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_tasks_rejects_bad_since() {
+        let err = call_agent_tasks(&json!({"name": "x", "since": "yesterday"}), "x")
+            .await
+            .unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("since"), "expected since error, got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn agent_tasks_self_read_nonexistent_returns_exists_false() {
+        let unique = format!("__agent_tasks_test_{}", Uuid::new_v4());
+        let resp = call_agent_tasks(&json!({"name": unique, "limit": 10}), &unique)
+            .await
+            .expect("self-read must not error on missing file");
+        let text = resp["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["exists"], false);
+        assert_eq!(parsed["returned"], 0);
+        assert!(parsed["tasks"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_tasks_returns_filtered_entries_from_log() {
+        // Write a synthetic tasks.jsonl into a temporary HOME, then call
+        // call_agent_tasks against it and verify filtering + ordering.
+        let env_guard = crate::test_support::env_lock().lock().await;
+        let tmp =
+            std::path::PathBuf::from(format!("/tmp/deskd-test-agent-tasks-{}", Uuid::new_v4()));
+        // SAFETY: ENV_LOCK serializes env-mutating tests workspace-wide.
+        unsafe { std::env::set_var("HOME", &tmp) };
+
+        let agent = "history-agent";
+        let log = crate::app::tasklog::log_path(agent);
+        let entries = vec![
+            crate::app::tasklog::TaskLog {
+                ts: "2026-05-01T10:00:00Z".into(),
+                source: "telegram".into(),
+                turns: 3,
+                cost: 0.05,
+                duration_ms: 1500,
+                status: "ok".into(),
+                task: "first".into(),
+                error: None,
+                msg_id: "m1".into(),
+                github_repo: None,
+                github_pr: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                session_count: None,
+                tool_use_count: None,
+                parent_agent: None,
+            },
+            crate::app::tasklog::TaskLog {
+                ts: "2026-05-02T10:00:00Z".into(),
+                source: "github_poll".into(),
+                turns: 5,
+                cost: 0.10,
+                duration_ms: 4000,
+                status: "error".into(),
+                task: "second".into(),
+                error: Some("boom".into()),
+                msg_id: "m2".into(),
+                github_repo: Some("owner/repo".into()),
+                github_pr: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                session_count: None,
+                tool_use_count: None,
+                parent_agent: None,
+            },
+        ];
+        for e in &entries {
+            crate::app::tasklog::log_task_to_path(&log, e).unwrap();
+        }
+
+        // No filters → both entries returned, oldest-first preserved.
+        let resp = call_agent_tasks(&json!({"name": agent, "limit": 10}), agent)
+            .await
+            .expect("self-read must succeed");
+        let text = resp["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["exists"], true);
+        assert_eq!(parsed["returned"], 2);
+        let tasks = parsed["tasks"].as_array().unwrap();
+        assert_eq!(tasks[0]["msg_id"], "m1");
+        assert_eq!(tasks[1]["msg_id"], "m2");
+        assert_eq!(tasks[1]["error"], "boom");
+
+        // Source filter narrows to one entry.
+        let resp = call_agent_tasks(
+            &json!({"name": agent, "limit": 10, "source": "github_poll"}),
+            agent,
+        )
+        .await
+        .expect("filtered self-read must succeed");
+        let text = resp["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["returned"], 1);
+        assert_eq!(parsed["tasks"][0]["source"], "github_poll");
+
+        // since filter excludes older entries.
+        let resp = call_agent_tasks(
+            &json!({"name": agent, "limit": 10, "since": "2026-05-02T00:00:00Z"}),
+            agent,
+        )
+        .await
+        .expect("since-filtered self-read must succeed");
+        let text = resp["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["returned"], 1);
+        assert_eq!(parsed["tasks"][0]["msg_id"], "m2");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        drop(env_guard);
     }
 
     #[tokio::test]

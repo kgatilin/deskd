@@ -610,6 +610,32 @@ fn handle_tools_list(
         }
     }));
     tools.push(json!({
+        "name": "agent_tasks",
+        "description": "Read recent task log entries (one per completed task) for an agent. Returns structured records with status (ok/error/skip/empty), source (telegram, github_poll, agent:<name>, ...), turns, cost, duration_ms, and error. Useful for seeing whether a sub-agent processed a message and what happened. Access mirrors agent_logs: caller may read its own history or a sub-agent's.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Agent name"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of recent entries to return (1..=200, default 20)"
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Filter to entries from a specific source channel (e.g. 'telegram', 'github_poll', 'cli')"
+                },
+                "since": {
+                    "type": "string",
+                    "description": "RFC3339 timestamp; only return entries newer than this"
+                }
+            },
+            "required": ["name"]
+        }
+    }));
+    tools.push(json!({
         "name": "bus_status",
         "description": "Snapshot of bus connectivity for diagnostics. Reports internal bus state (running, sub-agents with alive flag) and host bus (clients currently connected). Sub-agent visibility scoped to caller's children.",
         "inputSchema": {
@@ -817,6 +843,7 @@ async fn handle_tools_call(
         "list_agents" => mcp_tools::call_list_agents(agent_name, internal_bus).await,
         "remove_agent" => mcp_tools::call_remove_agent(args, agent_name, internal_bus).await,
         "agent_logs" => mcp_tools::call_agent_logs(args, agent_name).await,
+        "agent_tasks" => mcp_tools::call_agent_tasks(args, agent_name).await,
         "bus_status" => mcp_tools::call_bus_status(agent_name, bus_socket, internal_bus).await,
         "get_scope" => mcp_tools::call_get_scope(agent_name, user_config, internal_bus).await,
         "sm_create" => {
