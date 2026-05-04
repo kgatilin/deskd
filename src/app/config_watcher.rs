@@ -4,7 +4,7 @@
 /// Polls the agent's deskd.yaml file for system_prompt changes. When detected,
 /// updates the stored agent state and sends a bus message with the new prompt
 /// content so the worker injects it into the existing session (no restart).
-use tracing::{info, warn};
+use tracing::info;
 
 /// Watch a config file for system_prompt changes and inject updates.
 ///
@@ -16,7 +16,16 @@ pub async fn watch_system_prompt(config_path: String, bus_socket: String, agent_
     let mut last_prompt = match crate::config::UserConfig::load(&config_path) {
         Ok(cfg) => cfg.system_prompt,
         Err(e) => {
-            warn!(agent = %agent_name, error = %e, "config_watcher: failed to load initial config");
+            crate::infra::diag::warn_event(
+                Some(&bus_socket),
+                "config_watcher",
+                "config.load_failed",
+                format!(
+                    "failed to load initial config for agent {}: {}",
+                    agent_name, e
+                ),
+                serde_json::json!({"agent": agent_name, "config_path": config_path}),
+            );
             String::new()
         }
     };
@@ -61,12 +70,27 @@ pub async fn watch_system_prompt(config_path: String, bus_socket: String, agent_
             Ok(mut state) => {
                 state.config.system_prompt = cfg.system_prompt.clone();
                 if let Err(e) = crate::app::agent::save_state_pub(&state) {
-                    warn!(agent = %agent_name, error = %e, "config_watcher: failed to save updated state");
+                    crate::infra::diag::warn_event(
+                        Some(&bus_socket),
+                        "config_watcher",
+                        "config.state_save_failed",
+                        format!(
+                            "failed to save updated state for agent {}: {}",
+                            agent_name, e
+                        ),
+                        serde_json::json!({"agent": agent_name}),
+                    );
                     continue;
                 }
             }
             Err(e) => {
-                warn!(agent = %agent_name, error = %e, "config_watcher: failed to load agent state");
+                crate::infra::diag::warn_event(
+                    Some(&bus_socket),
+                    "config_watcher",
+                    "config.state_load_failed",
+                    format!("failed to load agent state for {}: {}", agent_name, e),
+                    serde_json::json!({"agent": agent_name}),
+                );
                 continue;
             }
         }
@@ -81,7 +105,16 @@ pub async fn watch_system_prompt(config_path: String, bus_socket: String, agent_
         if let Err(e) =
             crate::app::bus::send_message(&bus_socket, "config-watcher", &target, &task).await
         {
-            warn!(agent = %agent_name, error = %e, "config_watcher: failed to send prompt update message");
+            crate::infra::diag::warn_event(
+                Some(&bus_socket),
+                "config_watcher",
+                "transport.bus_send_failed",
+                format!(
+                    "failed to send prompt update message to agent {}: {}",
+                    agent_name, e
+                ),
+                serde_json::json!({"agent": agent_name, "target": target}),
+            );
             continue;
         }
 
