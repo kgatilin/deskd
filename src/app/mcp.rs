@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::app::mcp_protocol::{
     Request, Response, connect_bus_listener, emit_channel_notification, handle_initialize,
@@ -68,7 +68,13 @@ pub async fn run(agent_name: &str) -> Result<()> {
                     Ok(Some(l)) => l,
                     Ok(None) => break, // stdin closed
                     Err(e) => {
-                        warn!(error = %e, "failed to read line");
+                        crate::infra::diag::warn_event(
+                            Some(&bus_socket),
+                            &format!("mcp-server-{}", agent_name),
+                            "transport.read_failed",
+                            format!("MCP server failed to read line from stdin: {}", e),
+                            serde_json::json!({"agent": agent_name}),
+                        );
                         break;
                     }
                 };
@@ -88,7 +94,16 @@ pub async fn run(agent_name: &str) -> Result<()> {
                 let req: Request = match serde_json::from_str(trimmed) {
                     Ok(r) => r,
                     Err(e) => {
-                        warn!(error = %e, line = %trimmed, "failed to parse JSON-RPC request");
+                        crate::infra::diag::warn_event(
+                            Some(&bus_socket),
+                            &format!("mcp-server-{}", agent_name),
+                            "transport.invalid_message",
+                            format!("MCP server failed to parse JSON-RPC request: {}", e),
+                            serde_json::json!({
+                                "agent": agent_name,
+                                "line_preview": trimmed.chars().take(200).collect::<String>(),
+                            }),
+                        );
                         let resp = Response::err(None, -32700, "Parse error");
                         let mut out = stdout.lock().await;
                         write_response(&mut *out, &resp).await?;
@@ -133,11 +148,23 @@ pub async fn run(agent_name: &str) -> Result<()> {
                         }
                     }
                     Ok(None) => {
-                        warn!("bus connection closed — channel notifications disabled");
+                        crate::infra::diag::warn_event(
+                            Some(&bus_socket),
+                            &format!("mcp-server-{}", agent_name),
+                            "transport.bus_disconnected",
+                            "bus connection closed — channel notifications disabled".to_string(),
+                            serde_json::json!({"agent": agent_name}),
+                        );
                         bus_rx = None;
                     }
                     Err(e) => {
-                        warn!(error = %e, "bus read error");
+                        crate::infra::diag::warn_event(
+                            Some(&bus_socket),
+                            &format!("mcp-server-{}", agent_name),
+                            "transport.bus_read_failed",
+                            format!("MCP server bus read error: {}", e),
+                            serde_json::json!({"agent": agent_name}),
+                        );
                     }
                     _ => {} // empty line, skip
                 }
