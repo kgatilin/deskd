@@ -13,10 +13,7 @@ fn temp_socket(label: &str) -> String {
     format!(
         "/tmp/deskd-test-diag-{}-{}.sock",
         label,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        uuid::Uuid::new_v4()
     )
 }
 
@@ -129,6 +126,97 @@ async fn diagnostics_glob_receives_warn_and_error() {
     }
     topics.sort();
     assert_eq!(topics, vec!["diagnostics.error", "diagnostics.warn"]);
+
+    let _ = std::fs::remove_file(&socket);
+}
+
+/// When a message has no matching subscriber on a non-`diagnostics.*` target,
+/// the bus should publish a `bus.undeliverable` diagnostic so monitors see it.
+#[tokio::test]
+async fn bus_undeliverable_publishes_diag_event() {
+    let socket = temp_socket("undeliverable");
+
+    let sock = socket.clone();
+    tokio::spawn(async move {
+        deskd::app::bus::serve(&sock).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (mut sub_rx, _sub_tx) =
+        connect_subscriber(&socket, "diag-watcher", &["diagnostics.warn"]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (_unused_rx, mut sender_tx) = connect_subscriber(&socket, "test-sender", &[]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let send = serde_json::json!({
+        "type": "message",
+        "id": uuid::Uuid::new_v4().to_string(),
+        "source": "test-sender",
+        "target": "unmatched.topic",
+        "payload": {"hello": "world"},
+    });
+    let mut line = serde_json::to_string(&send).unwrap();
+    line.push('\n');
+    sender_tx.write_all(line.as_bytes()).await.unwrap();
+
+    let received = read_one(&mut sub_rx, 2000).await;
+    assert!(
+        received.is_some(),
+        "diag-watcher should receive bus.undeliverable event"
+    );
+    let received = received.unwrap();
+    assert_eq!(received["target"], "diagnostics.warn");
+    let payload = &received["payload"];
+    assert_eq!(payload["topic"], "diagnostics.warn");
+    assert_eq!(payload["source"], "bus");
+    assert_eq!(payload["kind"], "bus.undeliverable");
+    assert_eq!(payload["details"]["target"], "unmatched.topic");
+    assert_eq!(payload["details"]["source"], "test-sender");
+
+    let _ = std::fs::remove_file(&socket);
+}
+
+/// When the undeliverable message itself targets `diagnostics.*`, the bus
+/// must NOT publish another `bus.undeliverable` event — that would loop on
+/// every diag emission whose topic has no subscriber.
+///
+/// Subscribe a watcher to `diagnostics.warn`, then send a message to
+/// `diagnostics.error` (a different diagnostic topic with no subscriber).
+/// Without the guard the bus would publish a `bus.undeliverable` event to
+/// `diagnostics.warn`; the watcher would see it. With the guard, the watcher
+/// receives nothing.
+#[tokio::test]
+async fn bus_undeliverable_does_not_recurse_on_diagnostics_target() {
+    let socket = temp_socket("no-recurse");
+
+    let sock = socket.clone();
+    tokio::spawn(async move {
+        deskd::app::bus::serve(&sock).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (mut sub_rx, _sub_tx) =
+        connect_subscriber(&socket, "diag-watcher", &["diagnostics.warn"]).await;
+    let (_unused_rx, mut sender_tx) = connect_subscriber(&socket, "test-sender", &[]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let send = serde_json::json!({
+        "type": "message",
+        "id": uuid::Uuid::new_v4().to_string(),
+        "source": "test-sender",
+        "target": "diagnostics.error",
+        "payload": {"x": 1},
+    });
+    let mut line = serde_json::to_string(&send).unwrap();
+    line.push('\n');
+    sender_tx.write_all(line.as_bytes()).await.unwrap();
+
+    let received = read_one(&mut sub_rx, 500).await;
+    assert!(
+        received.is_none(),
+        "bus must not publish bus.undeliverable when the undeliverable target is itself a diagnostics.* topic"
+    );
 
     let _ = std::fs::remove_file(&socket);
 }

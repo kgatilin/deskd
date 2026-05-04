@@ -8,6 +8,7 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::domain::message::Message;
+use crate::infra::diag;
 use crate::infra::dto::{BusEnvelope, BusMessage};
 
 type Tx = mpsc::UnboundedSender<Message>;
@@ -20,12 +21,25 @@ struct Client {
 
 struct BusState {
     clients: HashMap<String, Client>,
+    /// Bus's own socket path. When set, undeliverable warnings publish a
+    /// best-effort `bus.undeliverable` event to `diagnostics.warn` (#426).
+    /// `None` in unit tests where there is no listening socket.
+    socket_path: Option<String>,
 }
 
 impl BusState {
-    fn new() -> Self {
+    fn with_socket(socket_path: impl Into<String>) -> Self {
         Self {
             clients: HashMap::new(),
+            socket_path: Some(socket_path.into()),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        Self {
+            clients: HashMap::new(),
+            socket_path: None,
         }
     }
 
@@ -115,6 +129,19 @@ impl BusState {
 
             if !delivered {
                 warn!(target = %target, "no subscriber for target");
+
+                if !target.starts_with("diagnostics.") {
+                    diag::warn_event(
+                        self.socket_path.as_deref(),
+                        "bus",
+                        "bus.undeliverable",
+                        format!("no subscriber for target {target}"),
+                        serde_json::json!({
+                            "target": target,
+                            "source": msg.source,
+                        }),
+                    );
+                }
             }
         }
     }
@@ -139,7 +166,7 @@ pub async fn serve(socket_path: &str) -> Result<()> {
 
     info!(socket = %socket_path, "bus listening");
 
-    let state = Arc::new(RwLock::new(BusState::new()));
+    let state = Arc::new(RwLock::new(BusState::with_socket(socket_path)));
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -273,7 +300,7 @@ mod tests {
     use std::collections::HashSet;
 
     fn make_bus() -> BusState {
-        BusState::new()
+        BusState::for_test()
     }
 
     fn register_client(

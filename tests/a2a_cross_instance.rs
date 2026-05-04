@@ -23,13 +23,7 @@ use deskd::app::a2a::{AgentAuthentication, AgentCapabilities, AgentCard, AgentSk
 use deskd::app::a2a_server::{A2aState, A2aTaskRegistry, router};
 
 fn temp_socket() -> String {
-    format!(
-        "/tmp/deskd-a2a-cross-{}.sock",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
+    format!("/tmp/deskd-a2a-cross-{}.sock", uuid::Uuid::new_v4())
 }
 
 /// Connect to a bus and register; return (lines reader, writer).

@@ -19,23 +19,11 @@ use tokio::net::UnixStream;
 use deskd::ports::bus::MessageBus;
 
 fn temp_socket() -> String {
-    format!(
-        "/tmp/deskd-test-wf-{}.sock",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
+    format!("/tmp/deskd-test-wf-{}.sock", uuid::Uuid::new_v4())
 }
 
 fn temp_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(format!(
-        "/tmp/deskd-test-wf-dir-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+    std::path::PathBuf::from(format!("/tmp/deskd-test-wf-dir-{}", uuid::Uuid::new_v4()))
 }
 
 async fn connect_and_register(
