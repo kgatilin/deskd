@@ -101,7 +101,16 @@ pub async fn watch_and_reload(
                 info!(agent = %agent_name, added, removed, "schedules reloaded");
             }
             Err(e) => {
-                warn!(agent = %agent_name, error = %e, "failed to reload config, schedules stopped");
+                crate::infra::diag::warn_event(
+                    Some(&bus_socket),
+                    "schedule_watcher",
+                    "config.reload_failed",
+                    format!(
+                        "failed to reload config for agent {}, schedules stopped: {}",
+                        agent_name, e
+                    ),
+                    serde_json::json!({"agent": agent_name, "config_path": config_path}),
+                );
             }
         }
     }
@@ -115,7 +124,16 @@ async fn run_schedule(def: ScheduleDef, bus_socket: String, agent_name: String, 
     let schedule = match Schedule::from_str(&def.cron) {
         Ok(s) => s,
         Err(e) => {
-            warn!(agent = %agent_name, cron = %def.cron, error = %e, "invalid cron expression, schedule skipped");
+            crate::infra::diag::warn_event(
+                Some(&bus_socket),
+                "schedule",
+                "config.invalid",
+                format!(
+                    "invalid cron expression {:?}, schedule skipped: {}",
+                    def.cron, e
+                ),
+                serde_json::json!({"agent": agent_name, "cron": def.cron, "target": def.target}),
+            );
             return;
         }
     };
@@ -231,7 +249,16 @@ async fn fire_github_poll(
     let cfg = match &def.config {
         Some(c) => c,
         None => {
-            warn!(agent = %agent_name, "github_poll schedule has no config, skipping");
+            crate::infra::diag::warn_event(
+                Some(bus_socket),
+                "github_poll",
+                "config.invalid",
+                format!(
+                    "github_poll schedule for agent {} has no config, skipping",
+                    agent_name
+                ),
+                serde_json::json!({"agent": agent_name, "target": def.target}),
+            );
             return Ok(());
         }
     };
@@ -494,7 +521,16 @@ async fn poll_issues(
         )
         .await
         {
-            warn!(error = %e, "failed to post github issue to bus");
+            crate::infra::diag::warn_event(
+                Some(bus_socket),
+                "github_poll",
+                "transport.bus_post_failed",
+                format!(
+                    "failed to post github issue {}#{} to bus: {}",
+                    repo, number, e
+                ),
+                serde_json::json!({"agent": agent_name, "repo": repo, "issue": number, "target": target}),
+            );
         }
         count += 1;
     }
@@ -587,7 +623,16 @@ async fn poll_issue_comments(
         )
         .await
         {
-            warn!(error = %e, "failed to post github comment to bus");
+            crate::infra::diag::warn_event(
+                Some(bus_socket),
+                "github_poll",
+                "transport.bus_post_failed",
+                format!(
+                    "failed to post github comment on {}#{} to bus: {}",
+                    repo, issue_number, e
+                ),
+                serde_json::json!({"agent": agent_name, "repo": repo, "issue": issue_number, "target": target, "kind": "comment"}),
+            );
         }
         count += 1;
     }
@@ -686,7 +731,13 @@ async fn poll_pull_requests(
         )
         .await
         {
-            warn!(error = %e, "failed to post github PR to bus");
+            crate::infra::diag::warn_event(
+                Some(bus_socket),
+                "github_poll",
+                "transport.bus_post_failed",
+                format!("failed to post github PR {}#{} to bus: {}", repo, number, e),
+                serde_json::json!({"agent": agent_name, "repo": repo, "pr": number, "target": target}),
+            );
         }
         count += 1;
     }
