@@ -71,9 +71,17 @@ pub async fn run(adapter: DiscordAdapter, bus_socket: String, agent_name: String
     // Task 1: Discord gateway (handles incoming messages via EventHandler)
     let gateway_task = {
         let agent = agent_name.clone();
+        let bus = bus_socket.clone();
+        let source = adapter_name.clone();
         tokio::spawn(async move {
             if let Err(e) = client.start().await {
-                tracing::error!(agent = %agent, error = %e, "Discord gateway failed");
+                crate::infra::diag::error_event(
+                    Some(&bus),
+                    &source,
+                    "adapter.failed",
+                    format!("Discord gateway failed: {}", e),
+                    serde_json::json!({"agent": agent, "task": "gateway"}),
+                );
             }
         })
     };
@@ -82,10 +90,17 @@ pub async fn run(adapter: DiscordAdapter, bus_socket: String, agent_name: String
     let outbound_task = {
         let bus = bus_socket.clone();
         let name = adapter_name.clone();
+        let source = adapter_name.clone();
         let http = http.clone();
         tokio::spawn(async move {
             if let Err(e) = bus_loop(&bus, &name, http).await {
-                tracing::error!(error = %e, "discord bus loop failed");
+                crate::infra::diag::error_event(
+                    Some(&bus),
+                    &source,
+                    "adapter.failed",
+                    format!("discord bus loop failed: {}", e),
+                    serde_json::json!({"task": "bus_loop"}),
+                );
             }
         })
     };
@@ -102,9 +117,27 @@ pub async fn run(adapter: DiscordAdapter, bus_socket: String, agent_name: String
     info!(agent = %agent_name, "Discord adapter started");
 
     tokio::select! {
-        _ = gateway_task => warn!(agent = %agent_name, "discord gateway task exited"),
-        _ = outbound_task => warn!(agent = %agent_name, "discord outbound task exited"),
-        _ = inbound_task => warn!(agent = %agent_name, "discord inbound task exited"),
+        _ = gateway_task => crate::infra::diag::warn_event(
+            Some(&bus_socket),
+            &adapter_name,
+            "adapter.task_exited",
+            format!("discord gateway task exited for agent {}", agent_name),
+            serde_json::json!({"agent": agent_name, "task": "gateway"}),
+        ),
+        _ = outbound_task => crate::infra::diag::warn_event(
+            Some(&bus_socket),
+            &adapter_name,
+            "adapter.task_exited",
+            format!("discord outbound task exited for agent {}", agent_name),
+            serde_json::json!({"agent": agent_name, "task": "outbound"}),
+        ),
+        _ = inbound_task => crate::infra::diag::warn_event(
+            Some(&bus_socket),
+            &adapter_name,
+            "adapter.task_exited",
+            format!("discord inbound task exited for agent {}", agent_name),
+            serde_json::json!({"agent": agent_name, "task": "inbound"}),
+        ),
     }
 
     Ok(())
@@ -180,7 +213,13 @@ async fn bus_loop(socket_path: &str, adapter_name: &str, http: Arc<Http>) -> Res
         let msg: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "discord adapter: invalid message from bus");
+                crate::infra::diag::warn_event(
+                    Some(socket_path),
+                    adapter_name,
+                    "transport.invalid_message",
+                    format!("discord adapter: invalid message from bus: {}", e),
+                    serde_json::json!({"raw_line_len": line.len()}),
+                );
                 continue;
             }
         };
@@ -191,7 +230,13 @@ async fn bus_loop(socket_path: &str, adapter_name: &str, http: Arc<Http>) -> Res
             let channel_id: u64 = match channel_id_str.parse() {
                 Ok(id) => id,
                 Err(_) => {
-                    warn!(target = %target, "discord adapter: invalid channel_id in target");
+                    crate::infra::diag::warn_event(
+                        Some(socket_path),
+                        adapter_name,
+                        "transport.invalid_target",
+                        format!("discord adapter: invalid channel_id in target {:?}", target),
+                        serde_json::json!({"target": target}),
+                    );
                     continue;
                 }
             };
@@ -210,7 +255,16 @@ async fn bus_loop(socket_path: &str, adapter_name: &str, http: Arc<Http>) -> Res
 
             let channel = serenity::model::id::ChannelId::new(channel_id);
             if let Err(e) = channel.say(&http, text).await {
-                warn!(channel_id = channel_id, error = %e, "failed to send Discord message");
+                crate::infra::diag::warn_event(
+                    Some(socket_path),
+                    adapter_name,
+                    "transport.send_failed",
+                    format!(
+                        "failed to send Discord message to channel {}: {}",
+                        channel_id, e
+                    ),
+                    serde_json::json!({"channel_id": channel_id}),
+                );
             }
         }
     }
@@ -241,7 +295,16 @@ async fn inbound_loop(
         )
         .await
         {
-            warn!(channel_id = channel_id, error = %e, "failed to publish Discord message to bus");
+            crate::infra::diag::warn_event(
+                Some(bus_socket),
+                &format!("discord-{}", agent_name),
+                "transport.bus_post_failed",
+                format!(
+                    "failed to publish Discord message from channel {} to bus: {}",
+                    channel_id, e
+                ),
+                serde_json::json!({"agent": agent_name, "channel_id": channel_id}),
+            );
         }
     }
 }
