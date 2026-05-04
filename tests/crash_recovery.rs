@@ -15,13 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 fn temp_socket() -> String {
-    format!(
-        "/tmp/deskd-test-crash-{}.sock",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
+    format!("/tmp/deskd-test-crash-{}.sock", uuid::Uuid::new_v4())
 }
 
 async fn connect_and_register(
@@ -65,10 +59,7 @@ async fn setup_state_dir() -> (std::path::PathBuf, tokio::sync::MutexGuard<'stat
     let guard = deskd::test_support::env_lock().lock().await;
     let tmp = std::path::PathBuf::from(format!(
         "/tmp/deskd-test-crash-state-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        uuid::Uuid::new_v4()
     ));
     // SAFETY: ENV_LOCK serializes all env-mutating tests across the workspace.
     unsafe { std::env::set_var("HOME", &tmp) };
@@ -300,13 +291,8 @@ async fn test_crash_error_delivered_to_sender() {
 /// Task log records error status on crash.
 #[tokio::test]
 async fn test_tasklog_records_crash_error() {
-    let log_dir = std::path::PathBuf::from(format!(
-        "/tmp/deskd-test-crashlog-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let log_dir =
+        std::path::PathBuf::from(format!("/tmp/deskd-test-crashlog-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&log_dir).unwrap();
 
     // Create a task log entry for a crashed task (what worker does on error).

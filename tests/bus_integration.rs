@@ -9,13 +9,7 @@ use tokio::net::UnixStream;
 
 /// Create a temp socket path that won't collide with other tests.
 fn temp_socket() -> String {
-    format!(
-        "/tmp/deskd-test-bus-{}.sock",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
+    format!("/tmp/deskd-test-bus-{}.sock", uuid::Uuid::new_v4())
 }
 
 /// Helper: connect to bus, register with a name, return (reader, writer).

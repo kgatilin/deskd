@@ -13,13 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 fn temp_socket() -> String {
-    format!(
-        "/tmp/deskd-test-lifecycle-{}.sock",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
+    format!("/tmp/deskd-test-lifecycle-{}.sock", uuid::Uuid::new_v4())
 }
 
 async fn connect_and_register(
@@ -87,13 +81,7 @@ async fn test_agent_state_lifecycle() {
     // Serialize env mutation; setenv is not thread-safe on POSIX.
     let _env_guard = deskd::test_support::env_lock().lock().await;
     // Set up isolated HOME.
-    let tmp = std::path::PathBuf::from(format!(
-        "/tmp/deskd-test-state-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let tmp = std::path::PathBuf::from(format!("/tmp/deskd-test-state-{}", uuid::Uuid::new_v4()));
     // SAFETY: ENV_LOCK serializes all env-mutating tests across the workspace.
     unsafe { std::env::set_var("HOME", &tmp) };
     std::fs::create_dir_all(tmp.join(".deskd/agents")).unwrap();
