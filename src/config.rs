@@ -58,6 +58,78 @@ pub struct WorkspaceConfig {
     /// configured sinks.
     #[serde(default)]
     pub alerts: Option<AlertsConfig>,
+    /// Web control panel (#443). When `enabled: true`, deskd serve starts an
+    /// axum HTTP server bound to `bind` exposing magic-link Telegram auth and
+    /// (eventually) agent dashboards. Absent or `enabled: false` → no impact.
+    #[serde(default)]
+    pub web: Option<WebConfig>,
+}
+
+/// Web control panel config — `web:` in workspace.yaml (#443).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebConfig {
+    /// Master switch. `false` (or block absent) → adapter is not started.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Local socket bind address. Reverse proxy is expected to terminate TLS
+    /// in front of this; do not bind publicly. Default: `127.0.0.1:8127`.
+    #[serde(default = "default_web_bind")]
+    pub bind: String,
+    /// Public-facing base URL used to construct magic-link login URLs.
+    /// Example: `https://deskd.example.com`. Trailing slash is tolerated.
+    pub external_url: String,
+    /// Session cookie lifetime in days. Default 30.
+    #[serde(default = "default_session_ttl_days")]
+    pub session_ttl_days: u32,
+    /// Magic-link token TTL in seconds. Default 300 (5 min).
+    #[serde(default = "default_magic_link_ttl_secs")]
+    pub magic_link_ttl_seconds: u64,
+    /// Whitelist of Telegram user IDs allowed to log in. Empty = nobody.
+    #[serde(default)]
+    pub allowed_telegram_ids: Vec<i64>,
+    /// Path to the JSONL audit log. `~` is expanded against `$HOME`.
+    /// Default: `~/.deskd/logs/web-audit.jsonl`.
+    #[serde(default = "default_web_audit_log")]
+    pub audit_log: String,
+    /// Rate limit configuration.
+    #[serde(default)]
+    pub rate_limit: WebRateLimitConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebRateLimitConfig {
+    /// Maximum auth requests per IP (and per telegram_id) per rolling hour.
+    /// Default 20.
+    #[serde(default = "default_auth_requests_per_hour")]
+    pub auth_requests_per_hour: u32,
+}
+
+impl Default for WebRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            auth_requests_per_hour: default_auth_requests_per_hour(),
+        }
+    }
+}
+
+fn default_web_bind() -> String {
+    "127.0.0.1:8127".to_string()
+}
+
+fn default_session_ttl_days() -> u32 {
+    30
+}
+
+fn default_magic_link_ttl_secs() -> u64 {
+    300
+}
+
+fn default_auth_requests_per_hour() -> u32 {
+    20
+}
+
+fn default_web_audit_log() -> String {
+    "~/.deskd/logs/web-audit.jsonl".to_string()
 }
 
 /// Alert configuration block — `alerts:` in workspace.yaml.
@@ -858,6 +930,81 @@ agents:
 "#;
         let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.alerts.is_none());
+    }
+
+    #[test]
+    fn test_workspace_config_web_block_full() {
+        let yaml = r#"
+agents:
+  - name: kira
+    work_dir: /home/kira
+web:
+  enabled: true
+  bind: 127.0.0.1:8127
+  external_url: https://deskd.example.com
+  session_ttl_days: 30
+  magic_link_ttl_seconds: 300
+  allowed_telegram_ids: [123456, 987654]
+  audit_log: ~/.deskd/logs/web-audit.jsonl
+  rate_limit:
+    auth_requests_per_hour: 20
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let web = cfg.web.expect("web block parsed");
+        assert!(web.enabled);
+        assert_eq!(web.bind, "127.0.0.1:8127");
+        assert_eq!(web.external_url, "https://deskd.example.com");
+        assert_eq!(web.session_ttl_days, 30);
+        assert_eq!(web.magic_link_ttl_seconds, 300);
+        assert_eq!(web.allowed_telegram_ids, vec![123456i64, 987654i64]);
+        assert_eq!(web.audit_log, "~/.deskd/logs/web-audit.jsonl");
+        assert_eq!(web.rate_limit.auth_requests_per_hour, 20);
+    }
+
+    #[test]
+    fn test_workspace_config_web_block_absent() {
+        let yaml = r#"
+agents:
+  - name: kira
+    work_dir: /home/kira
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.web.is_none());
+    }
+
+    #[test]
+    fn test_workspace_config_web_minimal_uses_defaults() {
+        // Only `external_url` is mandatory — everything else has a default.
+        let yaml = r#"
+agents:
+  - name: kira
+    work_dir: /home/kira
+web:
+  external_url: https://deskd.example.com
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let web = cfg.web.expect("web block parsed with defaults");
+        assert!(!web.enabled, "default enabled is false");
+        assert_eq!(web.bind, "127.0.0.1:8127");
+        assert_eq!(web.session_ttl_days, 30);
+        assert_eq!(web.magic_link_ttl_seconds, 300);
+        assert!(web.allowed_telegram_ids.is_empty());
+        assert_eq!(web.rate_limit.auth_requests_per_hour, 20);
+    }
+
+    #[test]
+    fn test_workspace_config_web_disabled() {
+        let yaml = r#"
+agents:
+  - name: kira
+    work_dir: /home/kira
+web:
+  enabled: false
+  external_url: https://deskd.example.com
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let web = cfg.web.expect("web block parsed");
+        assert!(!web.enabled);
     }
 
     #[test]

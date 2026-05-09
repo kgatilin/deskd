@@ -139,6 +139,27 @@ schedules: []   # cron jobs
 channels: []    # named bus targets
 ```
 
+### `web:` — optional web control panel (#443)
+
+When the workspace defines a `web:` block with `enabled: true`, `deskd serve`
+also starts a small axum HTTP server with Telegram magic-link login.
+
+```yaml
+web:
+  enabled: true
+  bind: 127.0.0.1:8127             # local-only; reverse proxy handles TLS
+  external_url: https://deskd.example.com
+  session_ttl_days: 30
+  magic_link_ttl_seconds: 300
+  allowed_telegram_ids: [123456]
+  audit_log: ~/.deskd/logs/web-audit.jsonl
+  rate_limit:
+    auth_requests_per_hour: 20
+```
+
+Bind is intentionally local. Front it with a reverse proxy (caddy, nginx) that
+terminates TLS, forwards `X-Forwarded-For`, and proxies to `127.0.0.1:8127`.
+
 ### Key paths
 
 | Path | Purpose |
