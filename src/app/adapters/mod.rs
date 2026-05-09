@@ -1,5 +1,6 @@
 pub mod discord;
 pub mod telegram;
+pub mod web;
 
 use crate::config::{AgentDef, UserConfig};
 use std::future::Future;

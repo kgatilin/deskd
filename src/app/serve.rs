@@ -3,6 +3,7 @@
 use anyhow::Result;
 use tracing::info;
 
+use crate::app::adapters::web;
 use crate::app::{agent, alerts, bus, bus_api, config_reload, worker, workflow};
 use crate::config;
 use crate::infra::diag;
@@ -286,6 +287,44 @@ pub async fn serve(config_path: String) -> Result<()> {
             );
         } else {
             info!("alerts config present but no agents — skipping alert manager");
+        }
+    }
+
+    // ── Web control panel (#443) ──────────────────────────────────────────
+    // When workspace.yaml defines `web:` with `enabled: true`, start a single
+    // axum HTTP server. The dispatch bus socket is taken from the first agent
+    // — every Telegram adapter subscribes to `telegram.out:*` on its agent
+    // bus, so any reachable agent bus suffices for dispatching the magic-link
+    // message. If no agents are defined, the web adapter cannot dispatch
+    // links and is skipped with a warning.
+    if let Some(web_cfg) = workspace.web.clone() {
+        if !web_cfg.enabled {
+            info!("web adapter config present but disabled — skipping");
+        } else if let Some(bus_socket) = workspace.agents.first().map(|a| a.bus_socket()) {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let cancel_handle = cancel.clone();
+            let bind = web_cfg.bind.clone();
+            tokio::spawn(async move {
+                if let Err(e) = web::run(web_cfg, bus_socket.clone(), cancel_handle).await {
+                    diag::error_event(
+                        Some(&bus_socket),
+                        "web",
+                        "adapter.exited",
+                        format!("web adapter exited: {}", e),
+                        serde_json::json!({}),
+                    );
+                }
+            });
+            info!(bind = %bind, "started web adapter");
+            // Cancel on Ctrl-C alongside the rest of the shutdown.
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                cancel.cancel();
+            });
+        } else {
+            tracing::warn!(
+                "web adapter enabled but no agents defined — cannot dispatch magic links"
+            );
         }
     }
 
