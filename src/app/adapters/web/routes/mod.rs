@@ -4,6 +4,8 @@ pub mod dashboard;
 pub mod health;
 pub mod login;
 pub mod logout;
+pub mod sse;
+pub mod static_assets;
 
 use axum::http::HeaderMap;
 
