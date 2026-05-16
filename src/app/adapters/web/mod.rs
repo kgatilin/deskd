@@ -17,12 +17,14 @@
 
 pub mod audit;
 pub mod auth;
+pub mod data;
 pub mod dispatch;
 pub mod middleware;
 pub mod router;
 pub mod routes;
 pub mod state;
 pub mod templates;
+pub mod view;
 
 use anyhow::Result;
 use std::sync::Arc;

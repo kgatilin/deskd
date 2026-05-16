@@ -31,9 +31,17 @@ pub fn login_page(csrf: &str) -> String {
     )
 }
 
-/// Render the placeholder dashboard. Child PRs of #442 will replace this with
-/// a real agent overview.
-pub fn dashboard_page(telegram_id: i64, csrf: &str) -> String {
+/// Render the dashboard (#444). Mobile-first, server-rendered. Live updates
+/// arrive over SSE via vendored htmx + the htmx-ext-sse extension; both
+/// scripts and the stylesheet are served from `/static/*` so the strict
+/// CSP from #443 (`script-src 'self'; style-src 'self'`) holds without
+/// permitting inline `<style>` elements or `style=` attributes.
+pub fn dashboard_page(
+    telegram_id: i64,
+    csrf: &str,
+    vps_strip_html: &str,
+    agents_section_html: &str,
+) -> String {
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -41,21 +49,29 @@ pub fn dashboard_page(telegram_id: i64, csrf: &str) -> String {
 <meta charset="utf-8">
 <title>deskd · dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/static/dashboard.css">
+<script src="/static/htmx.min.js"></script>
+<script src="/static/htmx-sse.js"></script>
 </head>
 <body>
-<main>
-  <h1>deskd dashboard</h1>
-  <p>Logged in as Telegram user <strong>{telegram_id}</strong>.</p>
-  <p>Agent data lands in a future PR (#442 child 2).</p>
-  <form method="post" action="/logout">
+<header class="topbar">
+  <h1>deskd</h1>
+  <span class="topbar__user">tg:{telegram_id}</span>
+  <form class="topbar__logout" method="post" action="/logout">
     <input type="hidden" name="_csrf" value="{csrf}">
     <button type="submit">Log out</button>
   </form>
+</header>
+<main>
+  {vps_strip_html}
+  {agents_section_html}
 </main>
 </body>
 </html>"#,
         telegram_id = telegram_id,
         csrf = html_escape(csrf),
+        vps_strip_html = vps_strip_html,
+        agents_section_html = agents_section_html,
     )
 }
 
@@ -113,9 +129,59 @@ mod tests {
 
     #[test]
     fn dashboard_page_includes_logout_form() {
-        let html = dashboard_page(42, "csrf-1");
-        assert!(html.contains("Telegram user <strong>42</strong>"));
+        let html = dashboard_page(
+            42,
+            "csrf-1",
+            "<section class='vps-strip'></section>",
+            "<section></section>",
+        );
+        assert!(html.contains("tg:42"));
         assert!(html.contains(r#"action="/logout""#));
         assert!(html.contains(r#"value="csrf-1""#));
+    }
+
+    #[test]
+    fn dashboard_page_loads_vendored_htmx() {
+        let html = dashboard_page(1, "x", "", "");
+        // Vendored under /static/ — never reach out to a CDN, keeps strict
+        // CSP (script-src 'self') intact.
+        assert!(html.contains(r#"src="/static/htmx.min.js""#));
+        assert!(html.contains(r#"src="/static/htmx-sse.js""#));
+    }
+
+    #[test]
+    fn dashboard_page_links_external_stylesheet() {
+        // CSP `style-src 'self'` forbids inline <style> blocks; the CSS is
+        // served from /static/dashboard.css instead. See #450 review.
+        let html = dashboard_page(1, "x", "", "");
+        assert!(
+            html.contains(r#"<link rel="stylesheet" href="/static/dashboard.css">"#),
+            "dashboard must link external stylesheet"
+        );
+    }
+
+    #[test]
+    fn dashboard_page_has_no_inline_style_block() {
+        // Regression guard: the strict CSP from #443 does NOT permit inline
+        // <style> elements. If this assertion ever fires, the dashboard will
+        // load unstyled in production.
+        let html = dashboard_page(
+            7,
+            "csrf-token",
+            "<section class='vps-strip'></section>",
+            "<section></section>",
+        );
+        assert!(
+            !html.contains("<style>") && !html.contains("<style "),
+            "inline <style> element snuck back into the dashboard HTML"
+        );
+    }
+
+    #[test]
+    fn dashboard_page_includes_word_dashboard_for_smoke_tests() {
+        // The existing #443 integration test asserts on the literal word
+        // "dashboard" appearing in the HTML; preserve that.
+        let html = dashboard_page(1, "x", "", "");
+        assert!(html.contains("dashboard"));
     }
 }
