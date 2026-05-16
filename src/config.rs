@@ -1,5 +1,5 @@
 use crate::domain::config_types::{
-    ConfigAgentKind, ConfigAgentRuntime, ConfigContextConfig, ConfigSessionMode,
+    ConfigAgentKind, ConfigAgentRuntime, ConfigContextConfig, ConfigLaunchMode, ConfigSessionMode,
 };
 use crate::infra::dto::ConfigModelDef;
 use anyhow::{Context, Result};
@@ -323,6 +323,13 @@ pub struct AgentDef {
     /// Agent runtime protocol: claude (default) or acp.
     #[serde(default)]
     pub runtime: ConfigAgentRuntime,
+    /// Launch mode: subprocess (default) or tmux (#452).
+    /// When `tmux`, the agent's Claude REPL is launched inside a detached
+    /// `tmux` session named `deskd-<agent>` rather than as a direct subprocess
+    /// of `deskd serve`. Useful for long-lived REPLs that need to survive
+    /// operator disconnects and receive MCP channel events (#451).
+    #[serde(default)]
+    pub launch_mode: ConfigLaunchMode,
 }
 
 impl AgentDef {
@@ -544,6 +551,12 @@ pub struct UserConfig {
     /// `agent_state` falls back to `~/.claude/projects/-home-<agent>/memory/current_state.md`.
     #[serde(default)]
     pub state_file: Option<String>,
+    /// Launch mode for the top-level agent this deskd.yaml belongs to:
+    /// `subprocess` (default) or `tmux` (#452). When `tmux`,
+    /// `deskd agent start <agent>` (no flag) launches the Claude REPL inside a
+    /// detached tmux session named `deskd-<agent>`.
+    #[serde(default)]
+    pub launch_mode: ConfigLaunchMode,
 }
 
 /// An A2A skill advertised in the Agent Card (per A2A spec).
@@ -646,6 +659,11 @@ pub struct SubAgentDef {
     /// Agent runtime protocol: claude (default) or acp.
     #[serde(default)]
     pub runtime: ConfigAgentRuntime,
+    /// Launch mode: subprocess (default) or tmux (#452).
+    /// When `tmux`, the agent's Claude REPL is launched inside a detached
+    /// tmux session named `deskd-<agent>` (see `deskd agent start --tmux`).
+    #[serde(default)]
+    pub launch_mode: ConfigLaunchMode,
     /// Worker loop kind: executor (default, full lifecycle) or context (lightweight Q&A).
     /// Context agents have no tool access, no task queue, no inbox — they answer
     /// questions from their loaded context with minimal overhead.
@@ -1091,6 +1109,7 @@ agents:
             budget_usd: 50.0,
             container: None,
             runtime: ConfigAgentRuntime::default(),
+            launch_mode: ConfigLaunchMode::default(),
         };
         assert_eq!(def.bus_socket(), "/home/kira/.deskd/bus.sock");
         assert_eq!(def.config_path(), "/home/kira/deskd.yaml");
@@ -1110,6 +1129,7 @@ agents:
             budget_usd: 50.0,
             container: None,
             runtime: ConfigAgentRuntime::default(),
+            launch_mode: ConfigLaunchMode::default(),
         };
         assert_eq!(def.config_path(), "/etc/agents/kira.yaml");
     }
@@ -1317,6 +1337,7 @@ telegram:
             budget_usd: 50.0,
             container: None,
             runtime: Default::default(),
+            launch_mode: Default::default(),
         };
         assert_eq!(def.config_path(), "/home/family/deskd.yaml");
     }
@@ -1336,6 +1357,7 @@ telegram:
             budget_usd: 50.0,
             container: None,
             runtime: Default::default(),
+            launch_mode: Default::default(),
         };
         assert_eq!(def.config_path(), "/home/family/deskd.yaml");
     }
@@ -1781,6 +1803,7 @@ agents:
             env: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            launch_mode: ConfigLaunchMode::default(),
             kind: ConfigAgentKind::default(),
             context: None,
             compact_threshold: None,
@@ -1808,6 +1831,7 @@ agents:
             env: None,
             session: ConfigSessionMode::default(),
             runtime: ConfigAgentRuntime::default(),
+            launch_mode: ConfigLaunchMode::default(),
             kind: ConfigAgentKind::default(),
             context: None,
             compact_threshold: None,
