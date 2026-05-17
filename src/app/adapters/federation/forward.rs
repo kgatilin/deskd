@@ -4,9 +4,10 @@
 //! Three responsibilities:
 //!
 //! 1. **Peer connection registry** — for each connected peer (hub side) keep
-//!    an `mpsc::UnboundedSender<FederationFrame>` that the writer task drains.
-//!    Sending a `Forward { origin, message }` over this channel reaches the
-//!    peer.
+//!    a bounded `mpsc::Sender<FederationFrame>` ([`PEER_CHANNEL_CAPACITY`])
+//!    that the writer task drains. Sending a `Forward { origin, message }`
+//!    over this channel reaches the peer. Bounded so a slow peer cannot
+//!    OOM the hub — on `Full` the frame is logged and dropped.
 //! 2. **Local→peer fanout** — when a frame is published on the local bus,
 //!    look up subscribed peers via the [`RoutingTable`] and forward the frame
 //!    to each, **skipping the origin** to prevent loops.
@@ -25,14 +26,23 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, warn};
 
 use super::frame::FederationFrame;
 use super::routing::RoutingTable;
 use crate::ports::bus_wire::BusMessage;
 
-/// Outbound channel handle per connected peer.
-pub type PeerSender = mpsc::UnboundedSender<FederationFrame>;
+/// Capacity of per-peer outbound channels. A slow peer's TCP write buffer
+/// fills, then this queue fills — at which point new frames are dropped
+/// rather than queued without bound. 1024 frames ≈ a few hundred KiB of
+/// queued JSON in the worst case, which is fine; the cure for a peer that
+/// stays full is reconnection, not unbounded RAM growth.
+pub const PEER_CHANNEL_CAPACITY: usize = 1024;
+
+/// Outbound channel handle per connected peer. Bounded — see
+/// [`PEER_CHANNEL_CAPACITY`].
+pub type PeerSender = mpsc::Sender<FederationFrame>;
 
 /// Trait for injecting an inbound federated frame onto the local bus.
 ///
@@ -159,21 +169,31 @@ impl ForwardMiddleware {
                 origin: origin.to_string(),
                 message: msg.clone(),
             };
-            if let Err(e) = tx.send(frame) {
-                warn!(
-                    target: "deskd::federation::forward",
-                    peer = %peer,
-                    error = %e,
-                    "failed to enqueue federated frame; peer channel closed"
-                );
-            } else {
-                debug!(
-                    target: "deskd::federation::forward",
-                    peer = %peer,
-                    origin = %origin,
-                    target_topic = %target_topic,
-                    "forwarded frame to peer"
-                );
+            match tx.try_send(frame) {
+                Ok(()) => {
+                    debug!(
+                        target: "deskd::federation::forward",
+                        peer = %peer,
+                        origin = %origin,
+                        target_topic = %target_topic,
+                        "forwarded frame to peer"
+                    );
+                }
+                Err(TrySendError::Full(_)) => {
+                    warn!(
+                        target: "deskd::federation::forward",
+                        peer = %peer,
+                        target_topic = %target_topic,
+                        "peer outbound channel full — dropping frame (slow peer)"
+                    );
+                }
+                Err(TrySendError::Closed(_)) => {
+                    warn!(
+                        target: "deskd::federation::forward",
+                        peer = %peer,
+                        "peer outbound channel closed — dropping frame"
+                    );
+                }
             }
         }
     }
@@ -209,13 +229,22 @@ impl ForwardMiddleware {
                 origin: origin.to_string(),
                 message: msg.clone(),
             };
-            if let Err(e) = tx.send(frame) {
-                warn!(
-                    target: "deskd::federation::forward",
-                    peer = %peer,
-                    error = %e,
-                    "failed to re-forward frame; channel closed"
-                );
+            match tx.try_send(frame) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    warn!(
+                        target: "deskd::federation::forward",
+                        peer = %peer,
+                        "peer outbound channel full — dropping re-forward (slow peer)"
+                    );
+                }
+                Err(TrySendError::Closed(_)) => {
+                    warn!(
+                        target: "deskd::federation::forward",
+                        peer = %peer,
+                        "peer outbound channel closed — dropping re-forward"
+                    );
+                }
             }
         }
     }
@@ -263,9 +292,8 @@ mod tests {
         }
     }
 
-    fn channel() -> (PeerSender, mpsc::UnboundedReceiver<FederationFrame>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (tx, rx)
+    fn channel() -> (PeerSender, mpsc::Receiver<FederationFrame>) {
+        mpsc::channel(PEER_CHANNEL_CAPACITY)
     }
 
     #[test]
@@ -373,6 +401,25 @@ mod tests {
         // Cross-device shape: inbox/personal@mac.
         mw.fanout_local("inbox/personal@mac", &msg("inbox/personal@mac"));
         assert!(rx_mac.try_recv().is_ok());
+    }
+
+    #[test]
+    fn slow_peer_full_channel_drops_frame_without_blocking() {
+        // Tiny channel so we can force "Full" deterministically.
+        let mw = ForwardMiddleware::for_test("local");
+        let (tx, mut rx) = mpsc::channel::<FederationFrame>(1);
+        mw.peers.insert("slow", tx);
+        mw.routing.subscribe("slow", "voice.*");
+
+        // First publish fills the channel.
+        mw.fanout_local("voice.recorded", &msg("voice.recorded"));
+        // Second publish should be dropped on Full (channel still has the
+        // first frame queued — receiver hasn't drained yet).
+        mw.fanout_local("voice.recorded", &msg("voice.recorded"));
+
+        // Exactly one frame survived.
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

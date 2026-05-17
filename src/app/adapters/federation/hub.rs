@@ -31,7 +31,7 @@ use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::forward::{ForwardMiddleware, NullInjector, PeerConnections};
+use super::forward::{ForwardMiddleware, NullInjector, PEER_CHANNEL_CAPACITY, PeerConnections};
 use super::frame::FederationFrame;
 use super::preflight::{SharedIdentity, TailnetIdentity, preflight_or_error, resolve_bind};
 use super::registry::PeerRegistry;
@@ -41,6 +41,10 @@ use super::routing::RoutingTable;
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// How long to wait for the peer's `hello` after a connection is accepted.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum byte length accepted for a `Subscribe.pattern` or
+/// `SubscribeInbox.name`. Frames exceeding this are dropped (and logged) so a
+/// malicious or buggy peer cannot inflate routing-table keys without bound.
+pub const MAX_SUBSCRIBE_PATTERN_BYTES: usize = 1024;
 
 /// Configuration handed to [`run_hub`].
 #[derive(Clone)]
@@ -286,7 +290,8 @@ async fn handle_connection(
     // ── Wire up outbound channel ────────────────────────────────────────
     // The writer task drains this channel onto the TCP socket. Both the
     // keepalive timer and the forward middleware enqueue frames here.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<FederationFrame>();
+    // Bounded so a slow peer cannot pin unbounded memory on the hub.
+    let (out_tx, mut out_rx) = mpsc::channel::<FederationFrame>(PEER_CHANNEL_CAPACITY);
     middleware.peers.insert(&peer_name, out_tx.clone());
 
     let peer_name_for_writer = peer_name.clone();
@@ -334,7 +339,7 @@ async fn handle_connection(
                         break Ok(());
                     }
                 }
-                if out_tx.send(FederationFrame::Ping).is_err() {
+                if out_tx.try_send(FederationFrame::Ping).is_err() {
                     break Ok(());
                 }
             }
@@ -350,34 +355,64 @@ async fn handle_connection(
                         missed = 0;
                     }
                     Ok(FederationFrame::Ping) => {
-                        let _ = out_tx.send(FederationFrame::Pong);
+                        let _ = out_tx.try_send(FederationFrame::Pong);
                     }
                     Ok(FederationFrame::Subscribe { pattern }) => {
-                        debug!(
-                            target: "deskd::federation::hub",
-                            peer_name = %peer_name,
-                            pattern = %pattern,
-                            "peer subscribed"
-                        );
-                        middleware.routing.subscribe(&peer_name, &pattern);
+                        if pattern.len() > MAX_SUBSCRIBE_PATTERN_BYTES {
+                            warn!(
+                                target: "deskd::federation::hub",
+                                peer_name = %peer_name,
+                                pattern_bytes = pattern.len(),
+                                limit = MAX_SUBSCRIBE_PATTERN_BYTES,
+                                "dropping Subscribe with oversize pattern"
+                            );
+                        } else {
+                            debug!(
+                                target: "deskd::federation::hub",
+                                peer_name = %peer_name,
+                                pattern = %pattern,
+                                "peer subscribed"
+                            );
+                            middleware.routing.subscribe(&peer_name, &pattern);
+                        }
                     }
                     Ok(FederationFrame::Unsubscribe { pattern }) => {
-                        debug!(
-                            target: "deskd::federation::hub",
-                            peer_name = %peer_name,
-                            pattern = %pattern,
-                            "peer unsubscribed"
-                        );
-                        middleware.routing.unsubscribe(&peer_name, &pattern);
+                        if pattern.len() > MAX_SUBSCRIBE_PATTERN_BYTES {
+                            warn!(
+                                target: "deskd::federation::hub",
+                                peer_name = %peer_name,
+                                pattern_bytes = pattern.len(),
+                                limit = MAX_SUBSCRIBE_PATTERN_BYTES,
+                                "dropping Unsubscribe with oversize pattern"
+                            );
+                        } else {
+                            debug!(
+                                target: "deskd::federation::hub",
+                                peer_name = %peer_name,
+                                pattern = %pattern,
+                                "peer unsubscribed"
+                            );
+                            middleware.routing.unsubscribe(&peer_name, &pattern);
+                        }
                     }
                     Ok(FederationFrame::SubscribeInbox { name }) => {
-                        debug!(
-                            target: "deskd::federation::hub",
-                            peer_name = %peer_name,
-                            inbox = %name,
-                            "peer subscribed inbox"
-                        );
-                        middleware.routing.subscribe_inbox(&peer_name, &name);
+                        if name.len() > MAX_SUBSCRIBE_PATTERN_BYTES {
+                            warn!(
+                                target: "deskd::federation::hub",
+                                peer_name = %peer_name,
+                                name_bytes = name.len(),
+                                limit = MAX_SUBSCRIBE_PATTERN_BYTES,
+                                "dropping SubscribeInbox with oversize name"
+                            );
+                        } else {
+                            debug!(
+                                target: "deskd::federation::hub",
+                                peer_name = %peer_name,
+                                inbox = %name,
+                                "peer subscribed inbox"
+                            );
+                            middleware.routing.subscribe_inbox(&peer_name, &name);
+                        }
                     }
                     Ok(FederationFrame::Forward { origin, message }) => {
                         middleware.handle_inbound(&peer_name, &origin, &message);
@@ -658,6 +693,82 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn oversize_subscribe_pattern_is_dropped() {
+        let identity = Arc::new(StubIdentity::ok(status_with(
+            "Running",
+            &["100.64.0.1"],
+            &[],
+        ))) as SharedIdentity;
+        let (_registry, middleware, addr, cancel) = start_hub_on("127.0.0.1:0", identity).await;
+
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(
+                FederationFrame::Hello {
+                    peer_name: "mac".into(),
+                    deskd_version: "test".into(),
+                    capabilities: vec![],
+                }
+                .to_line()
+                .unwrap()
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // One byte over the cap.
+        let huge = "a".repeat(MAX_SUBSCRIBE_PATTERN_BYTES + 1);
+        stream
+            .write_all(
+                FederationFrame::Subscribe {
+                    pattern: huge.clone(),
+                }
+                .to_line()
+                .unwrap()
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        // Follow with a valid Subscribe to confirm the connection is still
+        // alive (oversize frame should be dropped, not close the socket).
+        stream
+            .write_all(
+                FederationFrame::Subscribe {
+                    pattern: "voice.*".into(),
+                }
+                .to_line()
+                .unwrap()
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+
+        // The small subscribe should land in the routing table…
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if middleware
+                .routing
+                .match_topic("voice.recorded")
+                .contains("mac")
+            {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("valid subscribe never registered after oversize frame");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // …while the oversize pattern must NOT have been recorded.
+        assert!(
+            !middleware.routing.match_topic(&huge).contains("mac"),
+            "oversize Subscribe pattern leaked into routing table"
+        );
 
         cancel.cancel();
     }

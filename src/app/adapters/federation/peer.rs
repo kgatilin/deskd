@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::forward::{LocalBusInjector, NullInjector};
+use super::forward::{LocalBusInjector, NullInjector, PEER_CHANNEL_CAPACITY};
 use super::frame::FederationFrame;
 use super::hub::KEEPALIVE_INTERVAL;
 
@@ -60,9 +60,13 @@ impl Default for PeerDialerConfig {
 /// swaps the inner sender on every reconnect; frames enqueued while
 /// disconnected are silently dropped (we don't queue across reconnects in v1
 /// — that's the replay log work in #464).
+///
+/// The underlying channel is bounded ([`PEER_CHANNEL_CAPACITY`]); `send`
+/// drops the frame on `Full` so a stalled hub can never pin unbounded memory
+/// on the peer side either.
 #[derive(Clone, Default)]
 pub struct PeerSessionHandle {
-    inner: Arc<Mutex<Option<mpsc::UnboundedSender<FederationFrame>>>>,
+    inner: Arc<Mutex<Option<mpsc::Sender<FederationFrame>>>>,
 }
 
 impl PeerSessionHandle {
@@ -71,18 +75,19 @@ impl PeerSessionHandle {
         Self::default()
     }
 
-    /// Try to send a frame over the current session. Returns `false` if not
-    /// currently connected.
+    /// Try to send a frame over the current session. Returns `false` if the
+    /// session is disconnected, or if the outbound channel is currently full
+    /// (slow hub) — the frame is dropped in that case.
     pub async fn send(&self, frame: FederationFrame) -> bool {
         let guard = self.inner.lock().await;
         if let Some(tx) = guard.as_ref() {
-            tx.send(frame).is_ok()
+            tx.try_send(frame).is_ok()
         } else {
             false
         }
     }
 
-    async fn set(&self, tx: Option<mpsc::UnboundedSender<FederationFrame>>) {
+    async fn set(&self, tx: Option<mpsc::Sender<FederationFrame>>) {
         let mut guard = self.inner.lock().await;
         *guard = tx;
     }
@@ -239,17 +244,17 @@ async fn dial_once(
     }
 
     // ── Outbound channel + writer task ──────────────────────────────────
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<FederationFrame>();
+    let (out_tx, mut out_rx) = mpsc::channel::<FederationFrame>(PEER_CHANNEL_CAPACITY);
     session.set(Some(out_tx.clone())).await;
 
     // Issue config-driven subscriptions immediately after welcome.
     for pattern in &cfg.subscribe_patterns {
-        let _ = out_tx.send(FederationFrame::Subscribe {
+        let _ = out_tx.try_send(FederationFrame::Subscribe {
             pattern: pattern.clone(),
         });
     }
     for inbox in &cfg.subscribe_inboxes {
-        let _ = out_tx.send(FederationFrame::SubscribeInbox {
+        let _ = out_tx.try_send(FederationFrame::SubscribeInbox {
             name: inbox.clone(),
         });
     }
@@ -289,7 +294,7 @@ async fn dial_once(
                         break Ok(SessionExit::Disconnected);
                     }
                 }
-                if out_tx.send(FederationFrame::Ping).is_err() {
+                if out_tx.try_send(FederationFrame::Ping).is_err() {
                     break Ok(SessionExit::Disconnected);
                 }
             }
@@ -304,7 +309,7 @@ async fn dial_once(
                         missed = 0;
                     }
                     Ok(FederationFrame::Ping) => {
-                        let _ = out_tx.send(FederationFrame::Pong);
+                        let _ = out_tx.try_send(FederationFrame::Pong);
                     }
                     Ok(FederationFrame::Forward { origin, message }) => {
                         debug!(
