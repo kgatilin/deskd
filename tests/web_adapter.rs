@@ -61,6 +61,10 @@ fn build_state(rate_limit: u32) -> (WebState, RecordingDispatcher, tempfile::Tem
     let dispatcher = RecordingDispatcher::new();
     let dispatcher_arc: Arc<dyn deskd::app::adapters::web::dispatch::TelegramDispatcher> =
         Arc::new(dispatcher.clone());
+    let agent_commands: Arc<dyn deskd::app::adapters::web::dispatch::AgentCommandDispatcher> =
+        Arc::new(
+            deskd::app::adapters::web::dispatch::testing::RecordingAgentCommandDispatcher::new(),
+        );
 
     // Build the state manually so we can inject the recording dispatcher AND
     // a deterministic now-fn (1_700_000_000 = 2023-11-14 22:13:20 UTC).
@@ -72,6 +76,7 @@ fn build_state(rate_limit: u32) -> (WebState, RecordingDispatcher, tempfile::Tem
         rate_limiter_tg: Arc::new(RateLimiter::new(rate_limit, 3600)),
         audit: AuditLog::new(audit_path),
         telegram: dispatcher_arc,
+        agent_commands,
         now: Arc::new(|| 1_700_000_000),
     };
     (state, dispatcher, dir)
