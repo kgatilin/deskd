@@ -6,7 +6,7 @@ use axum::{
 };
 
 use super::middleware::headers::security_headers;
-use super::routes::{dashboard, health, login, logout, sse, static_assets};
+use super::routes::{agent_detail, dashboard, health, login, logout, metrics, sse, static_assets};
 use super::state::WebState;
 
 /// Build the axum router. Public so the integration tests can drive it
@@ -20,6 +20,8 @@ pub fn build(state: WebState) -> Router {
         .route("/login/request", post(login::login_request))
         .route("/login/consume", get(login::login_consume))
         .route("/logout", post(logout::logout))
+        .route("/metrics/refresh", post(metrics::refresh))
+        .route("/agent/{name}", get(agent_detail::agent_detail))
         .route("/static/htmx.min.js", get(static_assets::htmx_js))
         .route("/static/htmx-sse.js", get(static_assets::htmx_sse_js))
         .route("/static/dashboard.css", get(static_assets::dashboard_css))

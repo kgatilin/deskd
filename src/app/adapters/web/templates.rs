@@ -31,14 +31,16 @@ pub fn login_page(csrf: &str) -> String {
     )
 }
 
-/// Render the dashboard (#444). Mobile-first, server-rendered. Live updates
-/// arrive over SSE via vendored htmx + the htmx-ext-sse extension; both
-/// scripts and the stylesheet are served from `/static/*` so the strict
-/// CSP from #443 (`script-src 'self'; style-src 'self'`) holds without
-/// permitting inline `<style>` elements or `style=` attributes.
+/// Render the dashboard (#444 + #446). Mobile-first, server-rendered.
+/// Live updates arrive over SSE via vendored htmx + the htmx-ext-sse
+/// extension; both scripts and the stylesheet are served from `/static/*`
+/// so the strict CSP from #443 (`script-src 'self'; style-src 'self'`)
+/// holds without permitting inline `<style>` elements or `style=`
+/// attributes.
 pub fn dashboard_page(
     telegram_id: i64,
     csrf: &str,
+    refresh_form_html: &str,
     vps_strip_html: &str,
     agents_section_html: &str,
 ) -> String {
@@ -63,15 +65,72 @@ pub fn dashboard_page(
   </form>
 </header>
 <main>
-  {vps_strip_html}
+  <section hx-ext="sse" sse-connect="/events" sse-swap="vps-strip" id="vps-strip-wrap">
+    {vps_strip_html}
+  </section>
+  {refresh_form_html}
   {agents_section_html}
 </main>
 </body>
 </html>"#,
         telegram_id = telegram_id,
         csrf = html_escape(csrf),
+        refresh_form_html = refresh_form_html,
         vps_strip_html = vps_strip_html,
         agents_section_html = agents_section_html,
+    )
+}
+
+/// Render the «refresh now» form (#446). CSRF-protected `<form method=POST>`
+/// — no JS framework, so the strict CSP holds without exceptions.
+pub fn metrics_refresh_form(csrf: &str) -> String {
+    format!(
+        r#"<form class="metrics-refresh" method="post" action="/metrics/refresh">
+  <input type="hidden" name="_csrf" value="{csrf}">
+  <button type="submit">Refresh disk metrics</button>
+</form>"#,
+        csrf = html_escape(csrf)
+    )
+}
+
+/// Render the `/agent/<name>` detail page (#446 surface). The dedicated
+/// page lists the agent's home-dir size and the top-5 subdirectory
+/// breakdown. Header / nav match the dashboard.
+pub fn agent_detail_page(
+    telegram_id: i64,
+    csrf: &str,
+    agent_name: &str,
+    detail_html: &str,
+) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>deskd · {agent}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>deskd</h1>
+  <span class="topbar__user">tg:{telegram_id}</span>
+  <form class="topbar__logout" method="post" action="/logout">
+    <input type="hidden" name="_csrf" value="{csrf}">
+    <button type="submit">Log out</button>
+  </form>
+</header>
+<main>
+  <p><a href="/">← dashboard</a></p>
+  <h2>{agent}</h2>
+  {detail_html}
+</main>
+</body>
+</html>"#,
+        telegram_id = telegram_id,
+        csrf = html_escape(csrf),
+        agent = html_escape(agent_name),
+        detail_html = detail_html,
     )
 }
 
@@ -132,6 +191,7 @@ mod tests {
         let html = dashboard_page(
             42,
             "csrf-1",
+            "<form></form>",
             "<section class='vps-strip'></section>",
             "<section></section>",
         );
@@ -142,7 +202,7 @@ mod tests {
 
     #[test]
     fn dashboard_page_loads_vendored_htmx() {
-        let html = dashboard_page(1, "x", "", "");
+        let html = dashboard_page(1, "x", "", "", "");
         // Vendored under /static/ — never reach out to a CDN, keeps strict
         // CSP (script-src 'self') intact.
         assert!(html.contains(r#"src="/static/htmx.min.js""#));
@@ -153,7 +213,7 @@ mod tests {
     fn dashboard_page_links_external_stylesheet() {
         // CSP `style-src 'self'` forbids inline <style> blocks; the CSS is
         // served from /static/dashboard.css instead. See #450 review.
-        let html = dashboard_page(1, "x", "", "");
+        let html = dashboard_page(1, "x", "", "", "");
         assert!(
             html.contains(r#"<link rel="stylesheet" href="/static/dashboard.css">"#),
             "dashboard must link external stylesheet"
@@ -168,6 +228,7 @@ mod tests {
         let html = dashboard_page(
             7,
             "csrf-token",
+            "",
             "<section class='vps-strip'></section>",
             "<section></section>",
         );
@@ -181,7 +242,39 @@ mod tests {
     fn dashboard_page_includes_word_dashboard_for_smoke_tests() {
         // The existing #443 integration test asserts on the literal word
         // "dashboard" appearing in the HTML; preserve that.
-        let html = dashboard_page(1, "x", "", "");
+        let html = dashboard_page(1, "x", "", "", "");
         assert!(html.contains("dashboard"));
+    }
+
+    #[test]
+    fn dashboard_page_wraps_vps_strip_in_sse_target() {
+        // #446: when the disk collector publishes `metrics.updated`, the
+        // SSE stream emits a `vps-strip` named event so htmx swaps the
+        // top-of-page strip without a polling loop.
+        let html = dashboard_page(1, "x", "", "<section class='vps-strip'></section>", "");
+        assert!(html.contains(r#"sse-swap="vps-strip""#));
+    }
+
+    #[test]
+    fn metrics_refresh_form_posts_to_endpoint_with_csrf() {
+        let html = metrics_refresh_form("csrf-x");
+        assert!(html.contains(r#"action="/metrics/refresh""#));
+        assert!(html.contains(r#"value="csrf-x""#));
+        assert!(html.contains("method=\"post\""));
+    }
+
+    #[test]
+    fn agent_detail_page_renders_name_and_back_link() {
+        let html = agent_detail_page(1, "csrf", "kira", "<p>body</p>");
+        assert!(html.contains("kira"));
+        assert!(html.contains(r#"<a href="/">← dashboard</a>"#));
+        assert!(html.contains("<p>body</p>"));
+    }
+
+    #[test]
+    fn agent_detail_page_escapes_name() {
+        let html = agent_detail_page(1, "csrf", "<x>", "body");
+        assert!(html.contains("&lt;x&gt;"));
+        assert!(!html.contains("<title>deskd · <x>"));
     }
 }

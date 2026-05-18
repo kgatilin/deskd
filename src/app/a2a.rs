@@ -236,6 +236,7 @@ mod tests {
             alerts: None,
             web: None,
             federation: None,
+            metrics: None,
         }
     }
 

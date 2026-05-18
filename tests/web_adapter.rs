@@ -64,6 +64,7 @@ fn build_state(rate_limit: u32) -> (WebState, RecordingDispatcher, tempfile::Tem
 
     // Build the state manually so we can inject the recording dispatcher AND
     // a deterministic now-fn (1_700_000_000 = 2023-11-14 22:13:20 UTC).
+    let metrics_cache = dir.path().join("disk-cache.json");
     let state = WebState {
         cfg: Arc::new(cfg_obj.clone()),
         secret: Arc::new(TEST_SECRET),
@@ -73,6 +74,9 @@ fn build_state(rate_limit: u32) -> (WebState, RecordingDispatcher, tempfile::Tem
         audit: AuditLog::new(audit_path),
         telegram: dispatcher_arc,
         now: Arc::new(|| 1_700_000_000),
+        metrics: deskd::app::metrics::DiskMetrics::new(metrics_cache),
+        agent_homes: Arc::new(Vec::new()),
+        metrics_bus: None,
     };
     (state, dispatcher, dir)
 }
