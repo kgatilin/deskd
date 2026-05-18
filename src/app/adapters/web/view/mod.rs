@@ -5,9 +5,14 @@
 //! card has a stable `id="agent-{name}"` so htmx SSE swaps can replace it.
 
 pub mod cards;
+pub mod detail;
 pub mod strip;
 
-pub use cards::{agent_card, agent_card_id, agents_section, format_bytes, format_relative};
+pub use cards::{
+    agent_card, agent_card_id, agent_card_with_disk, agents_section, agents_section_with_disk,
+    format_bytes, format_relative,
+};
+pub use detail::agent_disk_detail_html;
 pub use strip::vps_strip;
 
 /// HTML-escape a string. Internal — kept here so all view functions share one

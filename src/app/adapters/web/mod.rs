@@ -30,6 +30,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use crate::app::metrics::DiskMetrics;
 use crate::config::WebConfig;
 
 use audit::AuditLog;
@@ -39,12 +40,25 @@ use middleware::rate_limit::RateLimiter;
 use state::{WebState, system_now};
 
 /// Construct a `WebState` with the production dispatcher pointed at the
-/// supplied bus socket.
-pub fn build_state(cfg: WebConfig, bus_socket: String) -> Result<WebState> {
+/// supplied bus socket. `metrics` + `agent_homes` are wired in so the
+/// dashboard and `/metrics/refresh` see live data.
+pub fn build_state(
+    cfg: WebConfig,
+    bus_socket: String,
+    metrics: DiskMetrics,
+    agent_homes: Vec<(String, String)>,
+) -> Result<WebState> {
     let secret_bytes = secret::load_or_create()?;
     let dispatcher: Arc<dyn TelegramDispatcher> =
-        Arc::new(BusDispatcher::new(bus_socket, "web".to_string()));
-    Ok(build_state_with_dispatcher(cfg, secret_bytes, dispatcher))
+        Arc::new(BusDispatcher::new(bus_socket.clone(), "web".to_string()));
+    Ok(build_state_with_dispatcher(
+        cfg,
+        secret_bytes,
+        dispatcher,
+        metrics,
+        agent_homes,
+        Some(bus_socket),
+    ))
 }
 
 /// Like [`build_state`] but with an injected dispatcher (used by tests).
@@ -52,6 +66,9 @@ pub fn build_state_with_dispatcher(
     cfg: WebConfig,
     secret_bytes: [u8; 32],
     dispatcher: Arc<dyn TelegramDispatcher>,
+    metrics: DiskMetrics,
+    agent_homes: Vec<(String, String)>,
+    metrics_bus: Option<String>,
 ) -> WebState {
     let audit_path = audit::expand_home(&cfg.audit_log);
     let limit = cfg.rate_limit.auth_requests_per_hour;
@@ -65,14 +82,23 @@ pub fn build_state_with_dispatcher(
         audit: AuditLog::new(audit_path),
         telegram: dispatcher,
         now: system_now(),
+        metrics,
+        agent_homes: Arc::new(agent_homes),
+        metrics_bus: metrics_bus.map(Arc::new),
     }
 }
 
 /// Start the web adapter HTTP server. Returns when `cancel` is triggered or
 /// `axum::serve` exits with an error. Bound to `cfg.bind`.
-pub async fn run(cfg: WebConfig, bus_socket: String, cancel: CancellationToken) -> Result<()> {
+pub async fn run(
+    cfg: WebConfig,
+    bus_socket: String,
+    metrics: DiskMetrics,
+    agent_homes: Vec<(String, String)>,
+    cancel: CancellationToken,
+) -> Result<()> {
     let bind = cfg.bind.clone();
-    let state = build_state(cfg, bus_socket)?;
+    let state = build_state(cfg, bus_socket, metrics, agent_homes)?;
     run_with_state(state, bind, cancel).await
 }
 
