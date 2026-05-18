@@ -34,24 +34,36 @@ use crate::config::WebConfig;
 
 use audit::AuditLog;
 use auth::{magic_link::TokenStore, secret};
-use dispatch::{BusDispatcher, TelegramDispatcher};
+use dispatch::{
+    AgentCommandDispatcher, BusAgentCommandDispatcher, BusDispatcher, TelegramDispatcher,
+};
 use middleware::rate_limit::RateLimiter;
 use state::{WebState, system_now};
 
-/// Construct a `WebState` with the production dispatcher pointed at the
+/// Construct a `WebState` with the production dispatchers pointed at the
 /// supplied bus socket.
 pub fn build_state(cfg: WebConfig, bus_socket: String) -> Result<WebState> {
     let secret_bytes = secret::load_or_create()?;
     let dispatcher: Arc<dyn TelegramDispatcher> =
-        Arc::new(BusDispatcher::new(bus_socket, "web".to_string()));
-    Ok(build_state_with_dispatcher(cfg, secret_bytes, dispatcher))
+        Arc::new(BusDispatcher::new(bus_socket.clone(), "web".to_string()));
+    let agent_commands: Arc<dyn AgentCommandDispatcher> = Arc::new(BusAgentCommandDispatcher::new(
+        bus_socket,
+        "web".to_string(),
+    ));
+    Ok(build_state_with_dispatcher(
+        cfg,
+        secret_bytes,
+        dispatcher,
+        agent_commands,
+    ))
 }
 
-/// Like [`build_state`] but with an injected dispatcher (used by tests).
+/// Like [`build_state`] but with injected dispatchers (used by tests).
 pub fn build_state_with_dispatcher(
     cfg: WebConfig,
     secret_bytes: [u8; 32],
     dispatcher: Arc<dyn TelegramDispatcher>,
+    agent_commands: Arc<dyn AgentCommandDispatcher>,
 ) -> WebState {
     let audit_path = audit::expand_home(&cfg.audit_log);
     let limit = cfg.rate_limit.auth_requests_per_hour;
@@ -64,6 +76,7 @@ pub fn build_state_with_dispatcher(
         rate_limiter_tg: Arc::new(RateLimiter::new(limit, 3600)),
         audit: AuditLog::new(audit_path),
         telegram: dispatcher,
+        agent_commands,
         now: system_now(),
     }
 }

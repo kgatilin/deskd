@@ -61,6 +61,10 @@ fn build_state() -> (WebState, RecordingDispatcher, tempfile::TempDir) {
     let dispatcher = RecordingDispatcher::new();
     let dispatcher_arc: Arc<dyn deskd::app::adapters::web::dispatch::TelegramDispatcher> =
         Arc::new(dispatcher.clone());
+    let agent_commands: Arc<dyn deskd::app::adapters::web::dispatch::AgentCommandDispatcher> =
+        Arc::new(
+            deskd::app::adapters::web::dispatch::testing::RecordingAgentCommandDispatcher::new(),
+        );
     let state = WebState {
         cfg: Arc::new(cfg_obj),
         secret: Arc::new(TEST_SECRET),
@@ -69,6 +73,7 @@ fn build_state() -> (WebState, RecordingDispatcher, tempfile::TempDir) {
         rate_limiter_tg: Arc::new(RateLimiter::new(20, 3600)),
         audit: AuditLog::new(audit_path),
         telegram: dispatcher_arc,
+        agent_commands,
         now: Arc::new(|| 1_700_000_000),
     };
     (state, dispatcher, dir)

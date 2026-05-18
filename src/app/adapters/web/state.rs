@@ -11,7 +11,7 @@ use crate::config::WebConfig;
 
 use super::audit::AuditLog;
 use super::auth::magic_link::TokenStore;
-use super::dispatch::TelegramDispatcher;
+use super::dispatch::{AgentCommandDispatcher, TelegramDispatcher};
 use super::middleware::rate_limit::RateLimiter;
 
 /// Aggregate state passed through axum's `State` extractor.
@@ -24,6 +24,10 @@ pub struct WebState {
     pub rate_limiter_tg: Arc<RateLimiter>,
     pub audit: AuditLog,
     pub telegram: Arc<dyn TelegramDispatcher>,
+    /// Per-agent command dispatcher (#445). Published as `{command: "…"}`
+    /// envelopes to `agent:<name>` on the bus by the production
+    /// implementation; tests inject a recording double.
+    pub agent_commands: Arc<dyn AgentCommandDispatcher>,
     /// Cached "now" provider — defaults to system time. Tests substitute a
     /// closure that returns a fixed timestamp so cookie/expiry semantics are
     /// deterministic.
