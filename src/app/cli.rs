@@ -77,6 +77,35 @@ pub enum Commands {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Hot-reload an agent's deskd.yaml without restarting its worker (#474).
+    ///
+    /// Talks to the running `deskd serve` via the agent's bus socket and
+    /// asks the daemon to re-parse YAML at `--config` (or the path the daemon
+    /// was started with) and apply changes — cron schedules, agent
+    /// enable/disable, system_prompt edits — to the next scheduled
+    /// invocation. In-flight agent turns are not interrupted. If the YAML
+    /// is malformed, the daemon stays on its previous config and the CLI
+    /// exits non-zero.
+    ///
+    /// Examples:
+    ///   deskd reload
+    ///   deskd reload --config /home/kira/deskd.yaml
+    ///   deskd reload --agent kira
+    Reload {
+        /// Path to the deskd.yaml the daemon should re-parse. Defaults to
+        /// the path the running serve was started against for the resolved
+        /// agent.
+        #[arg(long)]
+        config: Option<String>,
+        /// Agent name (selects which agent's bus to talk to). Auto-detected
+        /// from running serve state if omitted (uses the first agent).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Bus socket path. Auto-detected from running serve state if
+        /// omitted.
+        #[arg(long, env = "DESKD_BUS_SOCKET")]
+        socket: Option<String>,
+    },
     /// Run an executable skill graph from a YAML file.
     Graph {
         #[command(subcommand)]
