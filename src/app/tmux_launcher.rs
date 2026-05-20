@@ -51,20 +51,15 @@ pub struct LaunchTarget<'a> {
 
 /// Pre-flight: verify the host is ready to launch a tmux Claude REPL.
 ///
-/// Checks performed:
-/// - `tmux` binary on PATH
-/// - `claude` binary on PATH
+/// Checks performed (filesystem-first, fail-cheap before PATH lookups):
 /// - agent home dir exists and is readable
 /// - `.mcp.json` exists in agent home dir
+/// - `tmux` binary on PATH
+/// - `claude` binary on PATH
 ///
 /// Each failure carries a specific, actionable message so the user can fix
 /// the underlying issue without re-reading code.
 pub fn check_tmux_runtime_prereqs(target: &LaunchTarget<'_>) -> Result<()> {
-    which_in_path("tmux")
-        .context("tmux is required to launch agents in tmux mode but was not found on PATH; install tmux (e.g. `apt install tmux` or `brew install tmux`)")?;
-    which_in_path("claude")
-        .context("`claude` CLI is required to launch agents in tmux mode but was not found on PATH; install Claude Code from https://docs.claude.com/en/docs/claude-code")?;
-
     let home = target.home_dir;
     let meta = std::fs::metadata(home).with_context(|| {
         format!(
@@ -86,6 +81,11 @@ pub fn check_tmux_runtime_prereqs(target: &LaunchTarget<'_>) -> Result<()> {
             mcp_json.display()
         );
     }
+
+    which_in_path("tmux")
+        .context("tmux is required to launch agents in tmux mode but was not found on PATH; install tmux (e.g. `apt install tmux` or `brew install tmux`)")?;
+    which_in_path("claude")
+        .context("`claude` CLI is required to launch agents in tmux mode but was not found on PATH; install Claude Code from https://docs.claude.com/en/docs/claude-code")?;
 
     Ok(())
 }
