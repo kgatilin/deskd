@@ -1073,30 +1073,40 @@ async fn handle_agent_compress(params: &Value, bus_socket: &str, caller: &str) -
 
 /// `reload_config` RPC handler — implements the daemon side of `deskd reload` (#474).
 ///
-/// Validates the YAML at `config_path` (or `params.path` if provided), and on
-/// success fires `reload_state.trigger()` to wake the config_reload watcher.
-/// The watcher then performs the actual changeset classification, swap, and
-/// `last_reload_at` recording — see `config_reload::watch_and_reload`.
+/// Validates the YAML at the daemon's own `cfg_path` (the path the agent was
+/// launched against), and on success fires `reload_state.trigger()` to wake
+/// the config_reload watcher. The watcher then performs the actual changeset
+/// classification, swap, and `last_reload_at` recording — see
+/// `config_reload::watch_and_reload`.
+///
+/// The handler intentionally does NOT honour any caller-supplied path —
+/// previously `params.path` would be validated but the watcher reloaded a
+/// different file, producing a misleading `validated: true` response (see
+/// #478 review). `--config <path>` on the CLI is now a client-side assertion
+/// only: the CLI compares the operator's path against the agent's recorded
+/// `config_path` in `ServeState` and fails before issuing the RPC on
+/// mismatch. Any `params.path` sent by an older client is silently ignored.
 ///
 /// On parse failure: records the error in `ReloadState`, returns the error
 /// to the caller, and leaves the running daemon on its previous config. The
 /// watcher is NOT triggered.
 ///
-/// Returns `{validated: true, path: "...", triggered: true}` on success.
+/// Note: "validated" means "parsed at RPC time," not "applied" — the watcher
+/// re-parses the file on its own tick (TOCTOU window). Safety is preserved
+/// on subsequent parse failure (old config kept), but the RPC's success
+/// response is a soft guarantee.
+///
+/// Returns `{validated: true, path: "...", triggered: true}` on success,
+/// where `path` is always the daemon's own `cfg_path`.
 async fn handle_reload_config(
-    params: &Value,
+    _params: &Value,
     default_cfg_path: &str,
     agent_name: &str,
     reload_state: &ReloadState,
 ) -> Result<Value> {
-    // Allow caller to override the config path. Defaults to the path the
-    // daemon was originally launched against. This matches `--config` on
-    // the CLI side.
-    let path = params
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or(default_cfg_path)
-        .to_string();
+    // The daemon always reloads its own config path. Any caller-supplied
+    // path is ignored — `--config` is verified client-side in the CLI.
+    let path = default_cfg_path.to_string();
 
     // Validate by parsing. If this fails, the daemon stays on its previous
     // config — we never trigger the watcher.
@@ -1226,24 +1236,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reload_config_explicit_path_override() {
-        // params.path overrides default_cfg_path.
+    async fn test_reload_config_ignores_path_param() {
+        // params.path is intentionally ignored — the daemon always reloads
+        // its own default_cfg_path (see #478 review). Caller-supplied paths
+        // from older clients are silently dropped; verification happens in
+        // the CLI before the RPC is issued.
         let tmp = tempfile::tempdir().unwrap();
-        let real = tmp.path().join("override.yaml");
+        let real = tmp.path().join("daemon.yaml");
         std::fs::write(&real, "model: claude-sonnet-4-6\n").unwrap();
 
         let reload_state = ReloadState::new();
         let result = handle_reload_config(
-            &json!({"path": real.to_str().unwrap()}),
-            "/tmp/this-default-does-not-exist.yaml",
+            // Caller tries to override with a path that *does not exist*.
+            &json!({"path": "/tmp/operator-supplied-bogus.yaml"}),
+            // Daemon's actual path is `real` — valid.
+            real.to_str().unwrap(),
             "test-agent",
             &reload_state,
         )
         .await;
         assert!(
             result.is_ok(),
-            "explicit path should be used over default; got {:?}",
+            "handler must use default_cfg_path and ignore params.path; got {:?}",
             result.err()
+        );
+        let v = result.unwrap();
+        assert_eq!(
+            v["path"],
+            json!(real.to_str().unwrap()),
+            "response should report the daemon's own path, not the caller's override"
         );
     }
 

@@ -3,6 +3,12 @@
 //! Sends a `reload_config` RPC to the running daemon's bus API and prints
 //! the daemon's response. On parse failure (malformed YAML) the CLI exits
 //! non-zero so scripted operators can surface the error.
+//!
+//! `--config <path>` is a client-side **assertion**: if provided, the CLI
+//! looks up the agent's recorded `config_path` in `ServeState` and bails
+//! before sending the RPC if the paths don't match. The daemon always
+//! reloads its own launch path — see `bus_api::handle_reload_config` and
+//! the #478 review for why a server-side override was removed.
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -25,13 +31,20 @@ pub async fn handle(
     // Resolve the bus socket. Priority:
     //   1. explicit --socket / $DESKD_BUS_SOCKET
     //   2. running serve state, scoped to --agent if provided
-    let bus_socket = resolve_bus_socket(socket_override, agent_override.as_deref())?;
+    let bus_socket = resolve_bus_socket(socket_override.clone(), agent_override.as_deref())?;
 
     if !std::path::Path::new(&bus_socket).exists() {
         anyhow::bail!(
             "bus socket not found at {} — is `deskd serve` running?",
             bus_socket
         );
+    }
+
+    // If the operator passed --config, verify it matches the daemon's
+    // recorded path. We can only check when ServeState is available; when
+    // the operator went through --socket directly, we trust them.
+    if let Some(ref operator_path) = config_override {
+        verify_operator_config_path(operator_path, &bus_socket, &socket_override)?;
     }
 
     let request_id = Uuid::new_v4().to_string();
@@ -49,15 +62,11 @@ pub async fn handle(
     });
     write_line(&mut stream, &reg).await?;
 
-    // Build the RPC payload. `params.path` is only set when the operator
-    // passed --config — otherwise the daemon uses its own launch path.
-    let mut params = json!({});
-    if let Some(ref path) = config_override {
-        params["path"] = json!(path);
-    }
+    // The daemon ignores any `params.path` (see #478 review) — we send an
+    // empty params object. `--config` is verified client-side above.
     let req_payload = json!({
         "method": "reload_config",
-        "params": params,
+        "params": {},
         "request_id": request_id,
     });
     let envelope = json!({
@@ -131,6 +140,43 @@ pub async fn handle(
     Ok(())
 }
 
+/// Verify that the operator-supplied `--config` path matches the agent's
+/// recorded `config_path` in `ServeState`. Bails on mismatch.
+///
+/// Skipped when the operator used `--socket` directly: there's no serve
+/// state to consult, and we trust the operator's manual routing.
+fn verify_operator_config_path(
+    operator_path: &str,
+    bus_socket: &str,
+    socket_override: &Option<String>,
+) -> Result<()> {
+    if socket_override.is_some() {
+        // Operator drove the socket explicitly — no ServeState to consult.
+        return Ok(());
+    }
+    let Some(state) = config::ServeState::load() else {
+        // No serve state file — nothing to verify against. Don't fail; the
+        // daemon will still validate its own config when it parses.
+        return Ok(());
+    };
+    let Some(agent) = state.agents.values().find(|a| a.bus_socket == bus_socket) else {
+        // The socket we resolved isn't recorded in ServeState. Don't fail
+        // — the agent may have been started outside `deskd serve`.
+        return Ok(());
+    };
+    if agent.config_path != operator_path {
+        anyhow::bail!(
+            "--config mismatch: you passed {}, but the daemon is reading {}. \
+             Drop --config to reload the daemon's actual config, or restart the \
+             daemon with --config {} if you meant to change the file.",
+            operator_path,
+            agent.config_path,
+            operator_path,
+        );
+    }
+    Ok(())
+}
+
 /// Resolve the bus socket: explicit > $DESKD_BUS_SOCKET > running serve.
 fn resolve_bus_socket(explicit: Option<String>, agent: Option<&str>) -> Result<String> {
     if let Some(s) = explicit {
@@ -188,5 +234,101 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+    }
+
+    #[test]
+    fn verify_skipped_when_socket_override_set() {
+        // --socket given → no ServeState to consult; verification is a no-op.
+        let got = verify_operator_config_path(
+            "/tmp/some-yaml.yaml",
+            "/tmp/sock",
+            &Some("/tmp/sock".into()),
+        );
+        assert!(got.is_ok());
+    }
+
+    #[test]
+    fn verify_skipped_when_no_serve_state() {
+        // No serve state file → don't fail; the daemon will validate itself.
+        let _env_guard = crate::test_support::env_lock().blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let got = verify_operator_config_path("/tmp/some.yaml", "/tmp/sock", &None);
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert!(got.is_ok());
+    }
+
+    #[test]
+    fn verify_bails_on_path_mismatch() {
+        // ServeState records cfg_path X; operator passed Y → bail.
+        let _env_guard = crate::test_support::env_lock().blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        // Write a ServeState with one agent at known socket + config_path.
+        let state_dir = tmp.path().join(".deskd");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state_yaml = r#"
+workspace_config: /tmp/workspace.yaml
+started_at: "2026-05-20T00:00:00Z"
+agents:
+  alpha:
+    work_dir: /tmp/alpha-wd
+    bus_socket: /tmp/alpha.sock
+    config_path: /home/op/deskd.yaml
+"#;
+        std::fs::write(state_dir.join("serve.state.yaml"), state_yaml).unwrap();
+        let got = verify_operator_config_path("/tmp/wrong.yaml", "/tmp/alpha.sock", &None);
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let err = got.unwrap_err().to_string();
+        assert!(err.contains("--config mismatch"), "got: {}", err);
+        assert!(err.contains("/tmp/wrong.yaml"), "got: {}", err);
+        assert!(err.contains("/home/op/deskd.yaml"), "got: {}", err);
+    }
+
+    #[test]
+    fn verify_ok_on_path_match() {
+        // ServeState records cfg_path X; operator passed X → ok.
+        let _env_guard = crate::test_support::env_lock().blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let state_dir = tmp.path().join(".deskd");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state_yaml = r#"
+workspace_config: /tmp/workspace.yaml
+started_at: "2026-05-20T00:00:00Z"
+agents:
+  alpha:
+    work_dir: /tmp/alpha-wd
+    bus_socket: /tmp/alpha.sock
+    config_path: /home/op/deskd.yaml
+"#;
+        std::fs::write(state_dir.join("serve.state.yaml"), state_yaml).unwrap();
+        let got = verify_operator_config_path("/home/op/deskd.yaml", "/tmp/alpha.sock", &None);
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert!(got.is_ok(), "match should pass; got {:?}", got.err());
     }
 }
