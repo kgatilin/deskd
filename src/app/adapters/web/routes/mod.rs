@@ -11,6 +11,7 @@ pub mod health;
 pub mod login;
 pub mod logout;
 pub mod metrics;
+pub mod panel;
 pub mod sse;
 pub mod static_assets;
 

@@ -98,6 +98,7 @@ fn cfg(audit_path: std::path::PathBuf) -> WebConfig {
             auth_requests_per_hour: 20,
         },
         trust_transport: false,
+        claude_weekly_token_estimate: 100_000_000,
     }
 }
 

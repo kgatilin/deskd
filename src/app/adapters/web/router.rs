@@ -8,7 +8,7 @@ use axum::{
 use super::middleware::headers::security_headers;
 use super::routes::{
     agent_detail, agent_log, agent_task, cost, cost_feed, dashboard, github_webhook, health, login,
-    logout, metrics, sse, static_assets,
+    logout, metrics, panel, sse, static_assets,
 };
 use super::state::WebState;
 
@@ -45,6 +45,11 @@ pub fn build(state: WebState) -> Router {
         .route("/static/htmx.min.js", get(static_assets::htmx_js))
         .route("/static/htmx-sse.js", get(static_assets::htmx_sse_js))
         .route("/static/dashboard.css", get(static_assets::dashboard_css))
+        .route("/static/pico.min.css", get(static_assets::pico_css))
+        // ─── #497: panel v2 (Level 2 + Level 3 + KPI JSON) ──────────────
+        .route("/agents/{name}", get(panel::level2))
+        .route("/agents/{name}/sessions/{session_id}", get(panel::level3))
+        .route("/api/kpi", get(panel::api_kpi))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
