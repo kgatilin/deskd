@@ -294,6 +294,12 @@ pub struct WebConfig {
     /// [`allowed_telegram_ids`] is ignored.
     #[serde(default)]
     pub trust_transport: bool,
+    /// Estimated weekly Claude token budget — denominator of the Panel v2
+    /// «weekly tokens used / estimate (%)» gauge (#497). Mirrors the same
+    /// field on `UserConfig`; the web adapter prefers its own value here
+    /// because it runs at workspace level. Default: 100_000_000 (100M).
+    #[serde(default = "default_weekly_token_estimate")]
+    pub claude_weekly_token_estimate: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -850,6 +856,18 @@ pub struct UserConfig {
     /// instead of falling back to the local internal/parent bus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_user_agents: Option<HashMap<String, String>>,
+    /// Estimated weekly Claude token budget (denominator for the panel v2
+    /// «weekly tokens used / estimate (%)» gauge — #497). Numbers are
+    /// estimates derived from the user's plan; CI/codepath behaviour does
+    /// NOT depend on this field. Default: 100_000_000 (100M).
+    #[serde(default = "default_weekly_token_estimate")]
+    pub claude_weekly_token_estimate: u64,
+}
+
+/// Default for `claude_weekly_token_estimate` (#497). 100M tokens — the
+/// estimate Konstantin uses for Max plan as of 2026-05.
+pub fn default_weekly_token_estimate() -> u64 {
+    100_000_000
 }
 
 /// An A2A skill advertised in the Agent Card (per A2A spec).

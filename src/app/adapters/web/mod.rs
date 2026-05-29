@@ -22,11 +22,14 @@ pub mod data_chart;
 pub mod data_cost;
 pub mod data_log;
 pub mod dispatch;
+pub mod event_query;
 pub mod middleware;
+pub mod panel;
 pub mod router;
 pub mod routes;
 pub mod state;
 pub mod templates;
+pub mod transcript_view;
 pub mod view;
 
 use anyhow::Result;

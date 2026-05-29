@@ -20,6 +20,9 @@ const HTMX_SSE_JS: &str = include_str!("../static/htmx-sse.js");
 /// Dashboard stylesheet. Public so the templates module can sanity-check
 /// the bundled CSS without re-reading it from disk.
 pub const DASHBOARD_CSS: &str = include_str!("../static/dashboard.css");
+/// Pico.css v2 — vendored, classless, ~30 KB. Served from `/static/pico.min.css`
+/// for the Panel v2 templates (#497).
+pub const PICO_CSS: &str = include_str!("../static/pico.min.css");
 
 const JS_CONTENT_TYPE: &str = "application/javascript; charset=utf-8";
 const CSS_CONTENT_TYPE: &str = "text/css; charset=utf-8";
@@ -37,6 +40,11 @@ pub async fn htmx_sse_js() -> Response {
 
 pub async fn dashboard_css() -> Response {
     static_response(DASHBOARD_CSS, CSS_CONTENT_TYPE)
+}
+
+/// `GET /static/pico.min.css` — vendored Pico.css v2 (#497).
+pub async fn pico_css() -> Response {
+    static_response(PICO_CSS, CSS_CONTENT_TYPE)
 }
 
 fn static_response(body: &'static str, content_type: &'static str) -> Response {
