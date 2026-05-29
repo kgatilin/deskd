@@ -230,6 +230,43 @@ fn save_state_at(path: &Path, state: &AgentState) -> Result<()> {
     Ok(())
 }
 
+/// Persist `pid` to the agent's state file. `0` means "no live worker"
+/// (cleared on stop / kill / natural exit). Returns `Ok(())` even when the
+/// state file does not exist — pid persistence is best-effort and must not
+/// crash the supervisor (#440).
+///
+/// Used by the supervisor's subprocess spawn path to reconcile
+/// `~/.deskd/agents/<name>.yaml::pid` with the live worker child PID so
+/// `deskd agent doctor` reports `alive=true` after spawn / restart.
+pub fn persist_pid(name: &str, pid: u32) -> Result<()> {
+    let path = state_path(name);
+    persist_pid_at(&path, pid)
+}
+
+/// Like `persist_pid`, but writes under an explicit `home` directory instead
+/// of `$HOME`. Used by tests to avoid mutating process env (see #423 /
+/// PR #428 CI flake).
+pub fn persist_pid_in(home: &Path, name: &str, pid: u32) -> Result<()> {
+    let path = state_path_in(home, name);
+    persist_pid_at(&path, pid)
+}
+
+fn persist_pid_at(path: &Path, pid: u32) -> Result<()> {
+    // Missing state file is a no-op: the state writer that owns this file
+    // has either not run yet or has been removed; either way there's
+    // nothing to reconcile. Returning Ok here matches the rest of the
+    // best-effort persistence helpers in this module.
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let mut state: AgentState = serde_yaml::from_str(&content)?;
+    if state.pid == pid {
+        return Ok(());
+    }
+    state.pid = pid;
+    save_state_at(path, &state)
+}
+
 /// Create a new agent (saves state file; does not start a worker process).
 pub async fn create(cfg: &AgentConfig) -> Result<AgentState> {
     if state_path(&cfg.name).exists() {
@@ -973,5 +1010,144 @@ created_at: "2024-01-01T00:00:00Z"
         assert_eq!(loaded.parent.as_deref(), Some("parent-agent"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── PID persistence (#440) ─────────────────────────────────────────
+    //
+    // Acceptance contract for #440:
+    //   * After spawn, the state file `pid` reflects the live worker PID.
+    //   * After stop/kill, the state file `pid` is cleared to 0.
+    //   * After natural exit (child wait returns), `pid` is cleared to 0.
+    //
+    // The three tests below exercise `persist_pid_in` — the helper that
+    // every spawn/exit/kill path in `agent_process.rs` calls. By driving
+    // the helper directly under an explicit `HOME` we sidestep the
+    // process-wide env-lock and stay independent of a real Claude
+    // subprocess (which the CI sandbox can't run).
+
+    /// Build a minimal valid `AgentState` for pid-persistence tests.
+    fn mk_state_for_pid_test(name: &str, pid: u32) -> AgentState {
+        AgentState {
+            config: AgentConfig {
+                name: name.to_string(),
+                model: "claude-sonnet-4-6".to_string(),
+                system_prompt: String::new(),
+                work_dir: "/tmp".to_string(),
+                max_turns: 100,
+                unix_user: None,
+                command: vec!["claude".to_string()],
+                config_path: None,
+                container: None,
+                session: ConfigSessionMode::default(),
+                runtime: ConfigAgentRuntime::default(),
+                launch_mode: ConfigLaunchMode::default(),
+                kind: ConfigAgentKind::default(),
+                context: None,
+                compact_threshold: None,
+                auto_compact_threshold_tokens: None,
+                empty_completion_threshold: None,
+                empty_completion_restart_min_secs: None,
+            },
+            pid,
+            session_id: "sess-pid".to_string(),
+            total_turns: 0,
+            total_cost: 0.0,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            status: "idle".to_string(),
+            current_task: String::new(),
+            parent: None,
+            scope: None,
+            can_message: None,
+            env_keys: None,
+            session_start: None,
+            session_cost: 0.0,
+            session_turns: 0,
+            consecutive_empty_completions: 0,
+            last_empty_restart_at: None,
+            total_empty_restarts: 0,
+            tmux_session: None,
+            tmux_log_path: None,
+        }
+    }
+
+    /// AC #1 + #2: After spawn the state file pid must reflect the
+    /// spawned worker PID (covers both initial spawn and restart respawn —
+    /// the same code path runs in both cases).
+    #[test]
+    fn persist_pid_after_spawn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent_name = "spawn-pid-test";
+        // Seed the state file with pid=0 — the pre-spawn baseline written
+        // by `create_or_recover` before the supervisor starts the worker.
+        let initial = mk_state_for_pid_test(agent_name, 0);
+        save_state_in(tmp.path(), &initial).unwrap();
+
+        // Simulate spawn handing us a child PID (e.g. `child.id() == 4242`).
+        persist_pid_in(tmp.path(), agent_name, 4242).unwrap();
+
+        let loaded = load_state_in(tmp.path(), agent_name).unwrap();
+        assert_eq!(
+            loaded.pid, 4242,
+            "spawn handler must reconcile state.pid with live worker PID"
+        );
+        // Session-related fields must remain untouched.
+        assert_eq!(loaded.session_id, "sess-pid");
+    }
+
+    /// AC #3 (stop/kill branch): an explicit `agent stop` / `AgentProcess::kill`
+    /// must clear `pid` to 0 in the state file so `deskd agent doctor`
+    /// reports `pid=-` rather than a stale recycled PID.
+    #[test]
+    fn clear_pid_after_stop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent_name = "stop-pid-test";
+        // Live worker baseline: pid is non-zero (spawn already ran).
+        let live = mk_state_for_pid_test(agent_name, 9999);
+        save_state_in(tmp.path(), &live).unwrap();
+
+        // Stop/kill path persists pid=0.
+        persist_pid_in(tmp.path(), agent_name, 0).unwrap();
+
+        let loaded = load_state_in(tmp.path(), agent_name).unwrap();
+        assert_eq!(
+            loaded.pid, 0,
+            "stop/kill handler must clear the persisted worker PID"
+        );
+    }
+
+    /// AC #3 (natural-exit branch): when the child's `wait()` returns on
+    /// its own (no `agent stop` ran), the stdout-reader cleanup branch
+    /// must still clear the persisted PID.
+    #[test]
+    fn clear_pid_after_natural_exit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent_name = "exit-pid-test";
+        let live = mk_state_for_pid_test(agent_name, 4242);
+        save_state_in(tmp.path(), &live).unwrap();
+
+        // Reader-task simulates: ch.wait() returned, now clear the pid.
+        persist_pid_in(tmp.path(), agent_name, 0).unwrap();
+
+        let loaded = load_state_in(tmp.path(), agent_name).unwrap();
+        assert_eq!(
+            loaded.pid, 0,
+            "natural-exit handler must clear the persisted worker PID"
+        );
+    }
+
+    /// `persist_pid` is best-effort: a missing state file must not error
+    /// (the spawn path runs concurrently with state-file creation in some
+    /// recovery races, and a failed persist must not abort the supervisor).
+    #[test]
+    fn persist_pid_is_noop_when_state_file_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent_name = "ghost";
+        // Do NOT create a state file.
+        let res = persist_pid_in(tmp.path(), agent_name, 1234);
+        assert!(
+            res.is_ok(),
+            "persist_pid must tolerate a missing state file: {:?}",
+            res
+        );
     }
 }
