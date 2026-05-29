@@ -9,6 +9,8 @@
 //! - `GET /static/htmx.min.js`   — htmx 2.0.3 minified
 //! - `GET /static/htmx-sse.js`   — htmx-ext-sse 2.2.2 (the SSE extension)
 //! - `GET /static/dashboard.css` — dashboard stylesheet
+//! - `GET /static/pico.min.css`  — vendored Pico.css v2 (#497)
+//! - `GET /static/panel.js`      — panel v2 delegated row click (#516)
 
 use axum::{
     http::{StatusCode, header},
@@ -23,6 +25,10 @@ pub const DASHBOARD_CSS: &str = include_str!("../static/dashboard.css");
 /// Pico.css v2 — vendored, classless, ~30 KB. Served from `/static/pico.min.css`
 /// for the Panel v2 templates (#497).
 pub const PICO_CSS: &str = include_str!("../static/pico.min.css");
+/// Panel v2 delegated row-click handler (#516). Served from `/static/panel.js`
+/// so the strict CSP (`script-src 'self'`) holds — replaces the inline
+/// row-click attribute previously emitted on agent rows.
+pub const PANEL_JS: &str = include_str!("../static/panel.js");
 
 const JS_CONTENT_TYPE: &str = "application/javascript; charset=utf-8";
 const CSS_CONTENT_TYPE: &str = "text/css; charset=utf-8";
@@ -45,6 +51,11 @@ pub async fn dashboard_css() -> Response {
 /// `GET /static/pico.min.css` — vendored Pico.css v2 (#497).
 pub async fn pico_css() -> Response {
     static_response(PICO_CSS, CSS_CONTENT_TYPE)
+}
+
+/// `GET /static/panel.js` — panel v2 delegated row-click handler (#516).
+pub async fn panel_js() -> Response {
+    static_response(PANEL_JS, JS_CONTENT_TYPE)
 }
 
 fn static_response(body: &'static str, content_type: &'static str) -> Response {
@@ -97,5 +108,23 @@ mod tests {
         assert!(DASHBOARD_CSS.contains(".ctx-bar__fill--w-0"));
         assert!(DASHBOARD_CSS.contains(".ctx-bar__fill--w-50"));
         assert!(DASHBOARD_CSS.contains(".ctx-bar__fill--w-100"));
+    }
+
+    #[tokio::test]
+    async fn panel_js_served_with_js_content_type() {
+        let resp = panel_js().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap();
+        assert!(ct.to_str().unwrap().starts_with("application/javascript"));
+    }
+
+    #[tokio::test]
+    async fn panel_js_is_delegated_handler_with_data_href() {
+        // Sanity-check the vendored handler — must use the `data-href`
+        // attribute and skip inner `<a>` clicks, otherwise the CSP-safe
+        // delegated dispatch can't replace the old inline `onclick`.
+        assert!(PANEL_JS.contains("tr.agent-row[data-href]"));
+        assert!(PANEL_JS.contains("data-href") || PANEL_JS.contains("dataset.href"));
+        assert!(!PANEL_JS.contains("onclick"));
     }
 }

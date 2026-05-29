@@ -230,7 +230,7 @@ fn render_agent_rows(rows: &[AgentRollup]) -> String {
     );
     for r in rows {
         out.push_str(&format!(
-            r#"<tr onclick="location.href='/agents/{a}'" class="agent-row">
+            r#"<tr class="agent-row" data-href="/agents/{a}">
 <td><a href="/agents/{a}">{a}</a></td>
 <td>{m}</td>
 <td>{tok}</td>
@@ -419,6 +419,7 @@ pub fn shell_page(
 <link rel="stylesheet" href="/static/dashboard.css">
 <script src="/static/htmx.min.js"></script>
 <script src="/static/htmx-sse.js"></script>
+<script src="/static/panel.js" defer></script>
 </head>
 <body>
 <header class="container topbar">
@@ -590,5 +591,34 @@ mod tests {
         assert!(!lower.contains("<style "));
         assert!(!lower.contains("style=\""));
         assert!(!lower.contains("style='"));
+    }
+
+    #[test]
+    fn agent_rows_use_data_href_not_onclick() {
+        // #516: full-row navigation is wired via a delegated handler in
+        // `/static/panel.js` that reads `data-href`; no inline `onclick`
+        // attributes may appear (strict CSP from #443).
+        let rows = vec![AgentRollup {
+            agent: "dev".into(),
+            model: "claude-opus-4-7".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            iterations: 1,
+            cost_usd: 0.0,
+            limit_hits: 0,
+            sessions: 1,
+        }];
+        let html = render_agent_rows(&rows);
+        assert!(!html.contains("onclick"), "no inline onclick allowed");
+        assert!(html.contains(r#"data-href="/agents/dev""#));
+        assert!(html.contains(r#"class="agent-row""#));
+    }
+
+    #[test]
+    fn shell_page_links_panel_js_for_delegated_click() {
+        // #516: the shell must pull in `/static/panel.js` so the delegated
+        // row-click handler runs alongside the existing htmx scripts.
+        let html = shell_page("test", 42, "csrf-x", "<p>x</p>", "1m");
+        assert!(html.contains(r#"src="/static/panel.js""#));
     }
 }
