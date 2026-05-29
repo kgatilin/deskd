@@ -307,6 +307,66 @@ async fn dump_panel_html_sample_on_demand() {
     std::fs::write("/tmp/panel_sample.html", &body).unwrap();
 }
 
+// ─── #516: CSP-safe row click (no inline onclick handlers) ─────────────
+
+#[tokio::test]
+async fn root_has_no_inline_onclick_and_uses_data_href_with_panel_js() {
+    // #516 regression: panel v2 must not emit inline `onclick` handlers
+    // (strict CSP from #443 forbids `'unsafe-inline'`). Full-row click is
+    // delegated through `/static/panel.js` which reads `data-href`.
+    let (state, _disp, _dir) = build_state();
+    let cookie = auth_cookie(&state);
+    let app = router::build(state);
+    let req = req_with_peer(
+        Request::get("/")
+            .header(
+                header::COOKIE,
+                format!("{}={}", SESSION_COOKIE_NAME, cookie),
+            )
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        !body.contains("onclick="),
+        "panel v2 must not emit inline onclick attributes"
+    );
+    assert!(
+        body.contains(r#"src="/static/panel.js""#),
+        "shell head must link /static/panel.js"
+    );
+}
+
+#[tokio::test]
+async fn static_panel_js_served_with_js_content_type() {
+    let (state, _disp, _dir) = build_state();
+    let app = router::build(state);
+    let req = req_with_peer(
+        Request::get("/static/panel.js")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .expect("content-type")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        ct.starts_with("application/javascript"),
+        "expected JS, got {}",
+        ct
+    );
+    let body = body_string(resp).await;
+    // The handler must be a delegated listener on `data-href` rows.
+    assert!(body.contains("tr.agent-row[data-href]"));
+}
+
 #[tokio::test]
 async fn static_pico_css_served_with_css_content_type() {
     let (state, _disp, _dir) = build_state();

@@ -46,6 +46,7 @@ pub fn build(state: WebState) -> Router {
         .route("/static/htmx-sse.js", get(static_assets::htmx_sse_js))
         .route("/static/dashboard.css", get(static_assets::dashboard_css))
         .route("/static/pico.min.css", get(static_assets::pico_css))
+        .route("/static/panel.js", get(static_assets::panel_js))
         // ─── #497: panel v2 (Level 2 + Level 3 + KPI JSON) ──────────────
         .route("/agents/{name}", get(panel::level2))
         .route("/agents/{name}/sessions/{session_id}", get(panel::level3))
