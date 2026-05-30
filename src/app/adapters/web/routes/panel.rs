@@ -24,7 +24,7 @@ use serde::Deserialize;
 
 use crate::app::adapters::web::event_query::{
     self, KpiPeriod, aggregate_agents, aggregate_kpi, aggregate_sessions, iteration_sparkline_24h,
-    read_events_between,
+    read_events_between_from_roots,
 };
 use crate::app::adapters::web::panel;
 use crate::app::adapters::web::routes::authenticate;
@@ -65,8 +65,8 @@ pub async fn level2(
         "30d" => (now - chrono::Duration::days(30), "30d"),
         _ => (now - chrono::Duration::days(7), "7d"),
     };
-    let root = event_query::default_root();
-    let events = read_events_between(&root, window_start, now).await;
+    let roots = state.event_roots();
+    let events = read_events_between_from_roots(&roots, window_start, now).await;
     let rows = aggregate_agents(&events);
     let rollup = rows
         .into_iter()
@@ -146,8 +146,8 @@ pub async fn api_kpi(
         KpiPeriod::Week => event_query::week_start_berlin(now),
         KpiPeriod::Month => event_query::month_start_berlin(now),
     };
-    let root = event_query::default_root();
-    let events = read_events_between(&root, start, now).await;
+    let roots = state.event_roots();
+    let events = read_events_between_from_roots(&roots, start, now).await;
     let kpi = aggregate_kpi(&events, period);
     Json(kpi).into_response()
 }

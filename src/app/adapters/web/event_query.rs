@@ -138,6 +138,12 @@ pub struct Kpi {
 /// Read all event store files whose label falls between `start` and `end`
 /// (inclusive, Berlin date). Streaming JSONL parse: lines that fail to
 /// parse are skipped silently — the store is treated as forward-compatible.
+///
+/// Single-root reader. Production web handlers should use
+/// [`read_events_between_from_roots`] which unions across every registered
+/// agent home — `deskd serve` may run as a different unix user than the
+/// agents that write events, so a single `$HOME`-rooted read is
+/// systematically wrong (see #521).
 pub async fn read_events_between(
     root: &Path,
     start: DateTime<Utc>,
@@ -166,6 +172,41 @@ pub async fn read_events_between(
             }
         }
     }
+    out
+}
+
+/// Multi-root variant of [`read_events_between`] (#521).
+///
+/// Unions events from every supplied root, sorts the result by event
+/// timestamp ascending, and silently skips roots that don't exist or
+/// can't be read. This is what the web adapter MUST use: `deskd serve`
+/// typically runs as `root` (or a supervisor user) while agents run as
+/// their own unix users (`dev`, `kira`, `family`, …). Each agent owns a
+/// `~/.deskd/events/` under its own `$HOME`, so a single-root read
+/// rooted in the supervisor's `$HOME` always misses the real data.
+///
+/// Roots are typically `{agent_work_dir}/.deskd/events/` — derive them
+/// with [`crate::app::adapters::web::state::WebState::event_roots`].
+///
+/// Empty input → empty output (no error). Duplicate roots are *not*
+/// deduplicated — call sites are expected to pass distinct paths.
+pub async fn read_events_between_from_roots(
+    roots: &[PathBuf],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Vec<TranscriptEvent> {
+    let mut out = Vec::new();
+    for root in roots {
+        let part = read_events_between(root, start, end).await;
+        out.extend(part);
+    }
+    // Sort ascending by parsed RFC-3339 ts; events with unparseable
+    // timestamps sink to the end so aggregations stay deterministic.
+    out.sort_by_key(|ev| {
+        DateTime::parse_from_rfc3339(ev.ts())
+            .map(|t| t.with_timezone(&Utc))
+            .unwrap_or_else(|_| DateTime::<Utc>::MAX_UTC)
+    });
     out
 }
 
@@ -571,7 +612,14 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
         .ok()
 }
 
-/// Default event-store root, exposed so handlers can override in tests.
+/// Default event-store root for the *current process's* `$HOME`. Exposed
+/// for the per-agent transcript-extractor and tests.
+///
+/// **Do not call this from web-adapter route handlers** — the web adapter
+/// runs in `deskd serve`'s process whose `$HOME` is the supervisor's
+/// (often `/root`), not the agent home. Use
+/// [`read_events_between_from_roots`] with the homes resolved from
+/// [`crate::app::adapters::web::state::WebState`] instead (#521).
 pub fn default_root() -> PathBuf {
     default_event_root()
 }
@@ -757,6 +805,81 @@ mod tests {
         let m = month_start_berlin(now);
         let berlin = Berlin.from_utc_datetime(&m.naive_utc());
         assert_eq!(berlin.day(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_events_between_from_roots_unions_and_sorts() {
+        // Two fixture roots, each owning one day file. The aggregator
+        // must union events and return them sorted by timestamp asc.
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let root_a = dir_a.path();
+        let root_b = dir_b.path();
+
+        // Root A: one early event + one late event on 2026-05-22.
+        let day_a = root_a.join("2026-05-22.jsonl");
+        let a_early = ev_start("2026-05-22T08:00:00Z", "dev", "sA", "claude-opus-4-7");
+        let a_late = ev_end("2026-05-22T18:00:00Z", "dev", "sA", 100, 50, 3);
+        std::fs::write(
+            &day_a,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&a_early).unwrap(),
+                serde_json::to_string(&a_late).unwrap()
+            ),
+        )
+        .unwrap();
+        // Root B: one midday event on the same day.
+        let day_b = root_b.join("2026-05-22.jsonl");
+        let b_mid = ev_start("2026-05-22T12:00:00Z", "kira", "sB", "claude-sonnet-4-6");
+        std::fs::write(
+            &day_b,
+            format!("{}\n", serde_json::to_string(&b_mid).unwrap()),
+        )
+        .unwrap();
+
+        let roots = vec![root_a.to_path_buf(), root_b.to_path_buf()];
+        let start = ts("2026-05-22T00:00:00Z");
+        let end = ts("2026-05-22T23:59:59Z");
+        let events = read_events_between_from_roots(&roots, start, end).await;
+
+        assert_eq!(events.len(), 3, "should union events from both roots");
+        // Verify sort: 08:00 (dev), 12:00 (kira), 18:00 (dev).
+        let timestamps: Vec<&str> = events.iter().map(|e| e.ts()).collect();
+        assert_eq!(
+            timestamps,
+            vec![
+                "2026-05-22T08:00:00Z",
+                "2026-05-22T12:00:00Z",
+                "2026-05-22T18:00:00Z",
+            ],
+            "events must be sorted by timestamp ascending"
+        );
+        // Verify both agents are represented.
+        let agents: std::collections::HashSet<&str> = events.iter().map(|e| e.agent()).collect();
+        assert!(agents.contains("dev"));
+        assert!(agents.contains("kira"));
+    }
+
+    #[tokio::test]
+    async fn read_events_between_from_roots_skips_missing_roots() {
+        // A non-existent root must not panic and must not pollute the
+        // output of other roots that do exist. Empty input → empty output.
+        let dir = tempdir().unwrap();
+        let day = dir.path().join("2026-05-22.jsonl");
+        let e = ev_start("2026-05-22T10:00:00Z", "dev", "s1", "claude-opus-4-7");
+        std::fs::write(&day, format!("{}\n", serde_json::to_string(&e).unwrap())).unwrap();
+
+        let missing = std::path::PathBuf::from("/nonexistent/deskd-521/events");
+        let roots = vec![missing, dir.path().to_path_buf()];
+        let start = ts("2026-05-22T00:00:00Z");
+        let end = ts("2026-05-22T23:59:59Z");
+        let events = read_events_between_from_roots(&roots, start, end).await;
+        assert_eq!(events.len(), 1);
+
+        // Empty roots list → empty result.
+        let empty = read_events_between_from_roots(&[], start, end).await;
+        assert!(empty.is_empty());
     }
 
     #[tokio::test]

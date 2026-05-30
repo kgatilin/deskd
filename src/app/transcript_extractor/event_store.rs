@@ -20,6 +20,15 @@ use tokio::sync::Mutex;
 use super::events::TranscriptEvent;
 
 /// Default location for the event store: `~/.deskd/events/`.
+///
+/// Resolves against the *current process's* `$HOME`. This is correct for
+/// the per-agent transcript extractor, which runs in-process under the
+/// agent's identity. It is **wrong for the web adapter** — `deskd serve`
+/// typically runs as a supervisor user (often `root`) whose `$HOME`
+/// has no event files. The web adapter must instead enumerate the
+/// per-agent homes from its `WebState`; see
+/// [`crate::app::adapters::web::event_query::read_events_between_from_roots`]
+/// (#521).
 pub fn default_event_root() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".deskd").join("events")
