@@ -13,7 +13,7 @@ use crate::domain::config_types::ConfigSessionMode;
 use crate::ports::executor::{Executor, ProgressSink, TaskLimits, TokenUsage, TurnResult};
 
 use super::agent_registry::{
-    format_user_message, load_state, rotate_stream_log, save_state, save_state_pub,
+    format_user_message, load_state, persist_pid, rotate_stream_log, save_state, save_state_pub,
     stderr_log_path, stream_log_path,
 };
 use super::process_builder::{build_command, inject_required_flags};
@@ -372,7 +372,23 @@ impl AgentProcess {
             .spawn()
             .context("Failed to spawn persistent claude process")?;
 
-        info!(agent = %name, model = %state.config.model, "persistent process started");
+        // Persist the worker PID into the agent state file (#440) so
+        // `deskd agent doctor` reports `alive=true` after spawn / restart /
+        // supervisor respawn. Best-effort: a write failure must not abort
+        // the spawn — the supervisor still has the live child handle.
+        let worker_pid = child.id().unwrap_or(0);
+        if worker_pid > 0
+            && let Err(e) = persist_pid(name, worker_pid)
+        {
+            warn!(
+                agent = %name,
+                pid = worker_pid,
+                error = %e,
+                "failed to persist worker pid to state file"
+            );
+        }
+
+        info!(agent = %name, pid = worker_pid, model = %state.config.model, "persistent process started");
 
         let spawn_instant = std::time::Instant::now();
 
@@ -528,6 +544,16 @@ impl AgentProcess {
             } else {
                 None
             };
+            // Clear the persisted PID on natural exit (#440). The child
+            // handle has been awaited; any future `deskd agent doctor` call
+            // must not see a stale live-pid number in the state file.
+            if let Err(e) = persist_pid(&agent_name2, 0) {
+                warn!(
+                    agent = %agent_name2,
+                    error = %e,
+                    "failed to clear worker pid on natural exit"
+                );
+            }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let stderr_tail = stderr_buf_reader
                 .lock()
@@ -790,6 +816,11 @@ impl AgentProcess {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
+        // Clear the persisted PID (#440) so doctor reports `alive=false`
+        // with `pid=0` rather than a stale recycled pid.
+        if let Err(e) = persist_pid(&self.name, 0) {
+            warn!(agent = %self.name, error = %e, "failed to clear worker pid on kill");
+        }
         warn!(agent = %self.name, "persistent process killed");
     }
 
@@ -798,6 +829,10 @@ impl AgentProcess {
         if let Some(mut child) = self.child.lock().await.take() {
             let _ = child.kill().await;
             let _ = child.wait().await;
+        }
+        // Clear the persisted PID (#440). See `kill` for rationale.
+        if let Err(e) = persist_pid(&self.name, 0) {
+            warn!(agent = %self.name, error = %e, "failed to clear worker pid on stop");
         }
         info!(agent = %self.name, "persistent process stopped");
     }
