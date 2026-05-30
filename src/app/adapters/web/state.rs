@@ -5,6 +5,7 @@
 //! token store, the rate limiter, the audit log writer, and the Telegram
 //! dispatcher (a trait object so tests can stub it out).
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::app::metrics::DiskMetrics;
@@ -67,6 +68,22 @@ pub struct WebState {
     /// feed so a busy dashboard with many tabs only hits gh once per
     /// minute per repo.
     pub cost_cache: CostCache,
+}
+
+impl WebState {
+    /// Per-agent event-store roots — one `{work_dir}/.deskd/events/` per
+    /// registered agent (#521). The web adapter unions reads across all
+    /// of these so KPIs/agent rollups reflect what the agents actually
+    /// wrote, regardless of which unix user runs `deskd serve`.
+    ///
+    /// Returns an empty vec when no agents are configured; callers must
+    /// tolerate that (the panel renders all-zero, not an error).
+    pub fn event_roots(&self) -> Vec<PathBuf> {
+        self.agent_homes
+            .iter()
+            .map(|(_, home)| PathBuf::from(home).join(".deskd").join("events"))
+            .collect()
+    }
 }
 
 /// Returns a unix timestamp in seconds. Boxed so we can stub it out in tests.

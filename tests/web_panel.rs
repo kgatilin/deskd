@@ -108,6 +108,122 @@ async fn body_string(resp: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+/// Variant of `build_state` that registers two fixture agent homes (#521).
+/// The caller gets the dir handles back so they can write event-store
+/// fixtures under `{home}/.deskd/events/`. Both temp dirs MUST be held
+/// alive for the lifetime of the test or the fixture files vanish.
+fn build_state_with_agent_homes() -> (
+    WebState,
+    RecordingDispatcher,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let audit_path = cfg_dir.path().join("audit.jsonl");
+    let cfg_obj = cfg(audit_path.clone());
+    let dispatcher = RecordingDispatcher::new();
+    let dispatcher_arc: Arc<dyn deskd::app::adapters::web::dispatch::TelegramDispatcher> =
+        Arc::new(dispatcher.clone());
+    let bus_sender: Arc<dyn deskd::app::adapters::web::dispatch::BusSender> =
+        Arc::new(RecordingBusSender::new());
+    let agent_commands: Arc<dyn deskd::app::adapters::web::dispatch::AgentCommandDispatcher> =
+        Arc::new(
+            deskd::app::adapters::web::dispatch::testing::RecordingAgentCommandDispatcher::new(),
+        );
+    let metrics_cache = cfg_dir.path().join("disk-cache.json");
+
+    // Two fixture agent homes — these stand in for `/home/dev` and
+    // `/home/kira` on the real VPS. Each gets its own tempdir so we
+    // can prove the panel unions across them.
+    let home_a = tempfile::tempdir().unwrap();
+    let home_b = tempfile::tempdir().unwrap();
+    let agent_homes = vec![
+        ("dev".to_string(), home_a.path().display().to_string()),
+        ("kira".to_string(), home_b.path().display().to_string()),
+    ];
+
+    let state = WebState {
+        cfg: Arc::new(cfg_obj),
+        secret: Arc::new(TEST_SECRET),
+        tokens: Arc::new(TokenStore::new()),
+        rate_limiter_ip: Arc::new(RateLimiter::new(20, 3600)),
+        rate_limiter_tg: Arc::new(RateLimiter::new(20, 3600)),
+        audit: AuditLog::new(audit_path),
+        telegram: dispatcher_arc,
+        github_webhooks: None,
+        bus: bus_sender,
+        github_deliveries: shared_dedupe(),
+        agent_commands,
+        now: Arc::new(|| 1_700_000_000),
+        metrics: deskd::app::metrics::DiskMetrics::new(metrics_cache),
+        agent_homes: Arc::new(agent_homes),
+        metrics_bus: None,
+        cost: None,
+        gh: Arc::new(deskd::app::adapters::web::data_cost::testing::RecordingGhClient::new()),
+        cost_cache: deskd::app::adapters::web::data_cost::CostCache::new(),
+    };
+    (state, dispatcher, cfg_dir, home_a, home_b)
+}
+
+/// Compute today's Berlin-date `YYYY-MM-DD` label, matching the
+/// event-store rotation convention.
+fn berlin_today_label() -> String {
+    use chrono::{TimeZone, Utc};
+    use chrono_tz::Europe::Berlin;
+    let now = Utc::now();
+    Berlin
+        .from_utc_datetime(&now.naive_utc())
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// Write a `session.start` + `session.end` pair to
+/// `{home}/.deskd/events/{today}.jsonl`. Returns the file path for
+/// debugging. Timestamps use "now-ish" so they fall inside the
+/// today/week/month KPI windows.
+fn seed_today_events(
+    home: &std::path::Path,
+    agent: &str,
+    session_id: &str,
+    tokens_in: u64,
+    tokens_out: u64,
+    iterations: u64,
+) -> std::path::PathBuf {
+    use chrono::{Duration, Utc};
+    let events_dir = home.join(".deskd").join("events");
+    std::fs::create_dir_all(&events_dir).unwrap();
+    let path = events_dir.join(format!("{}.jsonl", berlin_today_label()));
+    // Pick timestamps strictly in the past so the KPI window's `now`
+    // upper-bound includes them. 1h ago is safely inside any of
+    // today/week/month windows when the test runs near midnight too.
+    let now = Utc::now();
+    let start = now - Duration::minutes(5);
+    let end = now - Duration::minutes(1);
+    let start_ev = serde_json::json!({
+        "kind": "session.start",
+        "ts": start.to_rfc3339(),
+        "agent": agent,
+        "session_id": session_id,
+        "model": "claude-opus-4-7",
+    });
+    let end_ev = serde_json::json!({
+        "kind": "session.end",
+        "ts": end.to_rfc3339(),
+        "agent": agent,
+        "session_id": session_id,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "cost_usd": 0.0,
+        "iterations": iterations,
+        "duration_s": 1800,
+    });
+    let line_a = serde_json::to_string(&start_ev).unwrap();
+    let line_b = serde_json::to_string(&end_ev).unwrap();
+    std::fs::write(&path, format!("{}\n{}\n", line_a, line_b)).unwrap();
+    path
+}
+
 // ─── Level 1: GET / ─────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -278,6 +394,111 @@ async fn api_kpi_returns_json_with_period_label() {
     // Default counts are zero — these are scalar numerics, not strings.
     assert!(v["tokens_total"].is_number());
     assert!(v["sessions"].is_number());
+}
+
+// ─── #521 regression: panel unions events across agent homes ───────────
+
+#[tokio::test]
+async fn api_kpi_aggregates_across_registered_agent_homes() {
+    // Real-world setup: `deskd serve` runs as root (HOME=/root with no
+    // events), agents `dev` and `kira` each own their own home with a
+    // populated event store. Before #521 the KPI numerator queried
+    // /root/.deskd/events/ and returned all zeros. After #521 the
+    // panel must union both registered homes.
+    let (state, _disp, _cfg_dir, home_a, home_b) = build_state_with_agent_homes();
+    seed_today_events(home_a.path(), "dev", "s-dev-1", 1000, 500, 5);
+    seed_today_events(home_b.path(), "kira", "s-kira-1", 2000, 750, 7);
+
+    let cookie = auth_cookie(&state);
+    let app = router::build(state);
+    let req = req_with_peer(
+        Request::get("/api/kpi?period=week")
+            .header(
+                header::COOKIE,
+                format!("{}={}", SESSION_COOKIE_NAME, cookie),
+            )
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // Union of both homes:
+    //   tokens_in  = 1000 + 2000 = 3000
+    //   tokens_out =  500 +  750 = 1250
+    //   total      = 3000 + 1250 = 4250
+    //   sessions   = 2 (one per agent)
+    //   iterations = 5 + 7 = 12
+    assert_eq!(v["tokens_in"], 3000, "tokens_in must union both homes");
+    assert_eq!(v["tokens_out"], 1250, "tokens_out must union both homes");
+    assert_eq!(
+        v["tokens_total"], 4250,
+        "tokens_total must union both homes"
+    );
+    assert_eq!(v["sessions"], 2, "should count both agents' sessions");
+    assert_eq!(v["iterations"], 12, "should sum iterations across homes");
+}
+
+#[tokio::test]
+async fn api_kpi_zero_when_no_event_files_exist() {
+    // Graceful empty state: two agents are registered but neither has
+    // ever written an event file. The route must return 200 with zeros,
+    // not 500 or a missing-file error.
+    let (state, _disp, _cfg_dir, _home_a, _home_b) = build_state_with_agent_homes();
+    let cookie = auth_cookie(&state);
+    let app = router::build(state);
+    let req = req_with_peer(
+        Request::get("/api/kpi?period=today")
+            .header(
+                header::COOKIE,
+                format!("{}={}", SESSION_COOKIE_NAME, cookie),
+            )
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["tokens_total"], 0);
+    assert_eq!(v["sessions"], 0);
+    assert_eq!(v["iterations"], 0);
+}
+
+#[tokio::test]
+async fn level1_dashboard_unions_agent_event_homes() {
+    // End-to-end sanity for `GET /`: with two agent homes populated, the
+    // rendered HTML must surface non-zero numbers. We inspect the cheap
+    // token count via the panel body — pre-#521 this rendered "0".
+    let (state, _disp, _cfg_dir, home_a, home_b) = build_state_with_agent_homes();
+    seed_today_events(home_a.path(), "dev", "s-dev-1", 1_000_000, 500_000, 5);
+    seed_today_events(home_b.path(), "kira", "s-kira-1", 2_000_000, 750_000, 7);
+
+    let cookie = auth_cookie(&state);
+    let app = router::build(state);
+    let req = req_with_peer(
+        Request::get("/")
+            .header(
+                header::COOKIE,
+                format!("{}={}", SESSION_COOKIE_NAME, cookie),
+            )
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    // Both agent rows must be in the rendered agent list.
+    assert!(
+        body.contains("dev"),
+        "agent dev should appear in the agent rollup table"
+    );
+    assert!(
+        body.contains("kira"),
+        "agent kira should appear in the agent rollup table"
+    );
 }
 
 // ─── /static/pico.min.css ──────────────────────────────────────────────

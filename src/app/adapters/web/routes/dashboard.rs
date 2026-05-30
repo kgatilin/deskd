@@ -15,7 +15,7 @@ use crate::app::adapters::web::data;
 use crate::app::adapters::web::data_chart;
 use crate::app::adapters::web::event_query::{
     self, KpiPeriod, aggregate_agents, aggregate_kpi, aggregate_weekly_tokens,
-    iteration_sparkline_24h, read_events_between, week_start_berlin,
+    iteration_sparkline_24h, read_events_between_from_roots, week_start_berlin,
 };
 use crate::app::adapters::web::panel;
 use crate::app::adapters::web::routes::{SESSION_COOKIE_NAME, authenticate};
@@ -88,14 +88,14 @@ pub async fn dashboard(
                 KpiPeriod::Week => week_start,
                 KpiPeriod::Month => event_query::month_start_berlin(now),
             };
-            let root = event_query::default_root();
-            let weekly_events = read_events_between(&root, week_start, now).await;
+            let roots = state.event_roots();
+            let weekly_events = read_events_between_from_roots(&roots, week_start, now).await;
             let weekly = aggregate_weekly_tokens(&weekly_events);
             let agent_rollups = aggregate_agents(&weekly_events);
             let kpi_events = if kpi_period == KpiPeriod::Week {
                 weekly_events.clone()
             } else {
-                read_events_between(&root, kpi_start, now).await
+                read_events_between_from_roots(&roots, kpi_start, now).await
             };
             let kpi = aggregate_kpi(&kpi_events, kpi_period);
             let spark = iteration_sparkline_24h(&weekly_events, now, 24);
