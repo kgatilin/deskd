@@ -267,6 +267,48 @@ fn persist_pid_at(path: &Path, pid: u32) -> Result<()> {
     save_state_at(path, &state)
 }
 
+/// CAS-style "clear PID" — sets `pid` to 0 in the agent's state file only when
+/// the currently persisted PID equals `expected`. Used by the stdout-reader,
+/// `kill`, and `stop` paths to avoid the restart-race window (#519): a stale
+/// reader task from a previous worker generation can fire its deferred clear
+/// AFTER a fresh spawn has already written a new PID, clobbering it.
+///
+/// Best-effort like [`persist_pid`]: a missing state file is a no-op; a PID
+/// mismatch logs at debug and returns `Ok(())` without writing.
+pub fn clear_pid_if_matches(name: &str, expected: u32) -> Result<()> {
+    let path = state_path(name);
+    clear_pid_if_matches_at(&path, name, expected)
+}
+
+/// Like `clear_pid_if_matches`, but resolves the state file under an explicit
+/// `home` directory instead of `$HOME`. Used by tests (see #423 / PR #428
+/// CI flake) and by callers that already know the home path.
+pub fn clear_pid_if_matches_in(home: &Path, name: &str, expected: u32) -> Result<()> {
+    let path = state_path_in(home, name);
+    clear_pid_if_matches_at(&path, name, expected)
+}
+
+fn clear_pid_if_matches_at(path: &Path, name: &str, expected: u32) -> Result<()> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let mut state: AgentState = serde_yaml::from_str(&content)?;
+    if state.pid != expected {
+        debug!(
+            agent = %name,
+            current = state.pid,
+            expected,
+            "skip pid clear — current pid does not match expected (restart race)"
+        );
+        return Ok(());
+    }
+    if state.pid == 0 {
+        return Ok(());
+    }
+    state.pid = 0;
+    save_state_at(path, &state)
+}
+
 /// Create a new agent (saves state file; does not start a worker process).
 pub async fn create(cfg: &AgentConfig) -> Result<AgentState> {
     if state_path(&cfg.name).exists() {
@@ -395,6 +437,23 @@ pub async fn create_or_recover(
     if path.exists() {
         let mut state = load_state(&def.name)?;
         state.config = cfg;
+        // Zero any stale PID on recovery (#519). A non-zero pid here is
+        // always stale — the previous deskd run owned that worker; if it
+        // exited cleanly the stdout-reader cleared the pid; if deskd was
+        // killed between spawn and clear, the stored pid is unrelated to
+        // any current process (PID reuse). The fresh spawn that follows
+        // create_or_recover will re-establish the live pid via
+        // `persist_pid`. Without this, `deskd agent doctor` can report
+        // `alive=true` for a long-dead worker when /proc/<recycled-pid>
+        // happens to exist.
+        if state.pid != 0 {
+            debug!(
+                agent = %def.name,
+                stale_pid = state.pid,
+                "zeroing stale pid on recovery"
+            );
+            state.pid = 0;
+        }
         save_state(&state)?;
         info!(agent = %def.name, session_id = %state.session_id, "recovered existing agent state");
         return Ok(state);
@@ -1149,5 +1208,152 @@ created_at: "2024-01-01T00:00:00Z"
             "persist_pid must tolerate a missing state file: {:?}",
             res
         );
+    }
+
+    // ─── #519 — restart-race CAS guard + stale-recovery normalize ────────
+
+    /// AC A: when the persisted pid matches the spawn-time expected value,
+    /// `clear_pid_if_matches` zeroes it. Mirrors the "natural exit /
+    /// kill / stop and nothing else raced us" path — the happy case for
+    /// the old unconditional `persist_pid(name, 0)`.
+    #[test]
+    fn clear_pid_if_matches_clears_when_pid_matches() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent_name = "match-test";
+        let live = mk_state_for_pid_test(agent_name, 4242);
+        save_state_in(tmp.path(), &live).unwrap();
+
+        clear_pid_if_matches_in(tmp.path(), agent_name, 4242).unwrap();
+
+        let loaded = load_state_in(tmp.path(), agent_name).unwrap();
+        assert_eq!(
+            loaded.pid, 0,
+            "clear_pid_if_matches must zero pid when expected matches current"
+        );
+    }
+
+    /// AC A — restart-race regression: a stale stdout-reader's deferred
+    /// `clear_pid_if_matches(name, OLD_PID)` runs AFTER the supervisor's
+    /// fresh respawn wrote `NEW_PID`. The fresh pid MUST be preserved.
+    ///
+    /// Pre-#519 this would clobber the new pid to 0, leaving
+    /// `deskd agent doctor` reporting `alive=false` for a healthy worker
+    /// until the next spawn-side write self-healed it.
+    #[test]
+    fn clear_pid_if_matches_preserves_pid_after_restart_race() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent_name = "race-test";
+
+        // Generation 1: spawn writes pid = OLD.
+        let gen1 = mk_state_for_pid_test(agent_name, 4242);
+        save_state_in(tmp.path(), &gen1).unwrap();
+
+        // Supervisor: child dies, fresh spawn writes pid = NEW.
+        // (The reader task from generation 1 has NOT yet run its deferred clear.)
+        persist_pid_in(tmp.path(), agent_name, 9999).unwrap();
+
+        // Now the stale reader fires, expecting OLD. Must NOT clobber NEW.
+        clear_pid_if_matches_in(tmp.path(), agent_name, 4242).unwrap();
+
+        let loaded = load_state_in(tmp.path(), agent_name).unwrap();
+        assert_eq!(
+            loaded.pid, 9999,
+            "stale reader's deferred clear must not clobber a fresh PID written by respawn"
+        );
+    }
+
+    /// AC A: missing state file is a no-op (best-effort, matches `persist_pid`).
+    #[test]
+    fn clear_pid_if_matches_is_noop_when_state_file_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let res = clear_pid_if_matches_in(tmp.path(), "ghost", 1234);
+        assert!(
+            res.is_ok(),
+            "clear_pid_if_matches must tolerate a missing state file: {:?}",
+            res
+        );
+    }
+
+    /// AC A: a clear targeting an already-zero pid is a no-op (idempotent).
+    /// This matters because the spawn-side write path may not always set a
+    /// pid (e.g. `child.id()` returned None) and the reader still runs.
+    #[test]
+    fn clear_pid_if_matches_zero_against_zero_is_noop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent_name = "zero-zero";
+        let baseline = mk_state_for_pid_test(agent_name, 0);
+        save_state_in(tmp.path(), &baseline).unwrap();
+
+        clear_pid_if_matches_in(tmp.path(), agent_name, 0).unwrap();
+
+        let loaded = load_state_in(tmp.path(), agent_name).unwrap();
+        assert_eq!(loaded.pid, 0);
+    }
+
+    /// AC B: `create_or_recover` zeros any non-zero pid found in the
+    /// recovered state file. The previous deskd run owned that pid; either
+    /// it cleared cleanly (in which case this is already 0) or deskd was
+    /// killed between spawn and clear, leaving an unrelated PID that may
+    /// now be recycled (`/proc/<pid>` exists but belongs to a stranger).
+    /// Without this, `doctor` reports `alive=true` for a long-dead worker.
+    ///
+    /// We use PID 1 (init) as a representative stale value: definitely not
+    /// our agent binary, definitely exists in `/proc` on Linux.
+    #[tokio::test]
+    async fn create_or_recover_zeros_stale_pid() {
+        // Serialize env mutation; setenv is not thread-safe on POSIX.
+        let _env_guard = crate::test_support::env_lock().lock().await;
+        let tmp = std::env::temp_dir().join(format!(
+            "deskd-test-recover-stale-pid-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Snapshot HOME so we can restore on drop (other tests share this lock).
+        let prev_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &tmp) };
+
+        let agent_name = "recover-stale-pid";
+        // Seed a state file with a stale PID (1 — init, definitely not our binary).
+        let stale = mk_state_for_pid_test(agent_name, 1);
+        // Mirror persist_pid's relative path layout: write under ~/.deskd/agents/.
+        save_state(&stale).expect("seed state file");
+        // Sanity: the seeded file actually has pid=1.
+        assert_eq!(load_state(agent_name).unwrap().pid, 1);
+
+        let def = config::AgentDef {
+            name: agent_name.to_string(),
+            unix_user: None,
+            work_dir: "/tmp".to_string(),
+            config: None,
+            telegram: None,
+            discord: None,
+            model: Some("claude-sonnet-4-6".to_string()),
+            command: vec!["claude".to_string()],
+            container: None,
+            runtime: ConfigAgentRuntime::default(),
+            launch_mode: ConfigLaunchMode::default(),
+            bus_socket: None,
+        };
+        let recovered = create_or_recover(&def, None).await.unwrap();
+        assert_eq!(
+            recovered.pid, 0,
+            "create_or_recover must normalize stale non-zero pid to 0 on recovery"
+        );
+        // And the on-disk file must reflect that — the next agent_doctor
+        // call reads from disk, not from this returned struct.
+        let on_disk = load_state(agent_name).unwrap();
+        assert_eq!(
+            on_disk.pid, 0,
+            "recovery must persist the zeroed pid to disk"
+        );
+
+        // Cleanup.
+        unsafe {
+            match prev_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
