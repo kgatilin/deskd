@@ -13,8 +13,8 @@ use crate::domain::config_types::ConfigSessionMode;
 use crate::ports::executor::{Executor, ProgressSink, TaskLimits, TokenUsage, TurnResult};
 
 use super::agent_registry::{
-    format_user_message, load_state, persist_pid, rotate_stream_log, save_state, save_state_pub,
-    stderr_log_path, stream_log_path,
+    clear_pid_if_matches, format_user_message, load_state, persist_pid, rotate_stream_log,
+    save_state, save_state_pub, stderr_log_path, stream_log_path,
 };
 use super::process_builder::{build_command, inject_required_flags};
 
@@ -112,6 +112,10 @@ pub struct AgentProcess {
     child: std::sync::Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
     /// Agent name.
     name: String,
+    /// PID captured at spawn time (#519). Used by `kill` / `stop` to clear the
+    /// persisted PID only if it still matches — guards against a stale reader
+    /// from a previous worker generation clobbering a fresh PID.
+    spawn_pid: u32,
     /// Last cumulative cost reported by Claude (for computing deltas).
     /// Claude's `total_cost_usd` is session-cumulative, not per-task.
     last_reported_cost: tokio::sync::Mutex<f64>,
@@ -130,7 +134,8 @@ impl AgentProcess {
         let will_resume =
             state.config.session == ConfigSessionMode::Persistent && !state.session_id.is_empty();
 
-        let (stdin_tx, event_rx, child) = Self::spawn_process(name, bus_socket, false).await?;
+        let (stdin_tx, event_rx, child, spawn_pid) =
+            Self::spawn_process(name, bus_socket, false).await?;
 
         if will_resume {
             let mut event_rx_guard = event_rx;
@@ -174,7 +179,7 @@ impl AgentProcess {
                     save_state_pub(&s).ok();
                 }
 
-                let (stdin_tx2, event_rx2, child2) =
+                let (stdin_tx2, event_rx2, child2, spawn_pid2) =
                     Self::spawn_process(name, bus_socket, true).await?;
                 let event_rx2 = check_fresh_startup(name, event_rx2).await.map_err(|e| {
                     error!(
@@ -189,6 +194,7 @@ impl AgentProcess {
                     event_rx: tokio::sync::Mutex::new(event_rx2),
                     child: child2,
                     name: name.to_string(),
+                    spawn_pid: spawn_pid2,
                     last_reported_cost: tokio::sync::Mutex::new(0.0),
                     last_reported_turns: tokio::sync::Mutex::new(0),
                 });
@@ -199,6 +205,7 @@ impl AgentProcess {
                 event_rx: tokio::sync::Mutex::new(event_rx_guard),
                 child,
                 name: name.to_string(),
+                spawn_pid,
                 last_reported_cost: tokio::sync::Mutex::new(0.0),
                 last_reported_turns: tokio::sync::Mutex::new(0),
             });
@@ -211,6 +218,7 @@ impl AgentProcess {
             event_rx: tokio::sync::Mutex::new(event_rx),
             child,
             name: name.to_string(),
+            spawn_pid,
             last_reported_cost: tokio::sync::Mutex::new(0.0),
             last_reported_turns: tokio::sync::Mutex::new(0),
         })
@@ -218,7 +226,8 @@ impl AgentProcess {
 
     /// Spawn a persistent Claude process with a fresh session (no --resume).
     pub async fn start_fresh(name: &str, bus_socket: &str) -> Result<Self> {
-        let (stdin_tx, event_rx, child) = Self::spawn_process(name, bus_socket, true).await?;
+        let (stdin_tx, event_rx, child, spawn_pid) =
+            Self::spawn_process(name, bus_socket, true).await?;
 
         let event_rx = check_fresh_startup(name, event_rx).await?;
 
@@ -227,6 +236,7 @@ impl AgentProcess {
             event_rx: tokio::sync::Mutex::new(event_rx),
             child,
             name: name.to_string(),
+            spawn_pid,
             last_reported_cost: tokio::sync::Mutex::new(0.0),
             last_reported_turns: tokio::sync::Mutex::new(0),
         })
@@ -242,6 +252,7 @@ impl AgentProcess {
         tokio::sync::mpsc::UnboundedSender<String>,
         tokio::sync::mpsc::UnboundedReceiver<StdoutEvent>,
         std::sync::Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
+        u32,
     )> {
         let state = load_state(name)?;
 
@@ -450,6 +461,10 @@ impl AgentProcess {
         let agent_name2 = name.to_string();
         let stderr_buf_reader = stderr_buf;
         let task_use_resume = use_resume;
+        // Capture the spawn-time PID for the reader task so it knows what
+        // value it owns (#519). Without this, a stale reader from an earlier
+        // worker generation can clear a fresh PID written by a newer spawn.
+        let reader_spawn_pid = worker_pid;
         tokio::spawn(async move {
             let stream_log = stream_log_path(&agent_name2);
             if let Some(parent) = stream_log.parent() {
@@ -547,7 +562,13 @@ impl AgentProcess {
             // Clear the persisted PID on natural exit (#440). The child
             // handle has been awaited; any future `deskd agent doctor` call
             // must not see a stale live-pid number in the state file.
-            if let Err(e) = persist_pid(&agent_name2, 0) {
+            //
+            // CAS guard (#519): only clear if the persisted pid still matches
+            // what we spawned. A restart race where a fresh spawn already
+            // wrote its own pid must NOT be clobbered by this stale reader.
+            if reader_spawn_pid > 0
+                && let Err(e) = clear_pid_if_matches(&agent_name2, reader_spawn_pid)
+            {
                 warn!(
                     agent = %agent_name2,
                     error = %e,
@@ -569,7 +590,7 @@ impl AgentProcess {
             debug!(agent = %agent_name2, "persistent process stdout closed");
         });
 
-        Ok((stdin_tx, event_rx, child_arc))
+        Ok((stdin_tx, event_rx, child_arc, worker_pid))
     }
 
     /// Send a task to the persistent process and collect the response.
@@ -818,7 +839,13 @@ impl AgentProcess {
         }
         // Clear the persisted PID (#440) so doctor reports `alive=false`
         // with `pid=0` rather than a stale recycled pid.
-        if let Err(e) = persist_pid(&self.name, 0) {
+        //
+        // CAS guard (#519): a restart race could mean a fresh spawn already
+        // wrote a new pid into the state file. Only clear if it still
+        // matches the pid this AgentProcess instance owns.
+        if self.spawn_pid > 0
+            && let Err(e) = clear_pid_if_matches(&self.name, self.spawn_pid)
+        {
             warn!(agent = %self.name, error = %e, "failed to clear worker pid on kill");
         }
         warn!(agent = %self.name, "persistent process killed");
@@ -831,7 +858,11 @@ impl AgentProcess {
             let _ = child.wait().await;
         }
         // Clear the persisted PID (#440). See `kill` for rationale.
-        if let Err(e) = persist_pid(&self.name, 0) {
+        //
+        // CAS guard (#519): see `kill` for the restart-race rationale.
+        if self.spawn_pid > 0
+            && let Err(e) = clear_pid_if_matches(&self.name, self.spawn_pid)
+        {
             warn!(agent = %self.name, error = %e, "failed to clear worker pid on stop");
         }
         info!(agent = %self.name, "persistent process stopped");

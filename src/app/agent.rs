@@ -8,10 +8,10 @@
 // Re-export everything so `crate::app::agent::*` continues to work.
 pub use super::agent_process::AgentProcess;
 pub use super::agent_registry::{
-    AgentConfig, AgentState, create, create_or_recover, create_or_update_from_config,
-    default_agent_command, list, load_state, load_state_in, persist_pid, persist_pid_in, remove,
-    save_state_in, save_state_pub, send, spawn_ephemeral, stderr_log_path, stream_log_path,
-    to_domain_agent,
+    AgentConfig, AgentState, clear_pid_if_matches, clear_pid_if_matches_in, create,
+    create_or_recover, create_or_update_from_config, default_agent_command, list, load_state,
+    load_state_in, persist_pid, persist_pid_in, remove, save_state_in, save_state_pub, send,
+    spawn_ephemeral, stderr_log_path, stream_log_path, to_domain_agent,
 };
 pub use super::process_builder::build_command;
 
