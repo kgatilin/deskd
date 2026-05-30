@@ -127,4 +127,65 @@ mod tests {
         assert!(PANEL_JS.contains("data-href") || PANEL_JS.contains("dataset.href"));
         assert!(!PANEL_JS.contains("onclick"));
     }
+
+    /// Regression guard for #522: opacity-based dimming on Panel v2
+    /// elements compounded with Pico.css v2's already-muted light theme
+    /// and dropped table headers / KPI labels / breakdown / breadcrumb
+    /// below WCAG AA. The fix replaces those with explicit `color:`
+    /// declarations that meet ≥4.5:1 on white.
+    #[tokio::test]
+    async fn dashboard_css_panel_v2_uses_explicit_colors_not_opacity() {
+        // The token providing the muted color, declared on `.panel`.
+        assert!(
+            DASHBOARD_CSS.contains("--panel-text-muted"),
+            "missing --panel-text-muted custom property"
+        );
+        // The concrete contrast-safe value (`#475569` ≈ 7.5:1 on #fff).
+        assert!(
+            DASHBOARD_CSS.contains("#475569"),
+            "missing slate-600 muted color value"
+        );
+
+        // The selectors previously dimmed via `opacity` must now bind
+        // `color:` from the token. We only check a substring of the
+        // generated declarations — a layout reflow can reorder
+        // properties, but `color: var(--panel-text-muted)` is durable.
+        //
+        // Anchor lookups to the Panel v2 section (after the token is
+        // declared) so legacy v1 rules like the original `.breadcrumb`
+        // — which lives earlier in the file and never used opacity —
+        // don't trigger a false positive on selectors that v2 redeclares.
+        let v2_start = DASHBOARD_CSS
+            .find("--panel-text-muted")
+            .expect("Panel v2 token declaration must exist");
+        let v2_section = &DASHBOARD_CSS[v2_start..];
+
+        let must_use_muted = [
+            ".panel-kpi .kpi-grid dt",
+            ".panel-kpi .kpi-breakdown",
+            ".panel-weekly .weekly-cap-hits",
+            ".model-rows th, .agent-rows th, .sessions-list th",
+            ".breadcrumb",
+            ".legacy-fold",
+            ".panel small",
+        ];
+        for sel in must_use_muted {
+            let rule_start = v2_section
+                .find(sel)
+                .unwrap_or_else(|| panic!("selector not found in Panel v2 section: {sel}"));
+            let rule_end = v2_section[rule_start..]
+                .find('}')
+                .map(|i| rule_start + i)
+                .unwrap_or(v2_section.len());
+            let rule_body = &v2_section[rule_start..rule_end];
+            assert!(
+                rule_body.contains("color: var(--panel-text-muted)"),
+                "{sel} no longer binds color: var(--panel-text-muted) — body was: {rule_body}",
+            );
+            assert!(
+                !rule_body.contains("opacity:"),
+                "{sel} still uses opacity-based dimming — body was: {rule_body}",
+            );
+        }
+    }
 }

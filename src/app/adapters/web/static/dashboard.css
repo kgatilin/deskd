@@ -186,24 +186,36 @@ small { color: #777; }
 }
 
 /* ─── Panel v2 (#497) ─────────────────────────────────────────────────── */
+/*
+ * Muted-text color tokens (#522). Replaces previous `opacity: 0.7–0.85`
+ * modifiers which compounded with Pico.css v2's already-muted light theme
+ * and dropped table headers / KPI labels / breakdown / breadcrumb below
+ * WCAG AA (4.5:1).
+ *
+ * Concrete values are verified against the Pico v2 light page background
+ * (`#fff`) and the panel container background:
+ *   --panel-text-muted:  #475569 — slate-600, ~7.5:1 on #fff (AAA)
+ *   --panel-text-subtle: #64748b — slate-500, ~4.7:1 on #fff (AA normal)
+ */
+.panel { --panel-text-muted: #475569; --panel-text-subtle: #64748b; }
 .font-mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
 .panel { max-width: 960px; margin: 0 auto; padding: 0.5rem; }
 .panel section { margin-block: 0.75rem; }
 .panel header h2 { margin-block-end: 0.25rem; font-size: 1rem; }
 .panel-kpi .kpi-grid { display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 0.8rem; margin: 0; }
-.panel-kpi .kpi-grid dt { font-weight: 600; opacity: 0.8; }
+.panel-kpi .kpi-grid dt { font-weight: 600; color: var(--panel-text-muted); }
 .panel-kpi .kpi-grid dd { margin: 0; }
-.panel-kpi .kpi-breakdown { display: block; opacity: 0.7; font-size: 0.85em; }
+.panel-kpi .kpi-breakdown { display: block; color: var(--panel-text-muted); font-size: 0.85em; }
 .panel-kpi .kpi-period { display: flex; gap: 0.6rem; margin-top: 0.4rem; font-size: 0.85rem; }
 .panel-weekly .weekly-gauge { font-size: 0.95rem; margin: 0.25rem 0; }
 .panel-weekly .weekly-gauge__bar { display: inline-block; letter-spacing: 0; }
 .panel-weekly .weekly-gauge__nums { margin-left: 0.6rem; }
-.panel-weekly .weekly-cap-hits { margin: 0.2rem 0 0.6rem; opacity: 0.85; }
+.panel-weekly .weekly-cap-hits { margin: 0.2rem 0 0.6rem; color: var(--panel-text-muted); }
 .gauge--green .weekly-gauge__bar { color: #0a8a3a; }
 .gauge--yellow .weekly-gauge__bar { color: #b07e00; }
 .gauge--red .weekly-gauge__bar { color: #c0392b; }
 .model-rows, .agent-rows, .sessions-list { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
-.model-rows th, .agent-rows th, .sessions-list th { text-align: left; opacity: 0.7; font-weight: 500; }
+.model-rows th, .agent-rows th, .sessions-list th { text-align: left; color: var(--panel-text-muted); font-weight: 500; }
 .model-rows td, .model-rows th, .agent-rows td, .agent-rows th, .sessions-list td, .sessions-list th { padding: 0.15rem 0.4rem; border-bottom: 1px solid rgba(127,127,127,0.15); }
 .agent-row, .session-row { cursor: pointer; }
 .agent-row:hover, .session-row:hover { background: rgba(127,127,127,0.08); }
@@ -211,9 +223,13 @@ small { color: #777; }
 .period-tabs { display: flex; gap: 0.6rem; margin-block: 0.4rem; }
 .period-tabs .tab { padding: 0.2rem 0.5rem; border-bottom: 2px solid transparent; }
 .period-tabs .tab--active { border-bottom-color: currentColor; font-weight: 600; }
-.breadcrumb { font-size: 0.85rem; opacity: 0.8; margin-block: 0.4rem; }
+.breadcrumb { font-size: 0.85rem; color: var(--panel-text-muted); margin-block: 0.4rem; }
 .transcript, .transcript-raw { white-space: pre-wrap; word-break: break-word; padding: 0.6rem; border: 1px solid rgba(127,127,127,0.2); border-radius: 6px; }
-.legacy-fold { margin-block-start: 1rem; opacity: 0.85; }
+.legacy-fold { margin-block-start: 1rem; color: var(--panel-text-muted); }
+/* Override the global `small { color: #777 }` (~3.7:1, sub-AA) for any
+ * `<small>` rendered inside a Panel v2 page. Scoped so other surfaces
+ * keep their previous styling. (#522) */
+.panel small { color: var(--panel-text-muted); }
 .legacy-fold summary { cursor: pointer; }
 @media (max-width: 420px) {
   .panel { padding: 0.4rem; }
